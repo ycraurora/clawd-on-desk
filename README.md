@@ -28,18 +28,18 @@ A desktop pet that reacts to your [Claude Code](https://docs.anthropic.com/en/do
 
 | Claude Code Event | Clawd State | Animation | |
 |---|---|---|---|
-| Idle (no activity) | idle | Eye-tracking follow | <img src="assets/gif/clawd-idle.gif" width="48"> |
-| UserPromptSubmit | thinking | Thought bubble | <img src="assets/gif/clawd-thinking.gif" width="48"> |
-| PreToolUse / PostToolUse | working (typing) | Typing | <img src="assets/gif/clawd-typing.gif" width="48"> |
-| PreToolUse (3+ sessions) | working (building) | Building | <img src="assets/gif/clawd-building.gif" width="48"> |
-| SubagentStart (1) | juggling | Juggling | <img src="assets/gif/clawd-juggling.gif" width="48"> |
-| SubagentStart (2+) | conducting | Conducting | <img src="assets/gif/clawd-conducting.gif" width="48"> |
-| PostToolUseFailure | error | ERROR + smoke | <img src="assets/gif/clawd-error.gif" width="48"> |
-| Stop / PostCompact | attention | Happy bounce | <img src="assets/gif/clawd-happy.gif" width="48"> |
-| PermissionRequest / Notification | notification | Alert jump | <img src="assets/gif/clawd-notification.gif" width="48"> |
-| PreCompact | sweeping | Broom sweep | <img src="assets/gif/clawd-sweeping.gif" width="48"> |
-| WorktreeCreate | carrying | Carrying box | <img src="assets/gif/clawd-carrying.gif" width="48"> |
-| 60s no events | sleeping | Sleep sequence | <img src="assets/gif/clawd-sleeping.gif" width="48"> |
+| Idle (no activity) | idle | Eye-tracking follow | <img src="assets/gif/clawd-idle.gif" width="96"> |
+| UserPromptSubmit | thinking | Thought bubble | <img src="assets/gif/clawd-thinking.gif" width="96"> |
+| PreToolUse / PostToolUse | working (typing) | Typing | <img src="assets/gif/clawd-typing.gif" width="96"> |
+| PreToolUse (3+ sessions) | working (building) | Building | <img src="assets/gif/clawd-building.gif" width="96"> |
+| SubagentStart (1) | juggling | Juggling | <img src="assets/gif/clawd-juggling.gif" width="96"> |
+| SubagentStart (2+) | conducting | Conducting | <img src="assets/gif/clawd-conducting.gif" width="96"> |
+| PostToolUseFailure | error | ERROR + smoke | <img src="assets/gif/clawd-error.gif" width="96"> |
+| Stop / PostCompact | attention | Happy bounce | <img src="assets/gif/clawd-happy.gif" width="96"> |
+| PermissionRequest / Notification | notification | Alert jump | <img src="assets/gif/clawd-notification.gif" width="96"> |
+| PreCompact | sweeping | Broom sweep | <img src="assets/gif/clawd-sweeping.gif" width="96"> |
+| WorktreeCreate | carrying | Carrying box | <img src="assets/gif/clawd-carrying.gif" width="96"> |
+| 60s no events | sleeping | Sleep sequence | <img src="assets/gif/clawd-sleeping.gif" width="96"> |
 
 ## Quick Start
 
