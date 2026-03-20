@@ -353,11 +353,11 @@ function applyState(state, svgOverride) {
     autoReturnTimer = setTimeout(() => {
       autoReturnTimer = null;
       if (miniMode) {
-        if (mouseOverPet) {
+        if (mouseOverPet && !doNotDisturb) {
           miniPeekIn();
           applyState("mini-peek");
         } else {
-          applyState("mini-idle");
+          applyState(doNotDisturb ? "mini-sleep" : "mini-idle");
         }
       } else {
         const resolved = resolveDisplayState();
@@ -710,7 +710,7 @@ function enableDoNotDisturb() {
   if (autoReturnTimer) { clearTimeout(autoReturnTimer); autoReturnTimer = null; }
   stopWakePoll();
   if (miniMode) {
-    applyState("mini-idle");
+    applyState("mini-sleep");
   } else {
     applyState("yawning");  // walk through yawning → collapsing → sleeping
   }
@@ -723,6 +723,7 @@ function disableDoNotDisturb() {
   doNotDisturb = false;
   sendToRenderer("dnd-change", false);
   if (miniMode) {
+    if (miniSleepPeeked) { miniPeekOut(); miniSleepPeeked = false; }
     applyState("mini-idle");
   } else {
     applyState("waking");
@@ -1006,7 +1007,7 @@ function createWindow() {
     if (doNotDisturb) {
       sendToRenderer("dnd-change", true);
       if (miniMode) {
-        applyState("mini-idle");
+        applyState("mini-sleep");
       } else {
         applyState("sleeping");
       }
@@ -1213,7 +1214,6 @@ function enterMiniMode(wa, viaMenu) {
   buildTrayMenu();
 
   const enterSvgState = doNotDisturb ? "mini-enter-sleep" : "mini-enter";
-  const idleSvgState = doNotDisturb ? "mini-sleep" : "mini-idle";
 
   if (viaMenu) {
     // Jump past ALL screens, load enter SVG off-screen, then slide to mini position
@@ -1230,7 +1230,7 @@ function enterMiniMode(wa, viaMenu) {
         win.setBounds({ x: currentMiniX, y: miniSnap.y, width: miniSnap.width, height: miniSnap.height });
         miniTransitionTimer = setTimeout(() => {
           miniTransitioning = false;
-          applyState(idleSvgState);
+          applyState(doNotDisturb ? "mini-sleep" : "mini-idle");
         }, 3200);
       }, 300);
     });
@@ -1240,7 +1240,7 @@ function enterMiniMode(wa, viaMenu) {
     applyState(enterSvgState);
     miniTransitionTimer = setTimeout(() => {
       miniTransitioning = false;
-      applyState(idleSvgState);
+      applyState(doNotDisturb ? "mini-sleep" : "mini-idle");
     }, 3200);
   }
 }
