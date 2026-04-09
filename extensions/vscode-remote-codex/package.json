@@ -1,0 +1,50 @@
+{
+  "name": "clawd-remote-codex",
+  "displayName": "Clawd Remote Codex Monitor",
+  "description": "Runs in VS Code remote workspaces and forwards Codex session activity back to the local Clawd bridge.",
+  "version": "0.1.0",
+  "publisher": "clawd",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:clawd.remoteCodex.showStatus"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "clawd.remoteCodex.showStatus",
+        "title": "Clawd: Show Remote Codex Status"
+      }
+    ],
+    "configuration": {
+      "title": "Clawd",
+      "properties": {
+        "clawd.remoteCodex.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Clawd monitoring for Codex sessions running in VS Code remote workspaces such as devcontainers."
+        },
+        "clawd.remoteCodex.pollIntervalMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "description": "Polling interval in milliseconds for remote Codex JSONL session logs."
+        },
+        "clawd.remoteCodex.sessionDirCandidates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional remote directories to probe for Codex session logs. Each value may be a home directory such as /home/vscode or a full sessions path such as /home/vscode/.codex/sessions."
+        }
+      }
+    }
+  }
+}
