@@ -111,6 +111,8 @@ npm start
 
 **Codex CLI** — 开箱即用。Clawd 会自动轮询 `~/.codex/sessions/` 下的 JSONL 日志。
 
+**Docker / devcontainer 里的 VS Code Codex** — Clawd 现在采用双端 bridge：随应用自动安装的本地 `clawd-terminal-focus` 扩展负责把事件转发到本机 Clawd，而真正读取容器内 `~/.codex/sessions` 的是另一个跑在 remote/workspace 侧的 helper 扩展。这个 helper 目前还不会自动装进容器里的 VS Code Server，测试这条链路时需要先手动安装一次。
+
 **Copilot CLI** — 需要手动配置 hooks。请参考 [docs/copilot-setup.md](docs/copilot-setup.md)。
 
 **Kiro CLI** — 如果你想在启动 Clawd 前先注册 hooks，可先执行 `npm run install:kiro-hooks`。Kiro 内置的 `kiro_default` 不是一个可编辑的 JSON agent，所以 Clawd 会维护一个自定义 `clawd` agent，并在每次启动时先同步最新的 `kiro_default` 配置，再追加 hooks。需要 hooks 时，请用 `kiro-cli --agent clawd` 新开会话，或者在现有会话里执行 `/agent swap clawd`。目前在 macOS 上，状态类动效已验证可用；但涉及终端里 `t / y / n` 的原生权限确认，仍然只能在终端处理。
@@ -168,6 +170,8 @@ Host my-server
 |------|------|
 | **Codex CLI：无法跳转终端** | Codex 通过 JSONL 日志轮询，日志中不含终端 PID，点击桌宠无法跳转到 Codex 终端。Claude Code 和 Copilot CLI 正常。 |
 | **Codex CLI：Windows hooks 禁用** | Codex 在 Windows 上硬编码禁用了 hooks，因此走日志轮询，延迟约 1.5 秒（hook 方式几乎无延迟）。 |
+| **Docker / devcontainer 里的 VS Code Codex：helper 仍需手动安装** | 本地 bridge 扩展会自动安装，但 remote/workspace 侧的 helper 目前还需要手动装进容器内的 VS Code Server。 |
+| **Docker / devcontainer 里的 VS Code Codex：暂不支持精确聚焦** | 装好 helper 后，远程 VS Code Codex 会话可以驱动桌宠状态，但点击会话菜单还不能精确跳转到对应的远程 Codex 界面。 |
 | **Copilot CLI：需手动配置 hooks** | Copilot 需要手动创建 `~/.copilot/hooks/hooks.json`。Claude Code 和 Codex 开箱即用。 |
 | **Copilot CLI：无权限气泡** | Copilot 的 `preToolUse` 只支持拒绝，无法做完整的允许/拒绝审批流。权限气泡仅支持 Claude Code。 |
 | **Gemini CLI：无 working 状态** | Gemini 的 session JSON 只记录已完成消息，不包含进行中的工具执行。桌宠会从 thinking 直接跳到 happy/error，工作中没有打字动画。 |

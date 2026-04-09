@@ -113,6 +113,8 @@ npm start
 
 **Codex CLI** — works out of the box. Clawd polls `~/.codex/sessions/` for JSONL logs automatically.
 
+**VS Code Codex in devcontainers/Docker** — Clawd now has a split bridge design: the bundled local `clawd-terminal-focus` extension runs on your desktop VS Code and forwards events into the local app, while a separate `workspace` helper extension must run inside the remote container/VS Code Server to read `~/.codex/sessions`. The helper is not auto-installed yet; for now, install it manually in the remote environment before testing this path.
+
 **Copilot CLI** — requires manual hook setup. See [docs/copilot-setup.md](docs/copilot-setup.md) for instructions.
 
 **Kiro CLI** — run `npm run install:kiro-hooks` if you want hooks registered before launching Clawd. Kiro's built-in `kiro_default` agent is not backed by an editable JSON file, so Clawd creates a custom `clawd` agent and re-syncs it from the latest `kiro_default` each time Clawd starts, then appends hooks. Use `kiro-cli --agent clawd` for a new chat, or `/agent swap clawd` inside an existing Kiro session, when you want hooks enabled. On macOS, state-driven animations have been verified; native terminal permission prompts such as `t / y / n` still need to be answered in the terminal.
@@ -170,6 +172,8 @@ Remote hooks run in `CLAWD_REMOTE` mode which skips PID collection (remote PIDs 
 |---|---|
 | **Codex CLI: no terminal focus** | Codex sessions use JSONL log polling which doesn't carry terminal PID info. Clicking Clawd won't jump to the Codex terminal. Claude Code and Copilot CLI work fine. |
 | **Codex CLI: Windows hooks disabled** | Codex hardcodes hooks off on Windows, so we poll log files instead. This means ~1.5s latency vs near-instant for hook-based agents. |
+| **VS Code Codex in devcontainers: helper install is manual** | The local bridge extension auto-installs, but the remote workspace helper still needs to be installed into the container's VS Code Server manually. |
+| **VS Code Codex in devcontainers: focus not wired yet** | Remote VS Code Codex sessions can drive pet state once the helper is installed, but clicking the session menu does not yet jump to the exact remote Codex surface. |
 | **Copilot CLI: manual hook setup** | Copilot hooks require manually creating `~/.copilot/hooks/hooks.json`. Claude Code and Codex work out of the box. |
 | **Copilot CLI: no permission bubble** | Copilot's `preToolUse` hook only supports deny, not the full allow/deny flow. Permission bubbles only work with Claude Code. |
 | **Gemini CLI: no working state** | Gemini's session JSON only records completed messages, not in-progress tool execution. The pet jumps from thinking straight to happy/error — no typing animation during work. |

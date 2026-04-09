@@ -1,15 +1,37 @@
 {
   "name": "clawd-terminal-focus",
   "displayName": "Clawd Terminal Focus",
-  "description": "Enables Clawd desktop pet to focus the correct terminal tab via URI",
-  "version": "0.1.0",
+  "description": "Enables Clawd desktop pet to focus the correct terminal tab and bridge remote Codex activity",
+  "version": "0.3.2",
   "publisher": "clawd",
   "engines": {
     "vscode": "^1.70.0"
   },
+  "extensionKind": [
+    "ui"
+  ],
   "activationEvents": [
-    "onUri"
+    "onStartupFinished",
+    "onUri",
+    "onCommand:clawd.internal.forwardStateToApp",
+    "onCommand:clawd.internal.bridgeLog",
+    "onCommand:clawd.showBridgeStatus"
   ],
   "main": "./extension.js",
-  "contributes": {}
+  "contributes": {
+    "commands": [
+      {
+        "command": "clawd.showBridgeStatus",
+        "title": "Clawd: Show Local Bridge Status"
+      },
+      {
+        "command": "clawd.internal.forwardStateToApp",
+        "title": "Clawd Internal: Forward State To App"
+      },
+      {
+        "command": "clawd.internal.bridgeLog",
+        "title": "Clawd Internal: Bridge Log"
+      }
+    ]
+  }
 }
