@@ -25,23 +25,17 @@ module.exports = function initState(ctx) {
 const _getCursor = ctx.getCursorScreenPoint || (screen ? () => screen.getCursorScreenPoint() : null);
 const _kill = ctx.processKill || process.kill.bind(process);
 
-// ── Theme-driven constants (from ctx.theme, populated by theme-loader) ──
-const theme = ctx.theme;
-
-const SVG_IDLE_FOLLOW = theme.states.idle[0];
-
-// ── State → SVG mapping (merged from theme.states + theme.miniMode.states) ──
-const STATE_SVGS = { ...theme.states };
-if (theme.miniMode && theme.miniMode.states) {
-  Object.assign(STATE_SVGS, theme.miniMode.states);
-}
-
-const MIN_DISPLAY_MS = theme.timings.minDisplay;
-const AUTO_RETURN_MS = theme.timings.autoReturn;
-
-const DEEP_SLEEP_TIMEOUT = theme.timings.deepSleepTimeout;
-const YAWN_DURATION = theme.timings.yawnDuration;
-const WAKE_DURATION = theme.timings.wakeDuration;
+// ── Theme-driven state (refreshed on hot theme switch) ──
+let theme = null;
+let SVG_IDLE_FOLLOW = null;
+let STATE_SVGS = {};
+let MIN_DISPLAY_MS = {};
+let AUTO_RETURN_MS = {};
+let DEEP_SLEEP_TIMEOUT = 0;
+let YAWN_DURATION = 0;
+let WAKE_DURATION = 0;
+let DND_SKIP_YAWN = false;
+let COLLAPSE_DURATION = 0;
 const SLEEP_SEQUENCE = new Set(["yawning", "dozing", "collapsing", "sleeping", "waking"]);
 
 const STATE_PRIORITY = {
@@ -52,7 +46,7 @@ const STATE_PRIORITY = {
 const ONESHOT_STATES = new Set(["attention", "error", "sweeping", "notification", "carrying"]);
 
 // Session display hints — validated against theme.displayHintMap keys
-const DISPLAY_HINT_MAP = theme.displayHintMap || {};
+let DISPLAY_HINT_MAP = {};
 
 // ── Session tracking ──
 const sessions = new Map();
@@ -64,9 +58,9 @@ let startupRecoveryTimer = null;
 const STARTUP_RECOVERY_MAX_MS = 300000;
 
 // ── Hit-test bounding boxes (from theme) ──
-const HIT_BOXES = theme.hitBoxes;
-const WIDE_SVGS = new Set(theme.wideHitboxFiles || []);
-const SLEEPING_SVGS = new Set(theme.sleepingHitboxFiles || []);
+let HIT_BOXES = {};
+let WIDE_SVGS = new Set();
+let SLEEPING_SVGS = new Set();
 let currentHitBox = HIT_BOXES.default;
 
 // ── State machine internal ──
@@ -78,6 +72,16 @@ let pendingTimer = null;
 let autoReturnTimer = null;
 let pendingState = null;
 let eyeResendTimer = null;
+let updateVisualState = null;
+let updateVisualSvgOverride = null;
+
+const UPDATE_VISUAL_STATE_MAP = {
+  checking: "sweeping",
+  downloading: "carrying",
+};
+const UPDATE_VISUAL_SVG_MAP = {
+  checking: "clawd-working-debugger.svg",
+};
 
 // ── Wake poll ──
 let wakePollTimer = null;
@@ -92,6 +96,36 @@ const STATE_LABEL_KEY = {
   working: "sessionWorking", thinking: "sessionThinking", juggling: "sessionJuggling",
   idle: "sessionIdle", sleeping: "sessionSleeping",
 };
+
+function refreshTheme() {
+  theme = ctx.theme;
+  SVG_IDLE_FOLLOW = theme.states.idle[0];
+  STATE_SVGS = { ...theme.states };
+  if (theme.miniMode && theme.miniMode.states) {
+    Object.assign(STATE_SVGS, theme.miniMode.states);
+  }
+  MIN_DISPLAY_MS = theme.timings.minDisplay;
+  AUTO_RETURN_MS = theme.timings.autoReturn;
+  DEEP_SLEEP_TIMEOUT = theme.timings.deepSleepTimeout;
+  YAWN_DURATION = theme.timings.yawnDuration;
+  WAKE_DURATION = theme.timings.wakeDuration;
+  DND_SKIP_YAWN = !!theme.timings.dndSkipYawn;
+  COLLAPSE_DURATION = theme.timings.collapseDuration || 0;
+  DISPLAY_HINT_MAP = theme.displayHintMap || {};
+  HIT_BOXES = theme.hitBoxes;
+  WIDE_SVGS = new Set(theme.wideHitboxFiles || []);
+  SLEEPING_SVGS = new Set(theme.sleepingHitboxFiles || []);
+
+  if (currentSvg && SLEEPING_SVGS.has(currentSvg)) {
+    currentHitBox = HIT_BOXES.sleeping;
+  } else if (currentSvg && WIDE_SVGS.has(currentSvg)) {
+    currentHitBox = HIT_BOXES.wide;
+  } else {
+    currentHitBox = HIT_BOXES.default;
+  }
+}
+
+refreshTheme();
 
 function setState(newState, svgOverride) {
   if (ctx.doNotDisturb) return;
@@ -210,6 +244,11 @@ function applyState(state, svgOverride) {
       autoReturnTimer = null;
       applyState(ctx.doNotDisturb ? "collapsing" : "dozing");
     }, YAWN_DURATION);
+  } else if (state === "collapsing" && COLLAPSE_DURATION > 0) {
+    autoReturnTimer = setTimeout(() => {
+      autoReturnTimer = null;
+      applyState("sleeping");
+    }, COLLAPSE_DURATION);
   } else if (state === "waking") {
     autoReturnTimer = setTimeout(() => {
       autoReturnTimer = null;
@@ -221,8 +260,14 @@ function applyState(state, svgOverride) {
       autoReturnTimer = null;
       if (ctx.miniMode) {
         if (ctx.mouseOverPet && !ctx.doNotDisturb) {
-          ctx.miniPeekIn();
-          applyState("mini-peek");
+          if (state === "mini-peek") {
+            // Peek animation done — stay peeked but show idle (don't re-trigger peek)
+            ctx.miniPeeked = true;
+            applyState("mini-idle");
+          } else {
+            ctx.miniPeekIn();
+            applyState("mini-peek");
+          }
         } else {
           applyState(ctx.doNotDisturb ? "mini-sleep" : "mini-idle");
         }
@@ -458,12 +503,12 @@ function detectRunningAgentProcesses(callback) {
   const { exec } = require("child_process");
   if (process.platform === "win32") {
     exec(
-      'wmic process where "(Name=\'node.exe\' and CommandLine like \'%claude-code%\') or Name=\'claude.exe\' or Name=\'codex.exe\' or Name=\'copilot.exe\' or Name=\'gemini.exe\' or Name=\'codebuddy.exe\'" get ProcessId /format:csv',
+      'wmic process where "(Name=\'node.exe\' and CommandLine like \'%claude-code%\') or Name=\'claude.exe\' or Name=\'codex.exe\' or Name=\'copilot.exe\' or Name=\'gemini.exe\' or Name=\'codebuddy.exe\' or Name=\'kiro.exe\' or Name=\'opencode.exe\'" get ProcessId /format:csv',
       { encoding: "utf8", timeout: 5000, windowsHide: true },
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy' || pgrep -x 'gemini'", { timeout: 3000 },
+    exec("pgrep -f 'claude-code|codex|copilot|codebuddy' || pgrep -x 'gemini' || pgrep -x 'kiro' || pgrep -x 'opencode'", { timeout: 3000 },
       (err) => done(!err)
     );
   }
@@ -479,16 +524,35 @@ function stopStaleCleanup() {
 }
 
 function resolveDisplayState() {
-  if (sessions.size === 0) return "idle";
-  let best = "sleeping";
-  let hasNonHeadless = false;
-  for (const [, s] of sessions) {
-    if (s.headless) continue;
-    hasNonHeadless = true;
-    if ((STATE_PRIORITY[s.state] || 0) > (STATE_PRIORITY[best] || 0)) best = s.state;
+  let best;
+  if (sessions.size === 0) {
+    best = "idle";
+  } else {
+    best = "sleeping";
+    let hasNonHeadless = false;
+    for (const [, s] of sessions) {
+      if (s.headless) continue;
+      hasNonHeadless = true;
+      if ((STATE_PRIORITY[s.state] || 0) > (STATE_PRIORITY[best] || 0)) best = s.state;
+    }
+    if (!hasNonHeadless) best = "idle";
   }
-  if (!hasNonHeadless) return "idle";
+  // Update overlay participates in priority — won't override higher-priority agent states
+  if (updateVisualState && (STATE_PRIORITY[updateVisualState] || 0) >= (STATE_PRIORITY[best] || 0)) {
+    return updateVisualState;
+  }
   return best;
+}
+
+function setUpdateVisualState(kind) {
+  if (!kind) {
+    updateVisualState = null;
+    updateVisualSvgOverride = null;
+    return null;
+  }
+  updateVisualState = UPDATE_VISUAL_STATE_MAP[kind] || kind;
+  updateVisualSvgOverride = UPDATE_VISUAL_SVG_MAP[kind] || null;
+  return updateVisualState;
 }
 
 function getActiveWorkingCount() {
@@ -526,6 +590,9 @@ function getWinningSessionDisplayHint(targetState) {
 }
 
 function getSvgOverride(state) {
+  if (updateVisualState && state === updateVisualState && updateVisualSvgOverride) {
+    return updateVisualSvgOverride;
+  }
   if (state === "idle") return SVG_IDLE_FOLLOW;
   if (state === "working") {
     const hinted = getWinningSessionDisplayHint("working");
@@ -640,7 +707,7 @@ function enableDoNotDisturb() {
   if (ctx.miniMode) {
     applyState("mini-sleep");
   } else {
-    applyState("yawning");
+    applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
   }
   ctx.buildContextMenu();
   ctx.buildTrayMenu();
@@ -653,6 +720,7 @@ function disableDoNotDisturb() {
   ctx.sendToHitWin("hit-state-sync", { dndEnabled: false });
   if (ctx.miniMode) {
     if (ctx.miniSleepPeeked) { ctx.miniPeekOut(); ctx.miniSleepPeeked = false; }
+    ctx.miniPeeked = false;
     applyState("mini-idle");
   } else {
     applyState("waking");
@@ -684,14 +752,16 @@ function cleanup() {
 }
 
 return {
-  setState, applyState, updateSession, resolveDisplayState,
+  setState, applyState, updateSession, resolveDisplayState, setUpdateVisualState,
   enableDoNotDisturb, disableDoNotDisturb,
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
-  getSvgOverride, cleanStaleSessions, startStartupRecovery,
+  getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
   detectRunningAgentProcesses, buildSessionSubmenu,
   getCurrentState, getCurrentSvg, getCurrentHitBox, getStartupRecoveryActive,
-  sessions, STATE_SVGS, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
-  HIT_BOXES, WIDE_SVGS,
+  sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
+  get STATE_SVGS() { return STATE_SVGS; },
+  get HIT_BOXES() { return HIT_BOXES; },
+  get WIDE_SVGS() { return WIDE_SVGS; },
   cleanup,
 };
 

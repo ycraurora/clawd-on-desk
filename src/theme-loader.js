@@ -37,6 +37,11 @@ const DEFAULT_OBJECT_SCALE = {
   widthRatio: 1.9, heightRatio: 1.3,
   offsetX: -0.45, offsetY: -0.25,
 };
+const DEFAULT_LAYOUT = {
+  centerXRatio: 0.5,
+  baselineBottomRatio: 0.05,
+  visibleHeightRatio: 0.58,
+};
 
 const DEFAULT_EYE_TRACKING = {
   enabled: false,
@@ -60,6 +65,8 @@ const DANGEROUS_TAGS = new Set([
 ]);
 const DANGEROUS_ATTR_RE = /^on/i;
 const DANGEROUS_HREF_RE = /^\s*javascript\s*:/i;
+const EXTERNAL_RESOURCE_RE = /^\s*(https?|data|file|ftp)\s*:/i;
+const PATH_TRAVERSAL_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
 const HREF_ATTRS = new Set(["href", "xlink:href", "src", "action", "formaction"]);
 
 // ── State ──
@@ -104,7 +111,7 @@ function discoverThemes() {
     _scanThemesDir(builtinThemesDir, true, themes, seen);
   }
 
-  // User-installed themes (override built-in if same id)
+  // User-installed themes (same id as built-in is skipped — built-in takes priority)
   if (userThemesDir) {
     _scanThemesDir(userThemesDir, false, themes, seen);
   }
@@ -313,6 +320,20 @@ function _sanitizeNode(node) {
       }
     }
 
+    // Sanitize <style> CSS content: strip @import and url() to block external loads
+    // while preserving @keyframes and other animation CSS that themes need
+    if (child.type === "style" || (child.type === "tag" && (child.name || "").toLowerCase() === "style")) {
+      if (child.children) {
+        for (const textNode of child.children) {
+          if (textNode.type === "text" && textNode.data) {
+            textNode.data = textNode.data
+              .replace(/@import\b[^;]*/gi, "/* sanitized */")
+              .replace(/url\s*\(\s*(?!['"]?#)[^)]*\)/gi, "url()");
+          }
+        }
+      }
+    }
+
     // Clean attributes on element nodes
     if (child.attribs) {
       const keys = Object.keys(child.attribs);
@@ -322,9 +343,12 @@ function _sanitizeNode(node) {
           delete child.attribs[key];
           continue;
         }
-        // Remove javascript: URLs
-        if (HREF_ATTRS.has(key.toLowerCase()) && DANGEROUS_HREF_RE.test(child.attribs[key])) {
-          delete child.attribs[key];
+        // Remove javascript: URLs, external protocols, and path traversal
+        if (HREF_ATTRS.has(key.toLowerCase())) {
+          const val = child.attribs[key];
+          if (DANGEROUS_HREF_RE.test(val) || EXTERNAL_RESOURCE_RE.test(val) || PATH_TRAVERSAL_RE.test(val)) {
+            delete child.attribs[key];
+          }
         }
       }
     }
@@ -356,12 +380,6 @@ function resolveHint(hookFilename) {
  * Built-in: assets/svg/. External: theme-cache for SVGs, theme dir for non-SVGs.
  * @returns {string} absolute directory path
  */
-function getAssetsDir() {
-  if (!activeTheme) return assetsSvgDir;
-  if (activeTheme._builtin) return assetsSvgDir;
-  return activeTheme._assetsDir || assetsSvgDir;
-}
-
 /**
  * Get asset path for a specific file.
  * For external themes: SVGs come from cache, non-SVGs from source theme dir.
@@ -369,7 +387,15 @@ function getAssetsDir() {
  * @returns {string} absolute file path
  */
 function getAssetPath(filename) {
-  if (!activeTheme || activeTheme._builtin) {
+  filename = path.basename(filename);
+  if (!activeTheme) return path.join(assetsSvgDir, filename);
+
+  if (activeTheme._builtin) {
+    // Built-in theme with own assets dir (e.g., calico with APNGs)
+    if (!filename.endsWith(".svg")) {
+      const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
+      if (fs.existsSync(themeAsset)) return themeAsset;
+    }
     return path.join(assetsSvgDir, filename);
   }
 
@@ -387,7 +413,15 @@ function getAssetPath(filename) {
  * @returns {string} path prefix
  */
 function getRendererAssetsPath() {
-  if (!activeTheme || activeTheme._builtin) {
+  if (!activeTheme) return "../assets/svg";
+  if (activeTheme._builtin) {
+    // Built-in theme with own assets dir (e.g., calico with SVG + APNGs)
+    const themeAssetsDir = path.join(activeTheme._themeDir, "assets");
+    if (fs.existsSync(themeAssetsDir)) {
+      // Use relative path (not file:// URL) so SVG internal <style> works
+      // file:// absolute URLs may cause browser to restrict inline CSS in SVG
+      return "../themes/" + activeTheme._id + "/assets";
+    }
     return "../assets/svg";
   }
   // External theme: return file:// URL to the cache dir for SVGs
@@ -400,7 +434,15 @@ function getRendererAssetsPath() {
  * @returns {string|null} file:// URL or null for built-in
  */
 function getRendererSourceAssetsPath() {
-  if (!activeTheme || activeTheme._builtin) return null;
+  if (!activeTheme) return null;
+  if (activeTheme._builtin) {
+    // Built-in theme with own assets dir (e.g., calico with APNGs)
+    const themeAssetsDir = path.join(activeTheme._themeDir, "assets");
+    if (fs.existsSync(themeAssetsDir)) {
+      return "../themes/" + activeTheme._id + "/assets";
+    }
+    return null;
+  }
   return pathToFileURL(path.join(activeTheme._themeDir, "assets")).href;
 }
 
@@ -412,15 +454,20 @@ function getRendererConfig() {
   if (!activeTheme) return null;
   const t = activeTheme;
   return {
+    viewBox: t.viewBox,
+    layout: t.layout,
     assetsPath: getRendererAssetsPath(),
     // For external themes: non-SVG assets served from source dir (not cache)
     sourceAssetsPath: getRendererSourceAssetsPath(),
     eyeTracking: t.eyeTracking,
     glyphFlips: t.miniMode ? t.miniMode.glyphFlips : {},
+    miniFlipAssets: t.miniMode ? !!t.miniMode.flipAssets : false,
     dragSvg: t.reactions && t.reactions.drag ? t.reactions.drag.file : null,
     idleFollowSvg: t.states.idle[0],
     // renderer needs to know which states need eye tracking (for <object> vs <img> decision)
     eyeTrackingStates: t.eyeTracking.enabled ? t.eyeTracking.states : [],
+    objectScale: t.objectScale,
+    transitions: t.transitions || {},
   };
 }
 
@@ -489,6 +536,13 @@ function validateTheme(cfg) {
     }
   }
 
+  if (cfg.layout) {
+    const cb = cfg.layout.contentBox;
+    if (!cb || cb.x == null || cb.y == null || cb.width == null || cb.height == null) {
+      errors.push("layout.contentBox must include x, y, width, height");
+    }
+  }
+
   return errors;
 }
 
@@ -512,6 +566,38 @@ function mergeDefaults(raw, themeId, isBuiltin) {
 
   // objectScale
   theme.objectScale = { ...DEFAULT_OBJECT_SCALE, ...(raw.objectScale || {}) };
+  {
+    const vb = theme.viewBox || { width: 1, height: 1 };
+    const aspect = (vb.width && vb.height) ? (vb.width / vb.height) : 1;
+    const os = theme.objectScale;
+    const derivedObjBottom = os.objBottom != null ? os.objBottom : (1 - os.offsetY - os.heightRatio);
+    const rawOs = raw.objectScale || {};
+
+    if (os.imgWidthRatio == null) {
+      os.imgWidthRatio = Math.min(os.widthRatio, os.heightRatio * aspect);
+    }
+    if (rawOs.imgOffsetX == null) {
+      os.imgOffsetX = os.offsetX + Math.max(0, (os.widthRatio - os.imgWidthRatio) / 2);
+    }
+    if (os.imgBottom == null) {
+      const fittedHeightRatio = aspect > 0 ? (os.imgWidthRatio / aspect) : os.heightRatio;
+      os.imgBottom = derivedObjBottom + Math.max(0, (os.heightRatio - fittedHeightRatio) / 2);
+    }
+  }
+
+  // layout
+  if (raw.layout && raw.layout.contentBox) {
+    const cb = raw.layout.contentBox;
+    theme.layout = {
+      ...DEFAULT_LAYOUT,
+      ...raw.layout,
+      contentBox: { ...cb },
+    };
+    if (theme.layout.centerX == null) theme.layout.centerX = cb.x + cb.width / 2;
+    if (theme.layout.baselineY == null) theme.layout.baselineY = cb.y + cb.height;
+  } else {
+    theme.layout = null;
+  }
 
   // eyeTracking
   theme.eyeTracking = { ...DEFAULT_EYE_TRACKING, ...(raw.eyeTracking || {}) };
@@ -524,6 +610,7 @@ function mergeDefaults(raw, themeId, isBuiltin) {
   if (raw.miniMode) {
     theme.miniMode = {
       supported: true,
+      offsetRatio: 0.486,
       ...raw.miniMode,
       timings: {
         minDisplay: {},
@@ -562,6 +649,40 @@ function mergeDefaults(raw, themeId, isBuiltin) {
   // idleAnimations
   theme.idleAnimations = raw.idleAnimations || [];
 
+  // ── Filename sanitization: basename all file references to prevent path traversal ──
+  const bn = (f) => typeof f === "string" ? f.replace(/^.*[\/\\]/, "") : f;
+  for (const [s, files] of Object.entries(theme.states || {})) {
+    if (Array.isArray(files)) theme.states[s] = files.map(bn);
+  }
+  if (theme.miniMode && theme.miniMode.states) {
+    for (const [s, files] of Object.entries(theme.miniMode.states)) {
+      if (Array.isArray(files)) theme.miniMode.states[s] = files.map(bn);
+    }
+  }
+  if (theme.reactions) {
+    for (const r of Object.values(theme.reactions)) {
+      if (r && r.file) r.file = bn(r.file);
+      if (r && Array.isArray(r.files)) r.files = r.files.map(bn);
+    }
+  }
+  if (theme.sounds) {
+    for (const [k, v] of Object.entries(theme.sounds)) theme.sounds[k] = bn(v);
+  }
+  if (theme.displayHintMap) {
+    for (const [k, v] of Object.entries(theme.displayHintMap)) theme.displayHintMap[k] = bn(v);
+  }
+  if (theme.workingTiers) {
+    for (const t of theme.workingTiers) { if (t.file) t.file = bn(t.file); }
+  }
+  if (theme.jugglingTiers) {
+    for (const t of theme.jugglingTiers) { if (t.file) t.file = bn(t.file); }
+  }
+  if (Array.isArray(theme.idleAnimations)) {
+    for (const a of theme.idleAnimations) { if (a && a.file) a.file = bn(a.file); }
+  }
+  if (Array.isArray(theme.wideHitboxFiles)) theme.wideHitboxFiles = theme.wideHitboxFiles.map(bn);
+  if (Array.isArray(theme.sleepingHitboxFiles)) theme.sleepingHitboxFiles = theme.sleepingHitboxFiles.map(bn);
+
   return theme;
 }
 
@@ -597,14 +718,11 @@ module.exports = {
   loadTheme,
   getActiveTheme,
   resolveHint,
-  getAssetsDir,
   getAssetPath,
   getRendererAssetsPath,
   getRendererSourceAssetsPath,
   getRendererConfig,
   getHitRendererConfig,
   ensureUserThemesDir,
-  validateTheme,
-  sanitizeSvg,
   getSoundUrl,
 };

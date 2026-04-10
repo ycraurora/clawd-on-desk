@@ -3,12 +3,16 @@
 // Reactions are triggered via IPC from main (relayed from hit window).
 
 const container = document.getElementById("pet-container");
+let clawdEl = document.getElementById("clawd");
+let pendingNext = null;
 
 // ── Theme config (injected via preload.js additionalArguments) ──
 let tc = window.themeConfig || {};
 
 function initWithConfig(cfg) {
   tc = cfg || {};
+  _viewBox = tc.viewBox || { x: -15, y: -25, width: 45, height: 45 };
+  _layout = tc.layout || null;
   _assetsPath = tc.assetsPath || "../assets/svg";
   _sourceAssetsPath = tc.sourceAssetsPath || null;
   _eyeIds = (tc.eyeTracking && tc.eyeTracking.ids) || { eyes: "eyes-js", body: "body-js", shadow: "shadow-js", dozeEyes: "eyes-doze" };
@@ -19,10 +23,103 @@ function initWithConfig(cfg) {
   _dragSvg = tc.dragSvg || "clawd-react-drag.svg";
   _idleFollowSvg = tc.idleFollowSvg || "clawd-idle-follow.svg";
   _glyphFlipDefs = tc.glyphFlips || { "pixel-z": 4, "pixel-z-small": 3 };
+
+  // Layered tracking: detect if theme uses multi-layer config
+  _useLayeredTracking = !!(tc.eyeTracking && tc.eyeTracking.trackingLayers);
+  _trackingLayersConfig = _useLayeredTracking ? tc.eyeTracking.trackingLayers : null;
+  _themeMaxOffset = (tc.eyeTracking && tc.eyeTracking.maxOffset) || 20;
+
+  // objectScale — applied via element.style in swapToFile() (CSP blocks <style> injection)
+  const os = tc.objectScale || { widthRatio: 1.9, heightRatio: 1.3, offsetX: -0.45, offsetY: -0.25 };
+  _objectScaleCSS = {
+    width:  `${os.widthRatio * 100}%`,
+    height: `${os.heightRatio * 100}%`,
+    imgWidthBase: (os.imgWidthRatio || os.widthRatio) * 100,
+    left:   `${os.offsetX * 100}%`,
+    imgLeft: `${(os.imgOffsetX != null ? os.imgOffsetX : os.offsetX) * 100}%`,
+    // Unified bottom-anchored positioning for both <object> and <img>
+    // Theme can override objBottom directly; otherwise derive from offsetY + heightRatio
+    objBottom: `${(os.objBottom != null ? os.objBottom : (1 - os.offsetY - os.heightRatio)) * 100}%`,
+    imgBottom: `${(os.imgBottom != null ? os.imgBottom : 0.05) * 100}%`,
+  };
+  _fileScales = os.fileScales || {};
+  _fileOffsets = os.fileOffsets || {};
+  _transitions = tc.transitions || {};
+  _miniFlipAssets = !!tc.miniFlipAssets;
+
+  applyObjectScaleStyle(clawdEl);
+  applyObjectScaleStyle(pendingNext);
+}
+
+function applyObjectScaleStyle(el, file) {
+  if (!el || !_objectScaleCSS) return;
+  if (shouldUseNormalizedLayout(file)) {
+    applyNormalizedLayoutStyle(el, file);
+    return;
+  }
+  const fo = (file && _fileOffsets[file]) || null;
+  const ox = fo ? fo.x : 0;
+  const oy = fo ? fo.y : 0;
+
+  // Unified bottom-anchored positioning: both <object> and <img> use bottom + oy
+  if (el.tagName === "IMG") {
+    const scale = (file && _fileScales[file]) || 1.0;
+    el.style.width = `${_objectScaleCSS.imgWidthBase * scale}%`;
+    el.style.height = "auto";
+    el.style.left = `calc(${_objectScaleCSS.imgLeft} + ${ox}px)`;
+    el.style.top = "auto";
+    el.style.bottom = `calc(${_objectScaleCSS.imgBottom || "5%"} + ${oy}px)`;
+  } else {
+    el.style.width = _objectScaleCSS.width;
+    el.style.height = _objectScaleCSS.height;
+    el.style.left = `calc(${_objectScaleCSS.left} + ${ox}px)`;
+    el.style.top = "auto";
+    el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy}px)`;
+  }
+}
+
+function shouldUseNormalizedLayout(file) {
+  if (!_layout || !_layout.contentBox) return false;
+  if (_inMiniMode || (file && file.startsWith("mini-"))) return false;
+  return true;
+}
+
+function applyNormalizedLayoutStyle(el, file) {
+  if (!el || !_layout || !_layout.contentBox || !_viewBox) return;
+  const fo = (file && _fileOffsets[file]) || null;
+  const ox = fo ? fo.x : 0;
+  const oy = fo ? fo.y : 0;
+  const scale = (file && _fileScales[file]) || 1.0;
+  const cb = _layout.contentBox;
+  const centerX = _layout.centerX != null ? _layout.centerX : (cb.x + cb.width / 2);
+  const baselineY = _layout.baselineY != null ? _layout.baselineY : (cb.y + cb.height);
+  const unitRatio = ((_layout.visibleHeightRatio || 0.58) * scale) / cb.height;
+  const widthRatio = _viewBox.width * unitRatio;
+  const heightRatio = _viewBox.height * unitRatio;
+  const leftRatio = (_layout.centerXRatio != null ? _layout.centerXRatio : 0.5)
+    - ((centerX - _viewBox.x) * unitRatio);
+  const bottomRatio = (_layout.baselineBottomRatio != null ? _layout.baselineBottomRatio : 0.05)
+    - ((_viewBox.y + _viewBox.height - baselineY) * unitRatio);
+
+  if (el.tagName === "IMG") {
+    el.style.width = `${widthRatio * 100}%`;
+    el.style.height = "auto";
+    el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
+    el.style.top = "auto";
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+  } else {
+    el.style.width = `${widthRatio * 100}%`;
+    el.style.height = `${heightRatio * 100}%`;
+    el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
+    el.style.top = "auto";
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+  }
 }
 
 let _assetsPath;
 let _sourceAssetsPath;
+let _viewBox;
+let _layout;
 let _eyeIds;
 let _bodyScale;
 let _shadowStretch;
@@ -31,10 +128,34 @@ let _eyeTrackingStates;
 let _dragSvg;
 let _idleFollowSvg;
 let _glyphFlipDefs;
+let _objectScaleCSS;
+let _fileScales = {};
+let _fileOffsets = {};
+let _transitions = {};  // per-file fade config: { "file.apng": { in: 400, out: 400 } }
+let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
+let _inMiniMode = false;
+
+function applyMiniFlip(el) {
+  if (!el || el.tagName !== "IMG") return;
+  el.style.transform = (_miniFlipAssets && _inMiniMode) ? "scaleX(-1)" : "";
+}
+
+// ── Layered tracking state (multi-layer eye/head/body tracking) ──
+let _useLayeredTracking = false;
+let _trackingLayersConfig = null;  // raw config from theme.json
+let _themeMaxOffset = 20;          // theme-level maxOffset for normalization
+let _trackingLayers = null;        // { name: { wrappers: [], maxOffset, ease, x, y } }
+let _layerTargetDx = 0;           // raw dx from tick.js (scaled to _themeMaxOffset)
+let _layerTargetDy = 0;           // raw dy from tick.js
+let _layerAnimFrame = null;        // requestAnimationFrame handle
+let _layeredTrackingObj = null;    // the <object> element currently tracked (guard against re-init)
+
 initWithConfig(tc);
 
 // Theme switch: reload + IPC push overrides additionalArguments
 window.electronAPI.onThemeConfig((newConfig) => {
+  // Clean up layered tracking before reinitializing
+  _cleanupLayeredTracking();
   initWithConfig(newConfig);
 });
 
@@ -64,8 +185,10 @@ let miniLeftFlip = false;
 window.electronAPI.onDndChange((enabled) => { dndEnabled = enabled; });
 
 window.electronAPI.onMiniModeChange((enabled, edge) => {
+  _inMiniMode = enabled;
   miniLeftFlip = enabled && edge === "left";
   container.classList.toggle("mini-left", miniLeftFlip);
+  applyMiniFlip(clawdEl);
   if (miniLeftFlip) {
     applyGlyphFlipCompensation(clawdEl);
   } else {
@@ -193,9 +316,8 @@ function endDragReaction() {
 }
 
 // --- Generic swap function: handles both <object> and <img> channels ---
-let clawdEl = document.getElementById("clawd");
-let pendingNext = null;
 let currentDisplayedSvg = getObjectSvgName(clawdEl);
+let pendingSvgFile = null; // tracks the SVG currently being loaded (for dedup)
 currentIdleSvg = currentDisplayedSvg;
 
 /**
@@ -204,6 +326,16 @@ currentIdleSvg = currentDisplayedSvg;
  * @param {string|null} state - current state name (for eye tracking decision)
  * @param {boolean} [useObjectChannel] - force object channel (true), img (false), or auto (undefined)
  */
+// Fade out an element and remove it after the transition completes
+function fadeOutAndRemove(el, durationMs) {
+  el.style.transition = `opacity ${durationMs}ms ease-out`;
+  el.style.opacity = "0";
+  setTimeout(() => {
+    if (el.tagName === "OBJECT") releaseObject(el);
+    else releaseImg(el);
+  }, durationMs);
+}
+
 function swapToFile(file, state, useObjectChannel) {
   if (pendingNext) {
     if (pendingNext.tagName === "OBJECT") releaseObject(pendingNext);
@@ -211,6 +343,7 @@ function swapToFile(file, state, useObjectChannel) {
     pendingNext = null;
   }
 
+  pendingSvgFile = file; // track what's loading for dedup
   const useObj = useObjectChannel !== undefined ? useObjectChannel : needsObjectChannel(state, file);
   const url = getAssetUrl(file);
 
@@ -220,18 +353,30 @@ function swapToFile(file, state, useObjectChannel) {
     next.type = "image/svg+xml";
     next.id = "clawd";
     next.style.opacity = "0";
+    applyObjectScaleStyle(next, file);
 
     const swap = () => {
       if (pendingNext !== next) return;
-      next.style.transition = "none";
+      const fadeInMs = (_transitions[file] && _transitions[file].in) || 0;
+      const fadeOutMs = (currentDisplayedSvg && _transitions[currentDisplayedSvg] && _transitions[currentDisplayedSvg].out) || 0;
+
+      if (fadeInMs > 0) {
+        next.style.transition = `opacity ${fadeInMs}ms ease-in`;
+        next.offsetHeight; // force reflow to trigger transition
+      } else {
+        next.style.transition = "none";
+      }
       next.style.opacity = "1";
+
       for (const child of [...container.querySelectorAll("object, img.clawd-img")]) {
         if (child !== next) {
-          if (child.tagName === "OBJECT") releaseObject(child);
+          if (fadeOutMs > 0) fadeOutAndRemove(child, fadeOutMs);
+          else if (child.tagName === "OBJECT") releaseObject(child);
           else releaseImg(child);
         }
       }
       pendingNext = null;
+      pendingSvgFile = null;
       clawdEl = next;
       currentDisplayedSvg = file;
 
@@ -256,18 +401,31 @@ function swapToFile(file, state, useObjectChannel) {
     next.className = "clawd-img";
     next.id = "clawd";
     next.style.opacity = "0";
+    applyObjectScaleStyle(next, file);
+    applyMiniFlip(next);
 
     const swap = () => {
       if (pendingNext !== next) return;
-      next.style.transition = "none";
+      const fadeInMs = (_transitions[file] && _transitions[file].in) || 0;
+      const fadeOutMs = (currentDisplayedSvg && _transitions[currentDisplayedSvg] && _transitions[currentDisplayedSvg].out) || 0;
+
+      if (fadeInMs > 0) {
+        next.style.transition = `opacity ${fadeInMs}ms ease-in`;
+        next.offsetHeight; // force reflow to trigger transition
+      } else {
+        next.style.transition = "none";
+      }
       next.style.opacity = "1";
+
       for (const child of [...container.querySelectorAll("object, img.clawd-img")]) {
         if (child !== next) {
-          if (child.tagName === "OBJECT") releaseObject(child);
+          if (fadeOutMs > 0) fadeOutAndRemove(child, fadeOutMs);
+          else if (child.tagName === "OBJECT") releaseObject(child);
           else releaseImg(child);
         }
       }
       pendingNext = null;
+      pendingSvgFile = null;
       clawdEl = next;
       currentDisplayedSvg = file;
     };
@@ -289,21 +447,28 @@ window.electronAPI.onStateChange((state, svg) => {
   // Main process state change → cancel any active click reaction
   cancelReaction();
 
+  // Dedup: same file already displayed OR currently loading → don't re-swap
+  const alreadyDisplayed = clawdEl && clawdEl.isConnected && currentDisplayedSvg === svg;
+  const alreadyPending = pendingSvgFile === svg && pendingNext;
+
+  if (alreadyDisplayed || alreadyPending) {
+    if (alreadyDisplayed) {
+      if (needsObjectChannel(state, svg) && !eyeTarget && !_trackingLayers) {
+        if (clawdEl.tagName === "OBJECT") attachEyeTracking(clawdEl);
+      } else if (!needsObjectChannel(state, svg)) {
+        detachEyeTracking();
+      }
+    }
+    currentIdleSvg = svg;
+    return;
+  }
+
+  // Different file — cancel pending, detach, and swap
   if (pendingNext) {
     if (pendingNext.tagName === "OBJECT") releaseObject(pendingNext);
     else releaseImg(pendingNext);
     pendingNext = null;
-  }
-
-  // Same file already displayed — just update eye tracking state
-  if (clawdEl && clawdEl.isConnected && currentDisplayedSvg === svg) {
-    if (needsObjectChannel(state, svg) && !eyeTarget) {
-      if (clawdEl.tagName === "OBJECT") attachEyeTracking(clawdEl);
-    } else if (!needsObjectChannel(state, svg)) {
-      detachEyeTracking();
-    }
-    currentIdleSvg = svg;
-    return;
+    pendingSvgFile = null;
   }
   detachEyeTracking();
 
@@ -312,6 +477,12 @@ window.electronAPI.onStateChange((state, svg) => {
 });
 
 // --- Eye tracking (idle state only) ---
+// Two systems coexist:
+//   1. Single-target (legacy): eyeTarget/bodyTarget/shadowTarget + applyEyeMove
+//      Used by default clawd theme (tc.eyeTracking.ids config)
+//   2. Layered tracking: per-element <g> wrappers + independent easing per layer
+//      Used when tc.eyeTracking.trackingLayers is defined (e.g. calico theme)
+
 let eyeTarget = null;
 let bodyTarget = null;
 let shadowTarget = null;
@@ -319,22 +490,183 @@ let lastEyeDx = 0;
 let lastEyeDy = 0;
 let eyeAttachToken = 0;
 
+// ── Single-target eye tracking (legacy) ──
+
 function applyEyeMove(dx, dy) {
   if (eyeTarget) {
-    eyeTarget.style.transform = `translate(${dx}px, ${dy}px)`;
+    eyeTarget.setAttribute("transform", `translate(${dx}, ${dy})`);
   }
   if (bodyTarget || shadowTarget) {
     const bdx = Math.round(dx * _bodyScale * 2) / 2;
     const bdy = Math.round(dy * _bodyScale * 2) / 2;
-    if (bodyTarget) bodyTarget.style.transform = `translate(${bdx}px, ${bdy}px)`;
+    if (bodyTarget) bodyTarget.setAttribute("transform", `translate(${bdx}, ${bdy})`);
     if (shadowTarget) {
       const absDx = Math.abs(bdx);
       const scaleX = 1 + absDx * _shadowStretch;
       const shiftX = Math.round(bdx * _shadowShift * 2) / 2;
-      shadowTarget.style.transform = `translate(${shiftX}px, 0) scaleX(${scaleX})`;
+      shadowTarget.setAttribute("transform", `translate(${shiftX}, 0) scale(${scaleX}, 1)`);
     }
   }
 }
+
+// ── Layered tracking helpers ──
+
+/**
+ * Wrap a single SVG element in a <g> for transform control.
+ * Returns the wrapper <g>, or null if element not found.
+ */
+function _wrapSvgElement(svgDoc, el) {
+  if (!el) return null;
+  const wrapper = svgDoc.createElementNS("http://www.w3.org/2000/svg", "g");
+  wrapper.setAttribute("data-tracking-wrapper", "1");
+  el.parentNode.insertBefore(wrapper, el);
+  wrapper.appendChild(el);
+  return wrapper;
+}
+
+/**
+ * Unwrap all tracking wrappers in the SVG document (restore original structure).
+ */
+function _unwrapAll(svgDoc) {
+  if (!svgDoc) return;
+  try {
+    const wrappers = svgDoc.querySelectorAll("[data-tracking-wrapper]");
+    for (const wrapper of wrappers) {
+      const parent = wrapper.parentNode;
+      if (!parent) continue;
+      // Move all children out of wrapper, then remove wrapper
+      while (wrapper.firstChild) {
+        parent.insertBefore(wrapper.firstChild, wrapper);
+      }
+      parent.removeChild(wrapper);
+    }
+  } catch {}
+}
+
+/**
+ * Calculate clamped offset for a layer (same formula as calico-test.html).
+ * Maps raw distance to [0, maxOffset] with soft clamping.
+ */
+function _calcLayerOffset(dx, dy, maxOffset) {
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist === 0) return [0, 0];
+  const clamp = Math.min(dist, maxOffset * 40) / (maxOffset * 40) * maxOffset;
+  return [(dx / dist) * clamp, (dy / dist) * clamp];
+}
+
+/**
+ * Initialize layered tracking for a loaded SVG document.
+ * Creates <g> wrappers for each element listed in trackingLayers config.
+ */
+function _initLayeredTracking(svgDoc) {
+  if (!_trackingLayersConfig || !svgDoc) return;
+
+  _trackingLayers = {};
+
+  for (const [layerName, layerCfg] of Object.entries(_trackingLayersConfig)) {
+    const wrappers = [];
+
+    // Wrap elements by ID
+    if (layerCfg.ids) {
+      for (const id of layerCfg.ids) {
+        const el = svgDoc.getElementById(id);
+        const w = _wrapSvgElement(svgDoc, el);
+        if (w) wrappers.push(w);
+      }
+    }
+
+    // Wrap elements by class
+    if (layerCfg.classes) {
+      for (const cls of layerCfg.classes) {
+        const els = svgDoc.querySelectorAll(`.${cls}`);
+        for (const el of els) {
+          const w = _wrapSvgElement(svgDoc, el);
+          if (w) wrappers.push(w);
+        }
+      }
+    }
+
+    _trackingLayers[layerName] = {
+      wrappers,
+      maxOffset: layerCfg.maxOffset || 10,
+      ease: layerCfg.ease || 0.15,
+      x: 0,
+      y: 0,
+    };
+  }
+
+  // Start the easing animation loop
+  _startLayerAnimLoop();
+}
+
+/**
+ * Start the requestAnimationFrame easing loop for layered tracking.
+ */
+function _startLayerAnimLoop() {
+  if (_layerAnimFrame) return; // already running
+
+  function tick() {
+    if (!_trackingLayers) { _layerAnimFrame = null; return; }
+
+    const rawDx = _layerTargetDx;
+    const rawDy = _layerTargetDy;
+
+    for (const layer of Object.values(_trackingLayers)) {
+      // Scale the pre-calculated offset (from tick.js, already in [-maxOffset, maxOffset])
+      // to this layer's range. No second normalization — tick.js already did it.
+      const scale = layer.maxOffset / (_themeMaxOffset || 20);
+      const tx = rawDx * scale;
+      const ty = rawDy * scale;
+
+      // Lerp towards target
+      layer.x += (tx - layer.x) * layer.ease;
+      layer.y += (ty - layer.y) * layer.ease;
+
+      // Snap to zero when very close (avoid sub-pixel jitter)
+      if (Math.abs(layer.x) < 0.01 && Math.abs(layer.y) < 0.01 && tx === 0 && ty === 0) {
+        layer.x = 0;
+        layer.y = 0;
+      }
+
+      // Quantize to quarter-pixel grid for smooth rendering
+      const qx = Math.round(layer.x * 4) / 4;
+      const qy = Math.round(layer.y * 4) / 4;
+
+      // Apply transform to all wrappers in this layer
+      for (const w of layer.wrappers) {
+        w.setAttribute("transform", `translate(${qx},${qy})`);
+      }
+    }
+
+    _layerAnimFrame = requestAnimationFrame(tick);
+  }
+
+  _layerAnimFrame = requestAnimationFrame(tick);
+}
+
+/**
+ * Clean up layered tracking: cancel RAF, unwrap elements, reset state.
+ */
+function _cleanupLayeredTracking() {
+  if (_layerAnimFrame) {
+    cancelAnimationFrame(_layerAnimFrame);
+    _layerAnimFrame = null;
+  }
+
+  // Unwrap elements in the current SVG if still accessible
+  if (_trackingLayers && clawdEl && clawdEl.tagName === "OBJECT") {
+    try {
+      _unwrapAll(clawdEl.contentDocument);
+    } catch {}
+  }
+
+  _trackingLayers = null;
+  _layerTargetDx = 0;
+  _layerTargetDy = 0;
+  _layeredTrackingObj = null;
+}
+
+// ── Attach / Detach (dispatches to correct system) ──
 
 function attachEyeTracking(objectEl) {
   if (!objectEl || objectEl.tagName !== "OBJECT") return;
@@ -349,6 +681,21 @@ function attachEyeTracking(objectEl) {
 
     try {
       const svgDoc = objectEl.contentDocument;
+      if (!svgDoc) {
+        if (attempt < 60) setTimeout(() => tryAttach(attempt + 1), 16);
+        return;
+      }
+
+      // Layered tracking: wrap elements and start RAF loop
+      if (_useLayeredTracking) {
+        // Skip if already tracking this exact <object> element
+        if (_trackingLayers && _layeredTrackingObj === objectEl) return;
+        _initLayeredTracking(svgDoc);
+        _layeredTrackingObj = objectEl;
+        return;
+      }
+
+      // Single-target tracking (legacy)
       const eyes = svgDoc && svgDoc.getElementById(_eyeIds.eyes);
       if (eyes) {
         eyeTarget = eyes;
@@ -374,15 +721,27 @@ function attachEyeTracking(objectEl) {
 
 function detachEyeTracking() {
   eyeAttachToken++;
+  // Single-target cleanup
   eyeTarget = null;
   bodyTarget = null;
   shadowTarget = null;
+  // Layered tracking cleanup
+  _cleanupLayeredTracking();
 }
 
 window.electronAPI.onEyeMove((dx, dy) => {
   const effectiveDx = miniLeftFlip ? -dx : dx;
   lastEyeDx = effectiveDx;
   lastEyeDy = dy;
+
+  if (_trackingLayers) {
+    // Layered tracking: store targets, RAF loop handles easing
+    _layerTargetDx = effectiveDx;
+    _layerTargetDy = dy;
+    return;
+  }
+
+  // Single-target tracking (legacy)
   // Detect stale eye targets (e.g. after DWM z-order recovery invalidates contentDocument)
   if (eyeTarget && !eyeTarget.ownerDocument?.defaultView) {
     eyeTarget = null;
@@ -416,18 +775,8 @@ window.electronAPI.onWakeFromDoze(() => {
   }
 });
 
-// --- Initial frame: set data from theme config (avoids hardcoded path in HTML) ---
-if (clawdEl && clawdEl.tagName === "OBJECT" && !clawdEl.data) {
-  const initialSvg = _idleFollowSvg;
-  const url = getAssetUrl(initialSvg);
-  clawdEl.data = url;
-  currentDisplayedSvg = initialSvg;
-  currentIdleSvg = initialSvg;
-  // Attach eye tracking once loaded
-  clawdEl.addEventListener("load", () => {
-    if (clawdEl && clawdEl.isConnected) {
-      attachEyeTracking(clawdEl);
-      if (miniLeftFlip) applyGlyphFlipCompensation(clawdEl);
-    }
-  }, { once: true });
+// --- Initial frame: always go through swapToFile so the right channel and theme scaling apply ---
+if (!currentDisplayedSvg && _idleFollowSvg) {
+  currentIdleSvg = _idleFollowSvg;
+  swapToFile(_idleFollowSvg, "idle");
 }

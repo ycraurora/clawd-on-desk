@@ -5,23 +5,28 @@ const { screen } = require("electron");
 
 module.exports = function initMini(ctx) {
 
-const MINI_OFFSET_RATIO = ctx.theme.miniMode.offsetRatio;
 const PEEK_OFFSET = 25;
 const SNAP_TOLERANCE = 30;
 const JUMP_PEAK_HEIGHT = 40;
 const JUMP_DURATION = 350;
 const CRABWALK_SPEED = 0.12;  // px/ms
+let MINI_OFFSET_RATIO = ctx.theme.miniMode.offsetRatio;
 
 let miniMode = false;
 let miniEdge = "right";  // "left" | "right"
 let miniTransitioning = false;
 let miniSleepPeeked = false;
+let miniPeeked = false;
 let preMiniX = 0, preMiniY = 0;
 let currentMiniX = 0;
 let miniSnap = null;  // { y, width, height } — canonical rect to prevent DPI drift
 let miniTransitionTimer = null;
 let peekAnimTimer = null;
 let isAnimating = false;
+
+function refreshTheme() {
+  MINI_OFFSET_RATIO = ctx.theme.miniMode.offsetRatio;
+}
 
 // ── Window animation ──
 function animateWindowX(targetX, durationMs) {
@@ -213,6 +218,7 @@ function exitMiniMode() {
   miniTransitioning = true;
   miniSnap = null;
   miniSleepPeeked = false;
+  miniPeeked = false;
 
   const size = _getSize();
   const clamped = ctx.clampToScreen(preMiniX, preMiniY, size.width, size.height);
@@ -325,6 +331,8 @@ function getMiniEdge() { return miniEdge; }
 function getMiniTransitioning() { return miniTransitioning; }
 function getMiniSleepPeeked() { return miniSleepPeeked; }
 function setMiniSleepPeeked(v) { miniSleepPeeked = v; }
+function getMiniPeeked() { return miniPeeked; }
+function setMiniPeeked(v) { miniPeeked = v; }
 function getIsAnimating() { return isAnimating; }
 function getPreMiniX() { return preMiniX; }
 function getPreMiniY() { return preMiniY; }
@@ -340,10 +348,12 @@ return {
   enterMiniMode, exitMiniMode, enterMiniViaMenu,
   miniPeekIn, miniPeekOut, checkMiniModeSnap, cancelMiniTransition,
   animateWindowX, animateWindowParabola,
+  refreshTheme,
   handleDisplayChange, handleResize, restoreFromPrefs,
-  getMiniMode, getMiniEdge, getMiniTransitioning, getMiniSleepPeeked, setMiniSleepPeeked,
+  getMiniMode, getMiniEdge, getMiniTransitioning, getMiniSleepPeeked, setMiniSleepPeeked, getMiniPeeked, setMiniPeeked,
   getIsAnimating, getPreMiniX, getPreMiniY, getCurrentMiniX, getMiniSnap,
-  MINI_OFFSET_RATIO,
+  get MINI_OFFSET_RATIO() { return MINI_OFFSET_RATIO; },
+  PEEK_OFFSET,
   cleanup,
 };
 

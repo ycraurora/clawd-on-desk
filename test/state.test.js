@@ -6,6 +6,7 @@ const assert = require("node:assert");
 const themeLoader = require("../src/theme-loader");
 themeLoader.init(require("path").join(__dirname, "..", "src"));
 const _defaultTheme = themeLoader.loadTheme("clawd");
+const _calicoTheme = themeLoader.loadTheme("calico");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,41 @@ describe("resolveDisplayState()", () => {
       const rePri = api.STATE_PRIORITY[result] || 0;
       assert.ok(rePri >= hiPri, `expected ${high}(${hiPri}) to win over ${low}, got ${result}(${rePri})`);
     }
+  });
+
+  it("update visual overlay wins over session display state until cleared", () => {
+    api.sessions.set("s1", rawSession("working"));
+    assert.strictEqual(api.resolveDisplayState(), "working");
+
+    api.setUpdateVisualState("checking");
+    assert.strictEqual(api.resolveDisplayState(), "sweeping");
+    assert.strictEqual(api.getSvgOverride("sweeping"), "clawd-working-debugger.svg");
+
+    api.setUpdateVisualState(null);
+    assert.strictEqual(api.resolveDisplayState(), "working");
+  });
+
+  it("update overlay does not override higher-priority agent states", () => {
+    // error(8) > sweeping(6) — update checking must not stomp agent error
+    api.sessions.set("s1", rawSession("error"));
+    api.setUpdateVisualState("checking"); // → sweeping(6)
+    assert.strictEqual(api.resolveDisplayState(), "error");
+
+    // notification(7) > sweeping(6)
+    api.sessions.set("s1", rawSession("notification"));
+    assert.strictEqual(api.resolveDisplayState(), "notification");
+
+    // carrying(4) < sweeping(6) — update checking still wins over lower
+    api.sessions.set("s1", rawSession("working"));
+    assert.strictEqual(api.resolveDisplayState(), "sweeping");
+
+    api.setUpdateVisualState(null);
+  });
+
+  it("update overlay wins when no sessions exist", () => {
+    api.setUpdateVisualState("checking");
+    assert.strictEqual(api.resolveDisplayState(), "sweeping");
+    api.setUpdateVisualState(null);
   });
 });
 
@@ -623,5 +659,44 @@ describe("DND mode", () => {
     mock.timers.tick(3000); // yawning → collapsing
     api.setState("working");
     assert.strictEqual(api.getCurrentState(), "collapsing");
+  });
+});
+
+describe("refreshTheme()", () => {
+  let api, ctx;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx();
+    api = require("../src/state")(ctx);
+  });
+  afterEach(() => {
+    api.cleanup();
+    mock.timers.reset();
+  });
+
+  it("updates idle svg and DND sleep path after hot theme switch", () => {
+    assert.strictEqual(api.getSvgOverride("idle"), "clawd-idle-follow.svg");
+
+    ctx.theme = _calicoTheme;
+    api.refreshTheme();
+
+    assert.strictEqual(api.getSvgOverride("idle"), "calico-idle-follow.svg");
+    api.enableDoNotDisturb();
+    assert.strictEqual(api.getCurrentState(), "collapsing");
+    mock.timers.tick(5200);
+    assert.strictEqual(api.getCurrentState(), "sleeping");
+  });
+
+  it("uses the refreshed theme wake duration before returning from waking", () => {
+    ctx.theme = _calicoTheme;
+    api.refreshTheme();
+
+    api.applyState("waking");
+    mock.timers.tick(5799);
+    assert.strictEqual(api.getCurrentState(), "waking");
+
+    mock.timers.tick(1);
+    assert.strictEqual(api.getCurrentState(), "idle");
   });
 });

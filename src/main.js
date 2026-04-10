@@ -2,6 +2,7 @@ const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut } = require("e
 const path = require("path");
 const fs = require("fs");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
+const hitGeometry = require("./hit-geometry");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -91,13 +92,10 @@ let activeTheme = loadThemeFromPrefs(loadPrefs());
 
 // ── CSS <object> sizing (from theme) ──
 function getObjRect(bounds) {
-  const os = activeTheme.objectScale;
-  return {
-    x: bounds.x + bounds.width * os.offsetX,
-    y: bounds.y + bounds.height * os.offsetY,
-    w: bounds.width * os.widthRatio,
-    h: bounds.height * os.heightRatio,
-  };
+  const state = _state.getCurrentState();
+  const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
+  return hitGeometry.getAssetRectScreen(activeTheme, bounds, state, file)
+    || { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
 }
 
 let win;
@@ -160,6 +158,7 @@ function togglePetVisibility() {
         if (isLinux) perm.bubble.setSkipTaskbar(true);
       }
     }
+    syncUpdateBubbleVisibility();
     reapplyMacVisibility();
     petHidden = false;
   } else {
@@ -169,6 +168,7 @@ function togglePetVisibility() {
     for (const perm of pendingPermissions) {
       if (perm.bubble && !perm.bubble.isDestroyed()) perm.bubble.hide();
     }
+    hideUpdateBubble();
     petHidden = true;
   }
   syncPermissionShortcuts();
@@ -197,6 +197,52 @@ function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
 }
 
+function syncHitStateAfterLoad() {
+  sendToHitWin("hit-state-sync", {
+    currentSvg: _state.getCurrentSvg(),
+    currentState: _state.getCurrentState(),
+    miniMode: _mini.getMiniMode(),
+    dndEnabled: doNotDisturb,
+  });
+}
+
+function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
+  if (_mini.getMiniMode()) {
+    sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
+  }
+  if (doNotDisturb) {
+    sendToRenderer("dnd-change", true);
+    if (_mini.getMiniMode()) {
+      applyState("mini-sleep");
+    } else {
+      applyState("sleeping");
+    }
+    return;
+  }
+  if (_mini.getMiniMode()) {
+    applyState("mini-idle");
+    return;
+  }
+  if (sessions.size > 0) {
+    const resolved = resolveDisplayState();
+    applyState(resolved, getSvgOverride(resolved));
+    return;
+  }
+
+  applyState("idle", getSvgOverride("idle"));
+  if (!includeStartupRecovery) return;
+
+  setTimeout(() => {
+    if (sessions.size > 0 || doNotDisturb) return;
+    detectRunningAgentProcesses((found) => {
+      if (found && sessions.size === 0 && !doNotDisturb) {
+        _startStartupRecovery();
+        resetIdleTimer();
+      }
+    });
+  }, 5000);
+}
+
 // ── Sound playback ──
 let lastSoundTime = 0;
 const SOUND_COOLDOWN_MS = 10000;
@@ -209,6 +255,10 @@ function playSound(name) {
   if (!url) return;
   lastSoundTime = now;
   sendToRenderer("play-sound", url);
+}
+
+function resetSoundCooldown() {
+  lastSoundTime = 0;
 }
 
 // Sync input window position to match render window's hitbox.
@@ -236,6 +286,7 @@ let dragLocked = false;
 let menuOpen = false;
 let idlePaused = false;
 let forceEyeResend = false;
+let themeReloadInProgress = false;
 
 // ── Mini Mode — delegated to src/mini.js ──
 // Initialized after state module (needs applyState, resolveDisplayState, etc.)
@@ -266,6 +317,31 @@ const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
 
+const _updateBubbleCtx = {
+  get win() { return win; },
+  get bubbleFollowPet() { return bubbleFollowPet; },
+  get petHidden() { return petHidden; },
+  getPendingPermissions: () => pendingPermissions,
+  getNearestWorkArea,
+  getHitRectScreen,
+  guardAlwaysOnTop,
+  reapplyMacVisibility,
+};
+const _updateBubble = require("./update-bubble")(_updateBubbleCtx);
+const {
+  showUpdateBubble,
+  hideUpdateBubble,
+  repositionUpdateBubble,
+  handleUpdateBubbleAction,
+  handleUpdateBubbleHeight,
+  syncVisibility: syncUpdateBubbleVisibility,
+} = _updateBubble;
+
+function repositionFloatingBubbles() {
+  if (pendingPermissions.length) repositionBubbles();
+  repositionUpdateBubble();
+}
+
 // ── macOS cross-Space visibility helper ──
 // Prefer native collection behavior over Electron's setVisibleOnAllWorkspaces:
 // Electron may briefly hide the window while transforming process type, while
@@ -289,6 +365,7 @@ function reapplyMacVisibility() {
   apply(win);
   apply(hitWin);
   for (const perm of pendingPermissions) apply(perm.bubble);
+  apply(_updateBubble.getBubbleWindow());
   apply(contextMenuOwner);
 }
 
@@ -304,6 +381,8 @@ const _stateCtx = {
   get mouseOverPet() { return mouseOverPet; },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
   set miniSleepPeeked(v) { _mini.setMiniSleepPeeked(v); },
+  get miniPeeked() { return _mini.getMiniPeeked(); },
+  set miniPeeked(v) { _mini.setMiniPeeked(v); },
   get idlePaused() { return idlePaused; },
   set idlePaused(v) { idlePaused = v; },
   get forceEyeResend() { return forceEyeResend; },
@@ -329,23 +408,24 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
         startWakePoll, stopWakePoll, detectRunningAgentProcesses, buildSessionSubmenu,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
-const STATE_SVGS = _state.STATE_SVGS;
 const STATE_PRIORITY = _state.STATE_PRIORITY;
 
 // ── Hit-test: SVG bounding box → screen coordinates ──
 function getHitRectScreen(bounds) {
-  const obj = getObjRect(bounds);
-  const vb = activeTheme.viewBox;
-  const scale = Math.min(obj.w, obj.h) / vb.width;
-  const offsetX = obj.x + (obj.w - vb.width * scale) / 2;
-  const offsetY = obj.y + (obj.h - vb.height * scale) / 2;
-  const hb = _state.getCurrentHitBox();
-  return {
-    left:   offsetX + (hb.x + -vb.x) * scale,
-    top:    offsetY + (hb.y + -vb.y) * scale,
-    right:  offsetX + (hb.x + -vb.x + hb.w) * scale,
-    bottom: offsetY + (hb.y + -vb.y + hb.h) * scale,
-  };
+  const state = _state.getCurrentState();
+  const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
+  const hit = hitGeometry.getHitRectScreen(
+    activeTheme,
+    bounds,
+    state,
+    file,
+    _state.getCurrentHitBox(),
+    {
+      padX: _mini.getMiniMode() ? _mini.PEEK_OFFSET : 0,
+      padY: _mini.getMiniMode() ? 8 : 0,
+    }
+  );
+  return hit || { left: bounds.x, top: bounds.y, right: bounds.x + bounds.width, bottom: bounds.y + bounds.height };
 }
 
 // ── Main tick — delegated to src/tick.js ──
@@ -362,6 +442,8 @@ const _tickCtx = {
   get isAnimating() { return _mini.getIsAnimating(); },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
   set miniSleepPeeked(v) { _mini.setMiniSleepPeeked(v); },
+  get miniPeeked() { return _mini.getMiniPeeked(); },
+  set miniPeeked(v) { _mini.setMiniPeeked(v); },
   get mouseOverPet() { return mouseOverPet; },
   set mouseOverPet(v) { mouseOverPet = v; },
   get forceEyeResend() { return forceEyeResend; },
@@ -390,7 +472,7 @@ const _serverCtx = {
   get hideBubbles() { return hideBubbles; },
   get pendingPermissions() { return pendingPermissions; },
   get PASSTHROUGH_TOOLS() { return PASSTHROUGH_TOOLS; },
-  get STATE_SVGS() { return STATE_SVGS; },
+  get STATE_SVGS() { return _state.STATE_SVGS; },
   get sessions() { return sessions; },
   setState,
   updateSession,
@@ -463,6 +545,10 @@ function startTopmostWatchdog() {
     for (const perm of pendingPermissions) {
       if (perm.bubble && !perm.bubble.isDestroyed() && perm.bubble.isVisible()) perm.bubble.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
     }
+    const updateBubbleWin = _updateBubble.getBubbleWindow();
+    if (updateBubbleWin && !updateBubbleWin.isDestroyed() && updateBubbleWin.isVisible()) {
+      updateBubbleWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+    }
   }, TOPMOST_WATCHDOG_MS);
 }
 
@@ -500,7 +586,7 @@ const _menuCtx = {
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { soundMuted = v; },
   get pendingPermissions() { return pendingPermissions; },
-  repositionBubbles: () => repositionBubbles(),
+  repositionBubbles: () => repositionFloatingBubbles(),
   get petHidden() { return petHidden; },
   togglePetVisibility: () => togglePetVisibility(),
   get isQuitting() { return isQuitting; },
@@ -547,7 +633,15 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 const _updaterCtx = {
   get doNotDisturb() { return doNotDisturb; },
   get miniMode() { return _mini.getMiniMode(); },
+  get lang() { return lang; },
   t, rebuildAllMenus, updateLog,
+  showUpdateBubble: (payload) => showUpdateBubble(payload),
+  hideUpdateBubble: () => hideUpdateBubble(),
+  setUpdateVisualState: (kind) => _state.setUpdateVisualState(kind),
+  applyState: (state, svgOverride) => applyState(state, svgOverride),
+  resolveDisplayState: () => resolveDisplayState(),
+  getSvgOverride: (state) => getSvgOverride(state),
+  resetSoundCooldown: () => resetSoundCooldown(),
 };
 const _updater = require("./updater")(_updaterCtx);
 const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel } = _updater;
@@ -712,14 +806,19 @@ function createWindow() {
     if (isWin) guardAlwaysOnTop(hitWin);
 
     // Event-level safety net for position sync
-    win.on("move", syncHitWin);
-    win.on("resize", syncHitWin);
+    const syncFloatingWindows = () => {
+      syncHitWin();
+      if (bubbleFollowPet) repositionFloatingBubbles();
+      else repositionUpdateBubble();
+    };
+    win.on("move", syncFloatingWindows);
+    win.on("resize", syncFloatingWindows);
 
     // Send initial state to hitWin once it's ready
     hitWin.webContents.on("did-finish-load", () => {
-      sendToHitWin("hit-state-sync", {
-        currentSvg: _state.getCurrentSvg(), miniMode: _mini.getMiniMode(), dndEnabled: doNotDisturb,
-      });
+      sendToHitWin("theme-config", themeLoader.getHitRendererConfig());
+      if (themeReloadInProgress) return;
+      syncHitStateAfterLoad();
     });
 
     // Crash recovery for hitWin
@@ -741,7 +840,7 @@ function createWindow() {
     const looseClamped = looseClampToDisplays(newX, newY, size.width, size.height);
     win.setBounds({ ...looseClamped, width: size.width, height: size.height });
     syncHitWin();
-    if (bubbleFollowPet && pendingPermissions.length) repositionBubbles();
+    if (bubbleFollowPet) repositionFloatingBubbles();
   });
 
   ipcMain.on("pause-cursor-polling", () => { idlePaused = true; });
@@ -774,6 +873,7 @@ function createWindow() {
         const clamped = clampToScreen(x, y, size.width, size.height);
         win.setBounds({ ...clamped, width: size.width, height: size.height });
         syncHitWin();
+        repositionUpdateBubble();
       }
     }
   });
@@ -803,6 +903,8 @@ function createWindow() {
 
   ipcMain.on("bubble-height", (event, height) => _perm.handleBubbleHeight(event, height));
   ipcMain.on("permission-decide", (event, behavior) => _perm.handleDecide(event, behavior));
+  ipcMain.on("update-bubble-height", (event, height) => handleUpdateBubbleHeight(event, height));
+  ipcMain.on("update-bubble-action", (event, actionId) => handleUpdateBubbleAction(event, actionId));
 
   initFocusHelper();
   startMainTick();
@@ -812,37 +914,9 @@ function createWindow() {
   // If hooks arrived during startup, respect them instead of forcing idle
   // Also handles crash recovery (render-process-gone → reload)
   win.webContents.on("did-finish-load", () => {
-    if (_mini.getMiniMode()) {
-      sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
-    sendToHitWin("hit-state-sync", { miniMode: true });
-    }
-    if (doNotDisturb) {
-      sendToRenderer("dnd-change", true);
-    sendToHitWin("hit-state-sync", { dndEnabled: true });
-      if (_mini.getMiniMode()) {
-        applyState("mini-sleep");
-      } else {
-        applyState("sleeping");
-      }
-    } else if (_mini.getMiniMode()) {
-      applyState("mini-idle");
-    } else if (sessions.size > 0) {
-      const resolved = resolveDisplayState();
-      applyState(resolved, getSvgOverride(resolved));
-    } else {
-      applyState("idle", "clawd-idle-follow.svg");
-      // Startup recovery: delay 5s to let HWND/z-order/drag systems stabilize,
-      // then detect running Claude Code processes → suppress sleep sequence
-      setTimeout(() => {
-        if (sessions.size > 0 || doNotDisturb) return; // hook arrived during wait
-        detectRunningAgentProcesses((found) => {
-          if (found && sessions.size === 0 && !doNotDisturb) {
-            _startStartupRecovery();
-            resetIdleTimer();
-          }
-        });
-      }, 5000);
-    }
+    sendToRenderer("theme-config", themeLoader.getRendererConfig());
+    if (themeReloadInProgress) return;
+    syncRendererStateAfterLoad();
   });
 
   // ── Crash recovery: renderer process can die from <object> churn ──
@@ -872,6 +946,7 @@ function createWindow() {
     if (isProportionalMode() || clamped.x !== x || clamped.y !== y) {
       win.setBounds({ ...clamped, width: size.width, height: size.height });
       syncHitWin();
+      repositionUpdateBubble();
     }
   });
   screen.on("display-removed", () => {
@@ -886,9 +961,11 @@ function createWindow() {
     const clamped = clampToScreen(x, y, size.width, size.height);
     win.setBounds({ ...clamped, width: size.width, height: size.height });
     syncHitWin();
+    repositionUpdateBubble();
   });
   screen.on("display-added", () => {
     reapplyMacVisibility();
+    repositionUpdateBubble();
   });
 }
 
@@ -958,7 +1035,7 @@ const _miniCtx = {
   getNearestWorkArea,
   get bubbleFollowPet() { return bubbleFollowPet; },
   get pendingPermissions() { return pendingPermissions; },
-  repositionBubbles: () => repositionBubbles(),
+  repositionBubbles: () => repositionFloatingBubbles(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
 };
@@ -991,32 +1068,28 @@ function switchTheme(themeId) {
 
   // 3. Update active theme
   activeTheme = newTheme;
-
-  const rendererConfig = themeLoader.getRendererConfig();
-  const hitConfig = themeLoader.getHitRendererConfig();
+  _mini.refreshTheme();
+  _state.refreshTheme();
+  _tick.refreshTheme();
+  if (_mini.getMiniMode()) _mini.handleDisplayChange();
 
   // 4. Reload both windows
+  themeReloadInProgress = true;
   win.webContents.reload();
   hitWin.webContents.reload();
 
-  // 5. After reload completes, push new config via IPC + restart tick
+  // 5. After both reloads complete, re-sync state with the new theme.
   let ready = 0;
   const onReady = () => {
     if (++ready < 2) return;
-    // Re-apply current state so renderer shows correct animation
-    const { state, svg } = resolveDisplayState();
-    sendToRenderer("state-change", state, svg);
+    themeReloadInProgress = false;
+    syncHitStateAfterLoad();
+    syncRendererStateAfterLoad({ includeStartupRecovery: false });
     syncHitWin();
     startMainTick();
   };
-  win.webContents.once("did-finish-load", () => {
-    win.webContents.send("theme-config", rendererConfig);
-    onReady();
-  });
-  hitWin.webContents.once("did-finish-load", () => {
-    hitWin.webContents.send("theme-config", hitConfig);
-    onReady();
-  });
+  win.webContents.once("did-finish-load", onReady);
+  hitWin.webContents.once("did-finish-load", onReady);
 
   savePrefs();
   rebuildAllMenus();
@@ -1153,6 +1226,7 @@ if (!gotTheLock) {
     globalShortcut.unregisterAll();
     _perm.cleanup();
     _server.cleanup();
+    _updateBubble.cleanup();
     _state.cleanup();
     _tick.cleanup();
     _mini.cleanup();
