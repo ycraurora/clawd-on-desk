@@ -3,6 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
 const hitGeometry = require("./hit-geometry");
+const { findNearestWorkArea, computeLooseClamp, SYNTHETIC_WORK_AREA } = require("./work-area");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -124,7 +125,7 @@ function getCurrentPixelSize(overrideWa) {
     const { x, y, width, height } = win.getBounds();
     wa = getNearestWorkArea(x + width / 2, y + height / 2);
   }
-  if (!wa) wa = screen.getPrimaryDisplay().workArea;
+  if (!wa) wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
   const px = Math.round(wa.width * ratio / 100);
   return { width: px, height: px };
 }
@@ -297,6 +298,7 @@ let themeReloadInProgress = false;
 const _permCtx = {
   get win() { return win; },
   get lang() { return lang; },
+  get sessions() { return sessions; },
   get bubbleFollowPet() { return bubbleFollowPet; },
   get permDebugLog() { return permDebugLog; },
   get doNotDisturb() { return doNotDisturb; },
@@ -652,7 +654,7 @@ function createWindow() {
     currentSize = prefs.size;
   } else if (prefs && SIZES[prefs.size]) {
     // Migrate legacy S/M/L to proportional mode
-    const wa = screen.getPrimaryDisplay().workArea;
+    const wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
     const px = SIZES[prefs.size].width;
     const ratio = Math.round(px / wa.width * 100);
     currentSize = `P:${Math.max(1, Math.min(75, ratio))}`;
@@ -686,7 +688,7 @@ function createWindow() {
     startX = clamped.x;
     startY = clamped.y;
   } else {
-    const { workArea } = screen.getPrimaryDisplay();
+    const workArea = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
     startX = workArea.x + workArea.width - size.width - 20;
     startY = workArea.y + workArea.height - size.height - 20;
   }
@@ -969,37 +971,26 @@ function createWindow() {
   });
 }
 
-function getNearestWorkArea(cx, cy) {
-  const displays = screen.getAllDisplays();
-  let nearest = displays[0].workArea;
-  let minDist = Infinity;
-  for (const d of displays) {
-    const wa = d.workArea;
-    const dx = Math.max(wa.x - cx, 0, cx - (wa.x + wa.width));
-    const dy = Math.max(wa.y - cy, 0, cy - (wa.y + wa.height));
-    const dist = dx * dx + dy * dy;
-    if (dist < minDist) { minDist = dist; nearest = wa; }
+// Read primary display safely — getPrimaryDisplay() can also throw during
+// display topology changes, so wrap it. Returns null on failure; the pure
+// helpers in work-area.js will fall through to a synthetic last-resort.
+function getPrimaryWorkAreaSafe() {
+  try {
+    const primary = screen.getPrimaryDisplay();
+    return (primary && primary.workArea) || null;
+  } catch {
+    return null;
   }
-  return nearest;
+}
+
+function getNearestWorkArea(cx, cy) {
+  return findNearestWorkArea(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), cx, cy);
 }
 
 // Loose clamp used during drag: union of all display work areas as the boundary,
 // so the pet can freely cross between screens. Only prevents going fully off-screen.
 function looseClampToDisplays(x, y, w, h) {
-  const displays = screen.getAllDisplays();
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const d of displays) {
-    const wa = d.workArea;
-    if (wa.x < minX) minX = wa.x;
-    if (wa.y < minY) minY = wa.y;
-    if (wa.x + wa.width > maxX) maxX = wa.x + wa.width;
-    if (wa.y + wa.height > maxY) maxY = wa.y + wa.height;
-  }
-  const margin = Math.round(w * 0.25);
-  return {
-    x: Math.max(minX - margin, Math.min(x, maxX - w + margin)),
-    y: Math.max(minY - margin, Math.min(y, maxY - h + margin)),
-  };
+  return computeLooseClamp(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), x, y, w, h);
 }
 
 function clampToScreen(x, y, w, h) {
