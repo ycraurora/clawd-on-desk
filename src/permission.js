@@ -48,6 +48,18 @@ const HOTKEY_ALLOW = "CommandOrControl+Shift+Y";
 const HOTKEY_DENY  = "CommandOrControl+Shift+N";
 let hotkeysRegistered = false;
 
+function sendToBubble(bubble, channel, payload) {
+  if (!bubble || bubble.isDestroyed()) return false;
+  const wc = bubble.webContents;
+  if (!wc || wc.isDestroyed()) return false;
+  try {
+    wc.send(channel, payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getActionablePermissions() {
   return pendingPermissions.filter(
     p => !p.isElicitation && !p.isCodexNotify && p.toolName !== "ExitPlanMode"
@@ -206,7 +218,8 @@ function showPermissionBubble(permEntry) {
   bub.loadFile(path.join(__dirname, "bubble.html"));
 
   bub.webContents.once("did-finish-load", () => {
-    bub.webContents.send("permission-show", {
+    if (permEntry.bubble !== bub || pendingPermissions.indexOf(permEntry) === -1) return;
+    sendToBubble(bub, "permission-show", {
       toolName: permEntry.toolName,
       toolInput: permEntry.toolInput,
       suggestions: permEntry.suggestions || [],
@@ -265,7 +278,7 @@ function resolvePermissionEntry(permEntry, behavior, message) {
 
   // Hide this bubble (fade out + destroy)
   if (bub && !bub.isDestroyed()) {
-    bub.webContents.send("permission-hide");
+    sendToBubble(bub, "permission-hide");
     if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
     permEntry.hideTimer = setTimeout(() => {
       if (bub && !bub.isDestroyed()) bub.destroy();
@@ -454,9 +467,9 @@ function handleDecide(event, behavior) {
     // Dismiss bubble without responding — let user decide in terminal.
     // Keep abortHandler registered so socket cleanup happens when Claude Code disconnects.
     const idx = pendingPermissions.indexOf(perm);
-    if (idx !== -1) pendingPermissions.splice(idx, 1);
-    if (perm.bubble && !perm.bubble.isDestroyed()) {
-      perm.bubble.webContents.send("permission-hide");
+  if (idx !== -1) pendingPermissions.splice(idx, 1);
+  if (perm.bubble && !perm.bubble.isDestroyed()) {
+      sendToBubble(perm.bubble, "permission-hide");
       if (perm.hideTimer) clearTimeout(perm.hideTimer);
       const bub = perm.bubble;
       perm.hideTimer = setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
@@ -500,7 +513,7 @@ function dismissCodexNotify(permEntry) {
   if (permEntry.autoExpireTimer) clearTimeout(permEntry.autoExpireTimer);
   if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
   if (permEntry.bubble && !permEntry.bubble.isDestroyed()) {
-    permEntry.bubble.webContents.send("permission-hide");
+    sendToBubble(permEntry.bubble, "permission-hide");
     const bub = permEntry.bubble;
     setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
   }
