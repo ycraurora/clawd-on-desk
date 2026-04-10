@@ -3,6 +3,7 @@ const path = require("path");
 const APPROVAL_HEURISTIC_MS = 2000;
 const MAX_TRACKED_FILES = 50;
 const MAX_PARTIAL_BYTES = 65536;
+const RECENT_DAY_DIR_CACHE_MS = 60 * 60 * 1000;
 const FALLBACK_HOME_CANDIDATES = [
   "/root",
   "/home/vscode",
@@ -95,6 +96,9 @@ class CodexBridgeMonitor {
     this._activeRoot = null;
     this._lastNoRootLogAt = 0;
     this._hasLoggedSuccessfulPoll = false;
+    this._recentDayDirsCache = [];
+    this._recentDayDirsCacheAt = 0;
+    this._recentDayDirsDateKey = "";
   }
 
   start() {
@@ -130,8 +134,19 @@ class CodexBridgeMonitor {
       return;
     }
 
-    const dayDirs = getRecentDateParts(new Date(), 3)
-      .map(({ yyyy, mm, dd }) => path.posix.join(root, yyyy, mm, dd));
+    const dayDirs = [];
+    const seen = new Set();
+    const addDayDir = (dir) => {
+      if (!dir || seen.has(dir)) return;
+      seen.add(dir);
+      dayDirs.push(dir);
+    };
+    for (const { yyyy, mm, dd } of getRecentDateParts(new Date(), 3)) {
+      addDayDir(path.posix.join(root, yyyy, mm, dd));
+    }
+    for (const dir of await this._getCachedRecentExistingDayDirs(root, 7)) {
+      addDayDir(dir);
+    }
 
     let sawAnyTrackedFile = false;
     for (const dir of dayDirs) {
@@ -318,6 +333,84 @@ class CodexBridgeMonitor {
         this._log(`remote-codex stale cleanup: ${tracked.sessionId} from ${filePath}`);
       }
     }
+  }
+
+  async _getCachedRecentExistingDayDirs(root, limit = 7) {
+    const now = Date.now();
+    const dateKey = this._getLocalDateKey();
+    const cacheStale = now - this._recentDayDirsCacheAt > RECENT_DAY_DIR_CACHE_MS;
+    const dayChanged = dateKey !== this._recentDayDirsDateKey;
+    if (!this._recentDayDirsCache.length || cacheStale || dayChanged) {
+      this._recentDayDirsCache = await this._getRecentExistingDayDirs(root, limit);
+      this._recentDayDirsCacheAt = now;
+      this._recentDayDirsDateKey = dateKey;
+    }
+    return this._recentDayDirsCache.slice(0, limit);
+  }
+
+  _getLocalDateKey() {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const dd = String(now.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  async _getRecentExistingDayDirs(root, limit = 7) {
+    const out = [];
+    let years;
+    try {
+      years = await this._readDir(root);
+    } catch {
+      return out;
+    }
+    const yearNames = years
+      .filter((entry) => this._isDirectoryEntry(entry) && /^\d{4}$/.test(this._entryName(entry)))
+      .map((entry) => this._entryName(entry))
+      .sort((a, b) => b.localeCompare(a));
+
+    for (const yyyy of yearNames) {
+      const yearDir = path.posix.join(root, yyyy);
+      let months;
+      try {
+        months = await this._readDir(yearDir);
+      } catch {
+        continue;
+      }
+      const monthNames = months
+        .filter((entry) => this._isDirectoryEntry(entry) && /^\d{2}$/.test(this._entryName(entry)))
+        .map((entry) => this._entryName(entry))
+        .sort((a, b) => b.localeCompare(a));
+
+      for (const mm of monthNames) {
+        const monthDir = path.posix.join(yearDir, mm);
+        let days;
+        try {
+          days = await this._readDir(monthDir);
+        } catch {
+          continue;
+        }
+        const dayNames = days
+          .filter((entry) => this._isDirectoryEntry(entry) && /^\d{2}$/.test(this._entryName(entry)))
+          .map((entry) => this._entryName(entry))
+          .sort((a, b) => b.localeCompare(a));
+
+        for (const dd of dayNames) {
+          out.push(path.posix.join(monthDir, dd));
+          if (out.length >= limit) return out;
+        }
+      }
+    }
+    return out;
+  }
+
+  _entryName(entry) {
+    return typeof entry === "string" ? entry : entry && entry.name ? entry.name : "";
+  }
+
+  _isDirectoryEntry(entry) {
+    if (typeof entry === "string") return true;
+    return !!(entry && typeof entry.isDirectory === "function" && entry.isDirectory());
   }
 
   _extractShellCommand(payload) {

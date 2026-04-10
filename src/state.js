@@ -314,6 +314,15 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
 
   const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, pidReachable };
 
+  if (event === "codex-permission") {
+    const nextState = existing && existing.state === "juggling" ? "juggling" : "working";
+    const dh = pickDisplayHint(nextState, existing, displayHint);
+    sessions.set(sessionId, { state: nextState, updatedAt: Date.now(), displayHint: dh, ...base });
+    cleanStaleSessions();
+    setState("notification");
+    return;
+  }
+
   // Evict oldest session if at capacity and this is a new session
   if (!existing && sessions.size >= MAX_SESSIONS) {
     let oldestId = null, oldestTime = Infinity;

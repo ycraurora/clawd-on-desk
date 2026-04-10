@@ -1,5 +1,6 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const path = require("path");
 const {
   CodexBridgeMonitor,
   buildSessionRootCandidates,
@@ -97,5 +98,46 @@ describe("CodexBridgeMonitor parsing", () => {
     assert.strictEqual(events.length, 1);
     assert.strictEqual(events[0].state, "notification");
     assert.strictEqual(events[0].extra.permissionDetail.command, "git push");
+  });
+
+  it("includes older existing day dirs beyond the last 3 calendar days", async () => {
+    const seenDirs = [];
+    const oldDir = "/home/stella/.codex/sessions/2026/04/07";
+    const monitor = new CodexBridgeMonitor({
+      sessionRoots: ["/home/stella/.codex/sessions"],
+      readDir: async (dir) => {
+        seenDirs.push(dir);
+        if (dir === "/home/stella/.codex/sessions") {
+          return [{ name: "2026", isDirectory: () => true }];
+        }
+        if (dir === "/home/stella/.codex/sessions/2026") {
+          return [{ name: "04", isDirectory: () => true }];
+        }
+        if (dir === "/home/stella/.codex/sessions/2026/04") {
+          return [
+            { name: "10", isDirectory: () => true },
+            { name: "09", isDirectory: () => true },
+            { name: "08", isDirectory: () => true },
+            { name: "07", isDirectory: () => true },
+          ];
+        }
+        if (dir === oldDir) {
+          return ["rollout-2026-04-07T13-25-50-019d6667-7a44-75a1-a782-2c578927b10b.jsonl"];
+        }
+        return [];
+      },
+      stat: async () => ({ mtimeMs: Date.now() }),
+      readFile: async () => Buffer.from('{"type":"session_meta","payload":{"cwd":"/workspace"}}\n'),
+      postState: () => {},
+      log: () => {},
+    });
+
+    monitor._activeRoot = "/home/stella/.codex/sessions";
+    await monitor._poll();
+
+    assert.ok(seenDirs.includes(oldDir), "expected poll to include older existing day dir");
+    assert.ok(
+      monitor._tracked.has(path.posix.join(oldDir, "rollout-2026-04-07T13-25-50-019d6667-7a44-75a1-a782-2c578927b10b.jsonl"))
+    );
   });
 });

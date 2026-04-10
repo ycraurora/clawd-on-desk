@@ -2,7 +2,7 @@
   "name": "clawd-terminal-focus",
   "displayName": "Clawd Terminal Focus",
   "description": "Enables Clawd desktop pet to focus the correct terminal tab and bridge remote Codex activity",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publisher": "clawd",
   "engines": {
     "vscode": "^1.70.0"
