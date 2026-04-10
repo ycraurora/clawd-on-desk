@@ -484,6 +484,17 @@ describe("updateSession()", () => {
     assert.strictEqual(api.getCurrentState(), "notification");
   });
 
+  it("codex-permission keeps underlying session active while showing notification", () => {
+    update(api, { id: "s1", state: "thinking", agentId: "codex" });
+    mock.timers.tick(1000);
+    update(api, { id: "s1", state: "notification", event: "codex-permission", agentId: "codex" });
+    assert.strictEqual(api.sessions.get("s1").state, "working");
+    assert.strictEqual(api.getCurrentState(), "notification");
+    mock.timers.tick(4000);
+    assert.strictEqual(api.resolveDisplayState(), "working");
+    assert.strictEqual(api.getCurrentState(), "working");
+  });
+
   it("SessionEnd + sweeping → plays sweeping even with other active sessions", () => {
     // Insert sessions directly to avoid MIN_DISPLAY_MS cascade from setState
     api.sessions.set("s1", rawSession("working"));

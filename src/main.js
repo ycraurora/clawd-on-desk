@@ -12,6 +12,14 @@ const isLinux = process.platform === "linux";
 const isWin = process.platform === "win32";
 const LINUX_WINDOW_TYPE = "toolbar";
 
+if (isLinux) {
+  // Prefer stability over GPU acceleration on Linux WMs/drivers. Keep this
+  // in the main process so packaged builds behave the same as `npm start`.
+  app.commandLine.appendSwitch("disable-gpu-compositing");
+  app.commandLine.appendSwitch("disable-accelerated-2d-canvas");
+  app.commandLine.appendSwitch("disable-accelerated-video-decode");
+}
+
 
 // ── Windows: AllowSetForegroundWindow via FFI ──
 let _allowSetForeground = null;
@@ -389,6 +397,8 @@ const _serverCtx = {
   resolvePermissionEntry,
   sendPermissionResponse,
   showPermissionBubble,
+  showCodexNotifyBubble,
+  clearCodexNotifyBubbles,
   replyOpencodePermission,
   permLog,
 };
@@ -1014,7 +1024,7 @@ function switchTheme(themeId) {
 
 // ── Auto-install VS Code / Cursor terminal-focus extension ──
 const EXT_ID = "clawd.clawd-terminal-focus";
-const EXT_VERSION = "0.3.2";
+const EXT_VERSION = "0.3.3";
 const EXT_DIR_NAME = `${EXT_ID}-${EXT_VERSION}`;
 
 function installTerminalFocusExtension() {

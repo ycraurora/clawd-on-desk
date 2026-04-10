@@ -111,6 +111,9 @@ function ensureRemoteMonitor() {
         cwd: extra && typeof extra.cwd === "string" ? extra.cwd : "",
         host: hostLabel,
       };
+      if (extra && extra.permissionDetail && typeof extra.permissionDetail === "object") {
+        payload.permissionDetail = extra.permissionDetail;
+      }
       bridgeLog(`forwarding via command state=${payload.state} sid=${payload.session_id} event=${payload.event}`);
       void vscode.commands.executeCommand(UI_FORWARD_STATE_COMMAND, payload)
         .then((ok) => {

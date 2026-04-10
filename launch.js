@@ -22,7 +22,14 @@ if (process.platform === "linux") {
 }
 
 const args = process.platform === "linux"
-  ? [".", "--no-sandbox", "--disable-setuid-sandbox"]
+  ? [
+      ".",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu-compositing",
+      "--disable-accelerated-2d-canvas",
+      "--disable-accelerated-video-decode",
+    ]
   : ["."];
 const child = spawn(electron, args, {
   stdio: "inherit",

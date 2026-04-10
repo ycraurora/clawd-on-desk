@@ -2,7 +2,7 @@
   "name": "clawd-remote-codex",
   "displayName": "Clawd Remote Codex Monitor",
   "description": "Runs in VS Code remote workspaces and forwards Codex session activity back to the local Clawd bridge.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "clawd",
   "engines": {
     "vscode": "^1.70.0"

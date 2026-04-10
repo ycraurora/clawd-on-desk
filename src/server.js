@@ -20,6 +20,12 @@ module.exports = function initServer(ctx) {
 let httpServer = null;
 let activeServerPort = null;
 
+function isRemoteCodexPermissionEvent(data) {
+  return data
+    && data.agent_id === "codex"
+    && data.event === "codex-permission";
+}
+
 function getHookServerPort() {
   return activeServerPort || readRuntimePort() || DEFAULT_SERVER_PORT;
 }
@@ -184,6 +190,9 @@ function startHttpServer() {
         try {
           const data = JSON.parse(body);
           const { state, svg, session_id, event } = data;
+          const permissionDetail = data.permissionDetail && typeof data.permissionDetail === "object"
+            ? data.permissionDetail
+            : null;
           let display_svg;
           if (data.display_svg === null) display_svg = null;
           else if (typeof data.display_svg === "string") display_svg = path.basename(data.display_svg);
@@ -199,6 +208,21 @@ function startHttpServer() {
           const headless = data.headless === true;
           if (ctx.STATE_SVGS[state]) {
             const sid = session_id || "default";
+            if (isRemoteCodexPermissionEvent(data)) {
+              ctx.updateSession(sid, "notification", event, source_pid, cwd, editor, pidChain, agentPid, agentId, host, headless, display_svg);
+              ctx.showCodexNotifyBubble({
+                sessionId: sid,
+                command: permissionDetail && typeof permissionDetail.command === "string"
+                  ? permissionDetail.command
+                  : "",
+              });
+              res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+              res.end("ok");
+              return;
+            }
+            if (agentId === "codex" && event !== "codex-permission") {
+              ctx.clearCodexNotifyBubbles(sid);
+            }
             if (state.startsWith("mini-") && !svg) {
               res.writeHead(400);
               res.end("mini states require svg override");
