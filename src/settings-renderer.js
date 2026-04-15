@@ -56,6 +56,31 @@ const STRINGS = {
     toastSaveFailed: "Couldn't save: ",
     langEnglish: "English",
     langChinese: "中文",
+    themeTitle: "Theme",
+    themeSubtitle: "Pick a theme for Clawd. Community themes land in your user themes folder and can be removed from here.",
+    themeEmpty: "No themes available.",
+    themeBadgeBuiltin: "Built-in",
+    themeBadgeActive: "Active",
+    themeActiveIndicator: "\u2713 Active",
+    themeThumbMissing: "\u{1F3AD}",
+    themeDeleteLabel: "Delete theme",
+    toastThemeDeleted: "Theme deleted.",
+    toastThemeDeleteFailed: "Couldn't delete theme: ",
+    animMapTitle: "Animation Map",
+    animMapSubtitle: "Silence individual interrupt animations. Events still fire — Clawd just skips the visual and sound for the selected states.",
+    animMapSemanticsNote: "Disable = no visual + no sound. Permission bubbles, sessions, and terminal focus still work.",
+    animMapResetAll: "Reset all",
+    animMapAttentionLabel: "Task complete (happy)",
+    animMapAttentionDesc: "The happy bounce when the agent finishes a turn (Stop / PostCompact).",
+    animMapErrorLabel: "Error flash",
+    animMapErrorDesc: "The shake animation when a tool call fails.",
+    animMapSweepingLabel: "Context sweep",
+    animMapSweepingDesc: "The broom animation during PreCompact / context clearing.",
+    animMapNotificationLabel: "Notification",
+    animMapNotificationDesc: "The bell animation for permission requests and elicitations.",
+    animMapCarryingLabel: "Worktree carry",
+    animMapCarryingDesc: "The carrying animation when a worktree is created.",
+    toastAnimMapResetOk: "Animation overrides cleared.",
   },
   zh: {
     settingsTitle: "设置",
@@ -98,6 +123,31 @@ const STRINGS = {
     toastSaveFailed: "保存失败：",
     langEnglish: "English",
     langChinese: "中文",
+    themeTitle: "主题",
+    themeSubtitle: "为 Clawd 选择一个主题。社区主题会放在你的用户主题目录里，可以在此删除。",
+    themeEmpty: "没有可用的主题。",
+    themeBadgeBuiltin: "内建",
+    themeBadgeActive: "当前",
+    themeActiveIndicator: "\u2713 当前",
+    themeThumbMissing: "\u{1F3AD}",
+    themeDeleteLabel: "删除主题",
+    toastThemeDeleted: "主题已删除。",
+    toastThemeDeleteFailed: "删除主题失败：",
+    animMapTitle: "动画映射",
+    animMapSubtitle: "关掉不想看的打扰动画。事件照样会触发——Clawd 只是不再播放对应的动画和音效。",
+    animMapSemanticsNote: "关闭 = 不播动画 + 不响音效。权限气泡、会话记录、终端聚焦照常工作。",
+    animMapResetAll: "全部恢复",
+    animMapAttentionLabel: "完成提示（happy）",
+    animMapAttentionDesc: "Agent 结束一轮时的开心跳动（Stop / PostCompact）。",
+    animMapErrorLabel: "错误提示",
+    animMapErrorDesc: "工具调用失败时的抖动动画。",
+    animMapSweepingLabel: "上下文清理",
+    animMapSweepingDesc: "PreCompact / 清空上下文时的扫把动画。",
+    animMapNotificationLabel: "通知提示",
+    animMapNotificationDesc: "权限请求、消息询问时的铃铛动画。",
+    animMapCarryingLabel: "Worktree 搬运",
+    animMapCarryingDesc: "创建 worktree 时的搬运动画。",
+    toastAnimMapResetOk: "动画覆盖已清空。",
   },
 };
 
@@ -107,6 +157,11 @@ let activeTab = "general";
 // Fetched once at boot (since it can't change while the app is running).
 // Null until hydrated — renderAgentsTab() renders an empty placeholder.
 let agentMetadata = null;
+
+// Theme list cache. Unlike agents, this CAN change at runtime (user deletes
+// a theme, drops a new one into the folder). Null until first fetch; refreshed
+// on tab open, after removeTheme succeeds, and on `theme` broadcasts.
+let themeList = null;
 
 function t(key) {
   const lang = (snapshot && snapshot.lang) || "en";
@@ -135,8 +190,8 @@ function showToast(message, { error = false, ttl = 3500 } = {}) {
 const SIDEBAR_TABS = [
   { id: "general", icon: "\u2699", labelKey: "sidebarGeneral", available: true },
   { id: "agents", icon: "\u26A1", labelKey: "sidebarAgents", available: true },
-  { id: "theme", icon: "\u{1F3A8}", labelKey: "sidebarTheme", available: false },
-  { id: "animMap", icon: "\u{1F3AC}", labelKey: "sidebarAnimMap", available: false },
+  { id: "theme", icon: "\u{1F3A8}", labelKey: "sidebarTheme", available: true },
+  { id: "animMap", icon: "\u{1F3AC}", labelKey: "sidebarAnimMap", available: true },
   { id: "shortcuts", icon: "\u2328", labelKey: "sidebarShortcuts", available: false },
   { id: "about", icon: "\u2139", labelKey: "sidebarAbout", available: false },
 ];
@@ -172,9 +227,251 @@ function renderContent() {
     renderGeneralTab(content);
   } else if (activeTab === "agents") {
     renderAgentsTab(content);
+  } else if (activeTab === "theme") {
+    renderThemeTab(content);
+  } else if (activeTab === "animMap") {
+    renderAnimMapTab(content);
   } else {
     renderPlaceholder(content);
   }
+}
+
+// ── Animation Map tab (Phase 3b — Disable-only) ──
+
+// 每行一个 oneshot state。顺序影响 UI 排列——按优先级从高到低。
+const ANIM_MAP_ROWS = [
+  { stateKey: "error",        labelKey: "animMapErrorLabel",        descKey: "animMapErrorDesc" },
+  { stateKey: "notification", labelKey: "animMapNotificationLabel", descKey: "animMapNotificationDesc" },
+  { stateKey: "sweeping",     labelKey: "animMapSweepingLabel",     descKey: "animMapSweepingDesc" },
+  { stateKey: "attention",    labelKey: "animMapAttentionLabel",    descKey: "animMapAttentionDesc" },
+  { stateKey: "carrying",     labelKey: "animMapCarryingLabel",     descKey: "animMapCarryingDesc" },
+];
+
+function renderAnimMapTab(parent) {
+  const h1 = document.createElement("h1");
+  h1.textContent = t("animMapTitle");
+  parent.appendChild(h1);
+
+  const subtitle = document.createElement("p");
+  subtitle.className = "subtitle";
+  subtitle.textContent = t("animMapSubtitle");
+  parent.appendChild(subtitle);
+
+  const note = document.createElement("p");
+  note.className = "subtitle";
+  note.textContent = t("animMapSemanticsNote");
+  parent.appendChild(note);
+
+  const themeId = (snapshot && snapshot.theme) || "clawd";
+  const rows = ANIM_MAP_ROWS.map((spec) => buildAnimMapRow(spec, themeId));
+  parent.appendChild(buildSection("", rows));
+
+  const hasAny = readThemeOverrideMap(themeId) !== null;
+  const resetWrap = document.createElement("div");
+  resetWrap.className = "anim-map-reset";
+  const resetBtn = document.createElement("button");
+  resetBtn.type = "button";
+  resetBtn.className = "theme-delete-btn anim-map-reset-btn";
+  resetBtn.textContent = t("animMapResetAll");
+  if (!hasAny) resetBtn.disabled = true;
+  attachActivation(resetBtn, () =>
+    window.settingsAPI.command("resetThemeOverrides", { themeId })
+      .then((result) => {
+        if (result && result.status === "ok" && !result.noop) {
+          showToast(t("toastAnimMapResetOk"));
+        }
+        return result;
+      })
+  );
+  resetWrap.appendChild(resetBtn);
+  parent.appendChild(resetWrap);
+}
+
+function readThemeOverrideMap(themeId) {
+  const all = snapshot && snapshot.themeOverrides;
+  const map = all && all[themeId];
+  if (!map || typeof map !== "object") return null;
+  const keys = Object.keys(map);
+  return keys.length > 0 ? map : null;
+}
+
+function isStateDisabled(themeId, stateKey) {
+  const map = readThemeOverrideMap(themeId);
+  const entry = map && map[stateKey];
+  return !!(entry && entry.disabled === true);
+}
+
+function buildAnimMapRow(spec, themeId) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML =
+    `<div class="row-text">` +
+      `<span class="row-label"></span>` +
+      `<span class="row-desc"></span>` +
+    `</div>` +
+    `<div class="row-control"><div class="switch" role="switch" tabindex="0"></div></div>`;
+  row.querySelector(".row-label").textContent = t(spec.labelKey);
+  row.querySelector(".row-desc").textContent = t(spec.descKey);
+  const sw = row.querySelector(".switch");
+
+  const disabled = isStateDisabled(themeId, spec.stateKey);
+  const visualOn = !disabled; // ON = 动画启用
+  if (visualOn) sw.classList.add("on");
+  sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+
+  attachActivation(sw, () => {
+    const nextDisabled = !isStateDisabled(themeId, spec.stateKey);
+    return window.settingsAPI.command("setThemeOverrideDisabled", {
+      themeId,
+      stateKey: spec.stateKey,
+      disabled: nextDisabled,
+    });
+  });
+  return row;
+}
+
+// ── Theme tab ──
+
+function fetchThemes() {
+  if (!window.settingsAPI || typeof window.settingsAPI.listThemes !== "function") {
+    themeList = [];
+    return Promise.resolve([]);
+  }
+  return window.settingsAPI.listThemes().then((list) => {
+    themeList = Array.isArray(list) ? list : [];
+    return themeList;
+  }).catch((err) => {
+    console.warn("settings: listThemes failed", err);
+    themeList = [];
+    return [];
+  });
+}
+
+function renderThemeTab(parent) {
+  const h1 = document.createElement("h1");
+  h1.textContent = t("themeTitle");
+  parent.appendChild(h1);
+
+  const subtitle = document.createElement("p");
+  subtitle.className = "subtitle";
+  subtitle.textContent = t("themeSubtitle");
+  parent.appendChild(subtitle);
+
+  if (themeList === null) {
+    const loading = document.createElement("div");
+    loading.className = "placeholder-desc";
+    parent.appendChild(loading);
+    fetchThemes().then(() => {
+      if (activeTab === "theme") renderContent();
+    });
+    return;
+  }
+
+  if (themeList.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "placeholder";
+    empty.innerHTML = `<div class="placeholder-desc">${escapeHtml(t("themeEmpty"))}</div>`;
+    parent.appendChild(empty);
+    return;
+  }
+
+  const grid = document.createElement("div");
+  grid.className = "theme-grid";
+  for (const theme of themeList) grid.appendChild(buildThemeCard(theme));
+  parent.appendChild(grid);
+}
+
+function buildThemeCard(theme) {
+  const card = document.createElement("div");
+  card.className = "theme-card";
+  card.setAttribute("role", "radio");
+  card.setAttribute("tabindex", "0");
+  card.setAttribute("aria-checked", theme.active ? "true" : "false");
+  if (theme.active) card.classList.add("active");
+
+  const thumb = document.createElement("div");
+  thumb.className = "theme-thumb";
+  if (theme.previewFileUrl) {
+    const img = document.createElement("img");
+    img.src = theme.previewFileUrl;
+    img.alt = "";
+    img.draggable = false;
+    thumb.appendChild(img);
+  } else {
+    const glyph = document.createElement("span");
+    glyph.className = "theme-thumb-empty";
+    glyph.textContent = t("themeThumbMissing");
+    thumb.appendChild(glyph);
+  }
+  card.appendChild(thumb);
+
+  const name = document.createElement("div");
+  name.className = "theme-card-name";
+  const nameText = document.createElement("span");
+  nameText.className = "theme-card-name-text";
+  nameText.textContent = theme.name || theme.id;
+  name.appendChild(nameText);
+  if (theme.builtin) {
+    const badge = document.createElement("span");
+    badge.className = "theme-card-badge";
+    badge.textContent = t("themeBadgeBuiltin");
+    name.appendChild(badge);
+  }
+  card.appendChild(name);
+
+  const canDelete = !theme.builtin && !theme.active;
+  if (theme.active || canDelete) {
+    const footer = document.createElement("div");
+    footer.className = "theme-card-footer";
+    const indicator = document.createElement("span");
+    indicator.className = "theme-card-check";
+    indicator.textContent = theme.active ? t("themeActiveIndicator") : "";
+    footer.appendChild(indicator);
+    if (canDelete) {
+      const btn = document.createElement("button");
+      btn.className = "theme-delete-btn";
+      btn.type = "button";
+      btn.textContent = "\u{1F5D1}";
+      btn.title = t("themeDeleteLabel");
+      btn.setAttribute("aria-label", t("themeDeleteLabel"));
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        handleDeleteTheme(theme);
+      });
+      footer.appendChild(btn);
+    }
+    card.appendChild(footer);
+  }
+
+  if (!theme.active) {
+    attachActivation(card, () => window.settingsAPI.update("theme", theme.id));
+  }
+  return card;
+}
+
+function handleDeleteTheme(theme) {
+  if (!window.settingsAPI) return;
+  window.settingsAPI
+    .confirmRemoveTheme(theme.id)
+    .then((res) => {
+      if (!res || !res.confirmed) return null;
+      return window.settingsAPI.command("removeTheme", theme.id);
+    })
+    .then((result) => {
+      if (result == null) return;
+      if (result.status !== "ok") {
+        const msg = (result && result.message) || "unknown error";
+        showToast(t("toastThemeDeleteFailed") + msg, { error: true });
+        return;
+      }
+      showToast(t("toastThemeDeleted"));
+      fetchThemes().then(() => {
+        if (activeTab === "theme") renderContent();
+      });
+    })
+    .catch((err) => {
+      showToast(t("toastThemeDeleteFailed") + (err && err.message), { error: true });
+    });
 }
 
 function renderAgentsTab(parent) {
@@ -272,7 +569,7 @@ function buildAgentSwitchRow({ agent, flag, extraClass, buildText }) {
   const on = readFlag();
   if (on) sw.classList.add("on");
   sw.setAttribute("aria-checked", on ? "true" : "false");
-  attachSwitchToggle(sw, () =>
+  attachActivation(sw, () =>
     window.settingsAPI.command("setAgentFlag", {
       agentId: agent.id,
       flag,
@@ -366,31 +663,28 @@ function buildSection(title, rows) {
   return section;
 }
 
-// Wire click + Space/Enter keydown on a `.switch` to an async invoker that
-// returns a `Promise<{status, message?}>`. Handles pending state, error
-// toasts, and keyboard activation identically across all rows — so
-// `buildSwitchRow` (pure prefs) and `buildAgentRow` (command-backed) share
-// a single toggle behavior.
-function attachSwitchToggle(sw, invoke) {
+// Wire click + Space/Enter keydown on any element to an async invoker that
+// returns a `Promise<{status, message?}>`. Shared by switches and cards.
+function attachActivation(el, invoke) {
   const run = () => {
-    if (sw.classList.contains("pending")) return;
-    sw.classList.add("pending");
+    if (el.classList.contains("pending")) return;
+    el.classList.add("pending");
     Promise.resolve()
       .then(invoke)
       .then((result) => {
-        sw.classList.remove("pending");
+        el.classList.remove("pending");
         if (!result || result.status !== "ok") {
           const msg = (result && result.message) || "unknown error";
           showToast(t("toastSaveFailed") + msg, { error: true });
         }
       })
       .catch((err) => {
-        sw.classList.remove("pending");
+        el.classList.remove("pending");
         showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       });
   };
-  sw.addEventListener("click", run);
-  sw.addEventListener("keydown", (ev) => {
+  el.addEventListener("click", run);
+  el.addEventListener("keydown", (ev) => {
     if (ev.key === " " || ev.key === "Enter") {
       ev.preventDefault();
       run();
@@ -416,7 +710,7 @@ function buildSwitchRow({ key, labelKey, descKey, invert = false }) {
   sw.setAttribute("aria-checked", visualOn ? "true" : "false");
   // No optimistic update — visual state flips on broadcast, not on click.
   // If the action fails, the broadcast never fires and the switch stays.
-  attachSwitchToggle(sw, () => {
+  attachActivation(sw, () => {
     const currentRaw = !!(snapshot && snapshot[key]);
     const currentVisual = invert ? !currentRaw : currentRaw;
     const nextRaw = invert ? currentVisual : !currentVisual;
@@ -480,6 +774,27 @@ window.settingsAPI.onChanged((payload) => {
   // resolves — rendering with a null snapshot blanks the UI and the
   // initial render later would need to re-fetch static language state.
   if (!snapshot) return;
+  // Patch `active` in place when only `theme` changed — cheaper than
+  // a full refetch. `themeOverrides` changes (e.g. removeTheme cleanup)
+  // can alter the list shape, so those still refetch.
+  const changes = payload && payload.changes;
+  if (changes && "themeOverrides" in changes) {
+    // 只有 theme tab 关心 list（removeTheme cleanup 可能改 list 形态）。
+    // animMap tab 的开关直接从 snapshot.themeOverrides 读，不用 refetch。
+    if (activeTab === "theme") {
+      fetchThemes().then(() => {
+        renderSidebar();
+        renderContent();
+      });
+      return;
+    }
+    renderSidebar();
+    renderContent();
+    return;
+  }
+  if (changes && "theme" in changes && themeList) {
+    themeList = themeList.map((t) => ({ ...t, active: t.id === changes.theme }));
+  }
   renderSidebar();
   renderContent();
 });

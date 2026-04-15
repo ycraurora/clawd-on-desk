@@ -1,9 +1,10 @@
-const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme } = require("electron");
+const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
 const hitGeometry = require("./hit-geometry");
 const { findNearestWorkArea, computeLooseClamp, SYNTHETIC_WORK_AREA } = require("./work-area");
+const { getLaunchSizingWorkArea, getProportionalPixelSize } = require("./size-utils");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -128,6 +129,10 @@ const _settingsController = createSettingsController({
     stopMonitorForAgent: _deferredStopMonitorForAgent,
     clearSessionsByAgent: _deferredClearSessionsByAgent,
     dismissPermissionsByAgent: _deferredDismissPermissionsByAgent,
+    // Theme deps — defined much later in the file, wrapped in lazy closures.
+    activateTheme: (id) => _deferredActivateTheme(id),
+    getThemeInfo: (id) => _deferredGetThemeInfo(id),
+    removeThemeDir: (id) => _deferredRemoveThemeDir(id),
   },
 });
 
@@ -201,7 +206,17 @@ function stopMonitorForAgent(agentId) {
 const themeLoader = require("./theme-loader");
 themeLoader.init(__dirname, app.getPath("userData"));
 
-let activeTheme = themeLoader.loadTheme(_settingsController.get("theme") || "clawd");
+// Lenient load so a missing/corrupt user-selected theme can't brick boot.
+// If lenient fell back to "clawd", hydrate prefs to match so the store
+// stays truth.
+const _requestedThemeId = _settingsController.get("theme") || "clawd";
+let activeTheme = themeLoader.loadTheme(_requestedThemeId);
+if (activeTheme._id !== _requestedThemeId) {
+  const result = _settingsController.hydrate({ theme: activeTheme._id });
+  if (result && result.status === "error") {
+    console.warn("Clawd: theme hydrate after fallback failed:", result.message);
+  }
+}
 
 // ── CSS <object> sizing (from theme) ──
 function getObjRect(bounds) {
@@ -221,7 +236,8 @@ let contextMenuOwner = null;
 let currentSize = _settingsController.get("size");
 
 // ── Proportional size mode ──
-// currentSize = "P:<ratio>" means the pet occupies <ratio>% of the work area width.
+// currentSize = "P:<ratio>" means the pet occupies <ratio>% of the display long edge,
+// so rotating the same monitor to portrait does not suddenly shrink the pet.
 const PROPORTIONAL_RATIOS = [8, 10, 12, 15];
 
 function isProportionalMode(size) {
@@ -241,8 +257,7 @@ function getCurrentPixelSize(overrideWa) {
     wa = getNearestWorkArea(x + width / 2, y + height / 2);
   }
   if (!wa) wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
-  const px = Math.round(wa.width * ratio / 100);
-  return { width: px, height: px };
+  return getProportionalPixelSize(ratio, wa);
 }
 let contextMenu;
 let doNotDisturb = false;
@@ -525,6 +540,17 @@ const _stateCtx = {
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
+  // Phase 3b: 读 prefs.themeOverrides 判断某个 oneshot state 是否被用户禁用。
+  // state.js gate 调这个做 early-return。不做白名单校验——settings-actions
+  // 负责写入合法性，这里只读。
+  isOneshotDisabled: (stateKey) => {
+    const themeId = activeTheme && activeTheme._id;
+    if (!themeId || !stateKey) return false;
+    const overrides = _settingsController.get("themeOverrides");
+    const themeMap = overrides && overrides[themeId];
+    const entry = themeMap && themeMap[stateKey];
+    return !!(entry && entry.disabled === true);
+  },
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
     // reading. Missing agents field falls back to "assume enabled" (the
@@ -773,7 +799,6 @@ const _menuCtx = {
   clampToScreen,
   getNearestWorkArea,
   reapplyMacVisibility,
-  switchTheme: (id) => switchTheme(id),
   discoverThemes: () => themeLoader.discoverThemes(),
   getActiveThemeId: () => activeTheme ? activeTheme._id : "clawd",
   ensureUserThemesDir: () => themeLoader.ensureUserThemesDir(),
@@ -888,6 +913,57 @@ ipcMain.handle("settings:command", async (_event, payload) => {
 // row per agent. Static because it comes from agents/registry.js — no runtime
 // state involved — so the renderer can cache the result and never has to
 // re-fetch.
+ipcMain.handle("settings:list-themes", () => {
+  try {
+    const activeId = activeTheme ? activeTheme._id : "clawd";
+    return themeLoader.listThemesWithMetadata().map((t) => ({
+      ...t,
+      active: t.id === activeId,
+    }));
+  } catch (err) {
+    console.warn("Clawd: settings:list-themes failed:", err && err.message);
+    return [];
+  }
+});
+
+// Kept in main so `dialog.showMessageBox` can take a BrowserWindow ref.
+const REMOVE_THEME_DIALOG_STRINGS = {
+  en: {
+    delete: "Delete",
+    cancel: "Cancel",
+    message: (name) => `Delete theme "${name}"?`,
+    detail: "This cannot be undone. All files for this theme will be removed from disk.",
+  },
+  zh: {
+    delete: "删除",
+    cancel: "取消",
+    message: (name) => `确认删除主题 "${name}"？`,
+    detail: "此操作不可撤销。主题的所有文件将从磁盘移除。",
+  },
+};
+ipcMain.handle("settings:confirm-remove-theme", async (event, themeId) => {
+  if (typeof themeId !== "string" || !themeId) return { confirmed: false };
+  const meta = themeLoader.getThemeMetadata(themeId);
+  const displayName = (meta && meta.name) || themeId;
+  const parent = BrowserWindow.fromWebContents(event.sender) || settingsWindow || null;
+  const s = REMOVE_THEME_DIALOG_STRINGS[lang] || REMOVE_THEME_DIALOG_STRINGS.en;
+  try {
+    const { response } = await dialog.showMessageBox(parent, {
+      type: "warning",
+      buttons: [s.delete, s.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      message: s.message(displayName),
+      detail: s.detail,
+      noLink: true,
+    });
+    return { confirmed: response === 0 };
+  } catch (err) {
+    console.warn("Clawd: confirm-remove-theme dialog failed:", err && err.message);
+    return { confirmed: false };
+  }
+});
+
 ipcMain.handle("settings:list-agents", () => {
   try {
     const { getAllAgents } = require("../agents/registry");
@@ -1008,7 +1084,12 @@ function createWindow() {
   if (isMac) {
     applyDockVisibility();
   }
-  const size = getCurrentPixelSize();
+  const launchSizingWorkArea = getLaunchSizingWorkArea(
+    prefs,
+    getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA,
+    getNearestWorkArea,
+  );
+  const size = getCurrentPixelSize(launchSizingWorkArea);
 
   // Restore saved position, or default to bottom-right of primary display.
   // Prefs file always exists in the new architecture (defaults are hydrated
@@ -1376,37 +1457,41 @@ Object.defineProperties(this || {}, {}); // no-op placeholder
 // Mini state is accessed via _mini getters in ctx objects below
 
 // ── Theme switching ──
-function switchTheme(themeId) {
-  if (!win || win.isDestroyed()) return;
+//
+// The `theme` settings effect calls this. MUST throw on failure so the
+// controller rejects the commit — otherwise prefs would record a theme id
+// that can't actually render. Does NOT write `theme` back to prefs; the
+// controller commits after this returns (writing here would infinite-loop).
+function activateTheme(themeId) {
+  if (!win || win.isDestroyed()) {
+    throw new Error("theme switch requires ready windows");
+  }
   if (activeTheme && activeTheme._id === themeId) return;
 
-  // 1. Cleanup timers in all modules
+  // Strict load first: if it throws, nothing downstream has mutated yet.
+  const newTheme = themeLoader.loadTheme(themeId, { strict: true });
+
   _state.cleanup();
   _tick.cleanup();
   _mini.cleanup();
-  // ⚠️ Don't clear pendingPermissions — permission bubbles are independent BrowserWindows
-  // ��️ Don't clear sessions — keep active session tracking
-  // ��️ Don't clear displayHint — semantic tokens resolve through new theme's map
+  // ⚠️ Don't clear pendingPermissions — bubbles are independent BrowserWindows
+  // ⚠️ Don't clear sessions — keep active session tracking
+  // ⚠️ Don't clear displayHint — semantic tokens resolve through new theme's map
 
-  // 2. If currently in mini mode and new theme doesn't support mini, exit first
-  const newTheme = themeLoader.loadTheme(themeId);
   if (_mini.getMiniMode() && !newTheme.miniMode.supported) {
     _mini.exitMiniMode();
   }
 
-  // 3. Update active theme
   activeTheme = newTheme;
   _mini.refreshTheme();
   _state.refreshTheme();
   _tick.refreshTheme();
   if (_mini.getMiniMode()) _mini.handleDisplayChange();
 
-  // 4. Reload both windows
   themeReloadInProgress = true;
   win.webContents.reload();
   hitWin.webContents.reload();
 
-  // 5. After both reloads complete, re-sync state with the new theme.
   let ready = 0;
   const onReady = () => {
     if (++ready < 2) return;
@@ -1419,12 +1504,39 @@ function switchTheme(themeId) {
   win.webContents.once("did-finish-load", onReady);
   hitWin.webContents.once("did-finish-load", onReady);
 
-  // Persist theme choice through the controller so it survives restarts.
-  // flushRuntimeStateToPrefs only captures window bounds + mini state;
-  // user-selected prefs like `theme` must be written explicitly.
-  _settingsController.applyBulk({ theme: themeId });
   flushRuntimeStateToPrefs();
-  rebuildAllMenus();
+}
+
+// Inject theme deps into the settings controller now that activateTheme,
+// themeLoader, and activeTheme are all defined. Uses lazy closures because
+// these references are captured at call time (inside an effect or command).
+function _deferredActivateTheme(themeId) {
+  return activateTheme(themeId);
+}
+function _deferredGetThemeInfo(themeId) {
+  const all = themeLoader.discoverThemes();
+  const entry = all.find((t) => t.id === themeId);
+  if (!entry) return null;
+  return {
+    builtin: !!entry.builtin,
+    active: activeTheme && activeTheme._id === themeId,
+  };
+}
+function _deferredRemoveThemeDir(themeId) {
+  const userThemesDir = themeLoader.ensureUserThemesDir();
+  if (!userThemesDir) throw new Error("user themes directory unavailable");
+  // Re-verify path containment as a defensive check — settings-actions
+  // already rejects built-in / active themes, and ensureUserThemesDir only
+  // ever returns the userData subtree, but belt + suspenders on an fs.rm
+  // call is worth the two lines.
+  const target = path.resolve(path.join(userThemesDir, themeId));
+  const root = path.resolve(userThemesDir);
+  if (!target.startsWith(root + path.sep)) {
+    throw new Error(`theme path escapes user themes directory: ${themeId}`);
+  }
+  fs.rmSync(target, { recursive: true, force: true });
+  // Rebuild menus so Theme submenu reflects the deleted entry.
+  try { rebuildAllMenus(); } catch { /* best-effort */ }
 }
 
 // ── Auto-install VS Code / Cursor terminal-focus extension ──
