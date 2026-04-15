@@ -34,6 +34,131 @@ const RESTORE_FOCUS_DELAY_MS = 300;
 const WIN_TOPMOST_LEVEL = "pop-up-menu";
 const LINUX_WINDOW_TYPE = "toolbar";
 
+// Codex doesn't come through /permission, so its sub-gate is checked at
+// the bubble-creation callsite instead of at the route entrance.
+function shouldSuppressCodexNotifyBubble(ctx) {
+  const codexBubblesEnabled =
+    typeof ctx.isAgentPermissionsEnabled !== "function" ||
+    ctx.isAgentPermissionsEnabled("codex");
+  return !!(ctx.doNotDisturb || ctx.hideBubbles || !codexBubblesEnabled);
+}
+
+// Pure layout calculator for the permission bubble stack. Extracted out of
+// repositionBubbles() so the geometry can be unit-tested without spinning up
+// real Electron BrowserWindows. Returns one bounds object per height in the
+// input array, in the same (oldest→newest) order.
+//
+// Layout priority when followPet=true:
+//   1. below pet     — stack hangs from hitRect.bottom (oldest closest to
+//                       the pet body, newest at the bottom of the stack)
+//   2. side of pet   — pick the side with more horizontal room (right wins
+//                       on ties), vertically anchored on the pet center and
+//                       clamped to the work area
+//   3. corner fallback — only when neither side has bw of clearance, fall
+//                         back to the work area's bottom-right corner
+//
+// followPet=false → bottom-right of the work area (default Clawd behavior).
+//
+// Visual invariant across ALL branches: bubbles[0] (oldest) ends up at the
+// highest y, bubbles[N-1] (newest) at the lowest y. Crossing a layout
+// threshold only translates the anchor — it does NOT reverse the visual
+// order. PR #89 fixed the original below↔degraded order-flip; this guards
+// the same bug from regressing.
+//
+// Degenerate case (totalH > usable work area height): the second clamp on
+// yBottom intentionally wins, anchoring the stack to the TOP of the work
+// area. The OLDEST bubble stays visible while newer ones overflow off the
+// bottom. Rationale: oldest is the request that has been waiting longest,
+// and Claude Code re-sends on timeout if newest gets dropped — losing
+// oldest is harder to recover. See test
+// "anchors stack top when totalH overflows the work area".
+function computeBubbleStackLayout({
+  followPet,
+  bubbleHeights,
+  bubbleWidth: bw,
+  margin,
+  gap,
+  workArea: wa,
+  hitRect,
+}) {
+  const N = bubbleHeights.length;
+  const bounds = new Array(N);
+  if (N === 0) return bounds;
+
+  // totalH = sum of heights + (N-1) gaps. The previous in-place loop in
+  // repositionBubbles added a gap after every bubble (N gaps total), which
+  // over-counted by one gap and slightly skewed both the below/side cutoff
+  // and the side vertical centering. Fixed here.
+  let totalH = 0;
+  for (let i = 0; i < N; i++) {
+    totalH += bubbleHeights[i];
+    if (i < N - 1) totalH += gap;
+  }
+
+  let x, yBottom;
+  if (followPet && hitRect) {
+    const hitBottom = Math.round(hitRect.bottom);
+    const hitLeft = Math.round(hitRect.left);
+    const hitRight = Math.round(hitRect.right);
+    const hitCx = Math.round((hitRect.left + hitRect.right) / 2);
+    const hitCy = Math.round((hitRect.top + hitRect.bottom) / 2);
+
+    // 1. Below pet — enough vertical room to hang the stack from the hitbox.
+    //    Iterate oldest→newest growing downward so the visual order matches
+    //    the side/corner branches' upward-stacking loop below.
+    if (wa.y + wa.height - hitBottom >= totalH) {
+      x = Math.max(wa.x, Math.min(hitCx - Math.round(bw / 2), wa.x + wa.width - bw));
+      let yTop = hitBottom;
+      for (let i = 0; i < N; i++) {
+        const bh = bubbleHeights[i];
+        bounds[i] = { x, y: yTop, width: bw, height: bh };
+        yTop += bh + gap;
+      }
+      return bounds;
+    }
+
+    // 2. Side — pick the side with more room (right wins on ties).
+    const spaceRight = wa.x + wa.width - hitRight;
+    const spaceLeft = hitLeft - wa.x;
+    if (spaceRight >= bw && spaceRight >= spaceLeft) {
+      x = Math.min(hitRight, wa.x + wa.width - bw);
+    } else if (spaceLeft >= bw) {
+      x = Math.max(wa.x, hitLeft - bw);
+    } else {
+      // 3. Corner fallback — neither side has bw of clearance.
+      x = wa.x + wa.width - bw - margin;
+      yBottom = wa.y + wa.height - margin;
+    }
+
+    if (yBottom === undefined) {
+      // Side vertical anchor: center the stack on the pet, then clamp to
+      // the work area. When totalH > usable height, minBottom > maxBottom
+      // and the second clamp wins on purpose (see header comment for the
+      // degenerate-case rationale).
+      yBottom = hitCy + Math.round(totalH / 2);
+      const maxBottom = wa.y + wa.height - margin;
+      const minBottom = wa.y + margin + totalH;
+      if (yBottom > maxBottom) yBottom = maxBottom;
+      if (yBottom < minBottom) yBottom = minBottom;
+    }
+  } else {
+    // followPet=off (or no hit rect): bottom-right of the nearest work area.
+    x = wa.x + wa.width - bw - margin;
+    yBottom = wa.y + wa.height - margin;
+  }
+
+  // Default upward stacking loop: newest (i=N-1) sits at yBottom, the rest
+  // grow upward. Combined with the below-branch's downward iteration above,
+  // the invariant holds: oldest highest on screen, newest lowest.
+  for (let i = N - 1; i >= 0; i--) {
+    const bh = bubbleHeights[i];
+    const y = yBottom - bh;
+    yBottom = y - gap;
+    bounds[i] = { x, y, width: bw, height: bh };
+  }
+  return bounds;
+}
+
 module.exports = function initPermission(ctx) {
 
   // Each entry: { res, abortHandler, suggestions, sessionId, bubble, hideTimer, toolName, toolInput, resolvedSuggestion, createdAt, measuredHeight }
@@ -108,7 +233,8 @@ module.exports = function initPermission(ctx) {
   }
 
   function repositionBubbles() {
-    // Stack bubbles from bottom-right upward. Newest (last in array) at bottom.
+    // Thin wrapper around computeBubbleStackLayout (top of file). All the
+    // geometry lives there so it can be unit-tested without Electron windows.
     if (!ctx.win || ctx.win.isDestroyed()) return;
     const margin = 8;
     const gap = 6;
@@ -117,67 +243,26 @@ module.exports = function initPermission(ctx) {
     const cx = petBounds.x + petBounds.width / 2;
     const cy = petBounds.y + petBounds.height / 2;
     const wa = ctx.getNearestWorkArea(cx, cy);
+    const hitRect = ctx.bubbleFollowPet ? ctx.getHitRectScreen(petBounds) : null;
 
-    let x, yBottom;
-    if (ctx.bubbleFollowPet) {
-      // Use hitbox bottom for tight positioning against actual pet body
-      const hit = ctx.getHitRectScreen(petBounds);
-      const hitBottom = Math.round(hit.bottom);
-      const hitCx = Math.round((hit.left + hit.right) / 2);
+    const bubbleHeights = pendingPermissions.map(perm =>
+      perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length)
+    );
 
-      // Calculate total bubble stack height
-      let totalH = 0;
-      for (const perm of pendingPermissions) {
-        totalH += (perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length)) + gap;
-      }
+    const bounds = computeBubbleStackLayout({
+      followPet: !!ctx.bubbleFollowPet,
+      bubbleHeights,
+      bubbleWidth: bw,
+      margin,
+      gap,
+      workArea: wa,
+      hitRect,
+    });
 
-      // Degradation: if total bubble height exceeds half the workspace, fall back to
-      // default bottom-right stacking so bubbles don't crowd the pet or overflow
-      if (totalH > wa.height / 2) {
-        x = wa.x + wa.width - bw - margin;
-        yBottom = wa.y + wa.height - margin;
-        // Fall through to upward stacking loop below
-      } else if (wa.y + wa.height - hitBottom >= totalH) {
-        // Enough room below — place bubbles under the pet body
-        x = Math.max(wa.x, Math.min(hitCx - Math.round(bw / 2), wa.x + wa.width - bw));
-        let yTop = hitBottom;
-        for (let i = pendingPermissions.length - 1; i >= 0; i--) {
-          const perm = pendingPermissions[i];
-          const bh = perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length);
-          if (perm.bubble && !perm.bubble.isDestroyed()) {
-            perm.bubble.setBounds({ x, y: yTop, width: bw, height: bh });
-          }
-          yTop += bh + gap;
-        }
-        return;
-      } else {
-        // Not enough room below — place to the side with more space
-        const hitRight = Math.round(hit.right);
-        const hitLeft = Math.round(hit.left);
-        const spaceRight = wa.x + wa.width - hitRight;
-        const spaceLeft = hitLeft - wa.x;
-        if (spaceRight >= bw || spaceRight >= spaceLeft) {
-          x = Math.min(hitRight, wa.x + wa.width - bw);
-        } else {
-          x = Math.max(wa.x, hitLeft - bw);
-        }
-        // Side fallback: stack from workspace bottom upward (not pet bottom, which would occlude pet)
-        yBottom = wa.y + wa.height - margin;
-      }
-    } else {
-      // Default: bottom-right corner of nearest work area
-      x = wa.x + wa.width - bw - margin;
-      yBottom = wa.y + wa.height - margin;
-    }
-
-    // Iterate in reverse: newest bubble (end of array) gets the bottom slot
-    for (let i = pendingPermissions.length - 1; i >= 0; i--) {
+    for (let i = 0; i < pendingPermissions.length; i++) {
       const perm = pendingPermissions[i];
-      const bh = perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length);
-      const y = yBottom - bh;
-      yBottom = y - gap;
-      if (perm.bubble && !perm.bubble.isDestroyed()) {
-        perm.bubble.setBounds({ x, y, width: bw, height: bh });
+      if (perm.bubble && !perm.bubble.isDestroyed() && bounds[i]) {
+        perm.bubble.setBounds(bounds[i]);
       }
     }
   }
@@ -201,6 +286,7 @@ module.exports = function initPermission(ctx) {
       skipTaskbar: true,
       hasShadow: false,
       ...(isLinux ? { type: LINUX_WINDOW_TYPE } : {}),
+      ...(isMac ? { type: "panel" } : {}),
       focusable: false,
       webPreferences: {
         preload: path.join(__dirname, "preload-bubble.js"),
@@ -495,7 +581,7 @@ module.exports = function initPermission(ctx) {
   const CODEX_NOTIFY_EXPIRE_MS = 30000;
 
   function showCodexNotifyBubble({ sessionId, command }) {
-    if (ctx.doNotDisturb || ctx.hideBubbles) {
+    if (shouldSuppressCodexNotifyBubble(ctx)) {
       permLog(`codex notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} hideBubbles=${ctx.hideBubbles}`);
       return;
     }
@@ -507,6 +593,7 @@ module.exports = function initPermission(ctx) {
       toolInput: { command: command || "(unknown)" },
       resolvedSuggestion: null, createdAt: Date.now(),
       isElicitation: false, isCodexNotify: true,
+      agentId: "codex",
       autoExpireTimer: null,
     };
     pendingPermissions.push(permEntry);
@@ -529,6 +616,47 @@ module.exports = function initPermission(ctx) {
     }
     repositionBubbles();
     syncPermissionShortcuts();
+  }
+
+  // Mirrors the DND dispatcher: CC res.destroy() so it falls back to chat,
+  // opencode skips the bridge reply so TUI takes over, codex just closes.
+  function dismissPermissionsByAgent(agentId) {
+    if (!agentId) return 0;
+    const toDismiss = pendingPermissions.filter((p) => p && p.agentId === agentId);
+    if (toDismiss.length === 0) return 0;
+    for (const perm of toDismiss) {
+      if (perm.isCodexNotify) {
+        dismissCodexNotify(perm);
+        continue;
+      }
+      const idx = pendingPermissions.indexOf(perm);
+      if (idx !== -1) pendingPermissions.splice(idx, 1);
+      if (perm._delayTimer) {
+        clearTimeout(perm._delayTimer);
+        perm._delayTimer = null;
+      }
+      if (perm.abortHandler && perm.res) {
+        try { perm.res.removeListener("close", perm.abortHandler); } catch { }
+      }
+      if (perm.bubble && !perm.bubble.isDestroyed()) {
+        sendToBubble(perm.bubble, "permission-hide");
+        if (perm.hideTimer) clearTimeout(perm.hideTimer);
+        const bub = perm.bubble;
+        perm.hideTimer = setTimeout(() => {
+          if (bub && !bub.isDestroyed()) bub.destroy();
+        }, 250);
+      }
+      // opencode: skip bridge reply — TUI has its own fallback prompt.
+      // CC / codebuddy / elicitation: destroy the connection so CC falls back
+      // to its built-in chat permission prompt.
+      if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
+        try { perm.res.destroy(); } catch { }
+      }
+    }
+    repositionBubbles();
+    syncPermissionShortcuts();
+    permLog(`dismissPermissionsByAgent(${agentId}): cleared ${toDismiss.length}`);
+    return toDismiss.length;
   }
 
   function clearCodexNotifyBubbles(sessionId) {
@@ -559,8 +687,13 @@ module.exports = function initPermission(ctx) {
     pendingPermissions, PASSTHROUGH_TOOLS,
     handleBubbleHeight, handleDecide, cleanup,
     showCodexNotifyBubble, clearCodexNotifyBubbles,
+    dismissPermissionsByAgent,
     syncPermissionShortcuts,
     replyOpencodePermission,
   };
 
 };
+
+// Test-only exports — bypasses the initPermission factory so unit tests can
+// hit the pure layout function without standing up Electron / ctx mocks.
+module.exports.__test = { computeBubbleStackLayout, shouldSuppressCodexNotifyBubble };

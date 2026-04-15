@@ -496,10 +496,38 @@ function cleanStaleSessions() {
   }
 }
 
+// setState() respects minDisplay timings, so the visible pet finishes
+// its current animation before settling to the resolved state.
+function clearSessionsByAgent(agentId) {
+  if (!agentId) return 0;
+  let removed = 0;
+  for (const [id, s] of sessions) {
+    if (s && s.agentId === agentId) {
+      sessions.delete(id);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    const resolved = resolveDisplayState();
+    setState(resolved, getSvgOverride(resolved));
+  }
+  return removed;
+}
+
 function detectRunningAgentProcesses(callback) {
   if (_detectInFlight) return;
   _detectInFlight = true;
   const done = (result) => { _detectInFlight = false; callback(result); };
+  // Agent gate short-circuit: if every agent is disabled, skip the system
+  // call entirely — nothing we could "find" should keep startup recovery
+  // alive. When at least one agent is enabled, we still run the combined
+  // detection because the query can't attribute individual processes back
+  // to agent ids (wmic/pgrep would need per-name queries), and the result
+  // is only a boolean for startup recovery — not a session creator.
+  if (typeof ctx.hasAnyEnabledAgent === "function" && !ctx.hasAnyEnabledAgent()) {
+    done(false);
+    return;
+  }
   const { exec } = require("child_process");
   if (process.platform === "win32") {
     exec(
@@ -757,6 +785,7 @@ return {
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
   getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
   detectRunningAgentProcesses, buildSessionSubmenu,
+  clearSessionsByAgent,
   getCurrentState, getCurrentSvg, getCurrentHitBox, getStartupRecoveryActive,
   sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
   get STATE_SVGS() { return STATE_SVGS; },

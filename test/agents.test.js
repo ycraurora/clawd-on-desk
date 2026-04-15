@@ -125,4 +125,10 @@ describe("Agent config modules — data integrity", () => {
     assert.strictEqual(ids.length, unique.size, `Duplicate IDs: ${ids.filter((id, i) => ids.indexOf(id) !== i)}`);
   });
 
+  it("codex has interactiveBubble=true so settings UI renders its bubble sub-toggle", () => {
+    const codex = agents.find((a) => a.id === "codex");
+    assert.ok(codex);
+    assert.strictEqual(codex.capabilities.interactiveBubble, true);
+  });
+
 });

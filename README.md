@@ -56,40 +56,36 @@ A desktop pet that reacts to your AI coding agent sessions in real-time. Clawd l
 - **i18n** — English and Chinese UI; switch via right-click menu or tray
 - **Auto-update** — checks GitHub releases; Windows installs NSIS updates on quit, macOS/Linux `git pull` + restart when running from a cloned repo
 
-## State Mapping
+## Animations
 
-Events from all agents (Claude Code hooks, Codex JSONL, Copilot hooks) map to the same animation states:
+<table>
+  <tr>
+    <td align="center"><img src="assets/gif/clawd-idle.gif" width="100"><br><sub>Idle</sub></td>
+    <td align="center"><img src="assets/gif/clawd-thinking.gif" width="100"><br><sub>Thinking</sub></td>
+    <td align="center"><img src="assets/gif/clawd-typing.gif" width="100"><br><sub>Typing</sub></td>
+    <td align="center"><img src="assets/gif/clawd-building.gif" width="100"><br><sub>Building</sub></td>
+    <td align="center"><img src="assets/gif/clawd-juggling.gif" width="100"><br><sub>Juggling</sub></td>
+    <td align="center"><img src="assets/gif/clawd-conducting.gif" width="100"><br><sub>Conducting</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/gif/clawd-error.gif" width="100"><br><sub>Error</sub></td>
+    <td align="center"><img src="assets/gif/clawd-happy.gif" width="100"><br><sub>Happy</sub></td>
+    <td align="center"><img src="assets/gif/clawd-notification.gif" width="100"><br><sub>Notification</sub></td>
+    <td align="center"><img src="assets/gif/clawd-sweeping.gif" width="100"><br><sub>Sweeping</sub></td>
+    <td align="center"><img src="assets/gif/clawd-carrying.gif" width="100"><br><sub>Carrying</sub></td>
+    <td align="center"><img src="assets/gif/clawd-sleeping.gif" width="100"><br><sub>Sleeping</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/gif/calico-idle.gif" width="80"><br><sub>Calico Idle</sub></td>
+    <td align="center"><img src="assets/gif/calico-thinking.gif" width="80"><br><sub>Calico Thinking</sub></td>
+    <td align="center"><img src="assets/gif/calico-typing.gif" width="80"><br><sub>Calico Typing</sub></td>
+    <td align="center"><img src="assets/gif/calico-building.gif" width="80"><br><sub>Calico Building</sub></td>
+    <td align="center"><img src="assets/gif/calico-juggling.gif" width="80"><br><sub>Calico Juggling</sub></td>
+    <td align="center"><img src="assets/gif/calico-conducting.gif" width="80"><br><sub>Calico Conducting</sub></td>
+  </tr>
+</table>
 
-| Agent Event | State | Animation | Clawd | Calico |
-|---|---|---|---|---|
-| Idle (no activity) | idle | Eye-tracking follow | <img src="assets/gif/clawd-idle.gif" width="160"> | <img src="assets/gif/calico-idle.gif" width="130"> |
-| Idle (random) | idle | Reading / patrol | <img src="assets/gif/clawd-idle-reading.gif" width="160"> | |
-| UserPromptSubmit | thinking | Thought bubble | <img src="assets/gif/clawd-thinking.gif" width="160"> | <img src="assets/gif/calico-thinking.gif" width="130"> |
-| PreToolUse / PostToolUse | working (typing) | Typing | <img src="assets/gif/clawd-typing.gif" width="160"> | <img src="assets/gif/calico-typing.gif" width="130"> |
-| PreToolUse (3+ sessions) | working (building) | Building | <img src="assets/gif/clawd-building.gif" width="160"> | <img src="assets/gif/calico-building.gif" width="130"> |
-| SubagentStart (1) | juggling | Juggling | <img src="assets/gif/clawd-juggling.gif" width="160"> | <img src="assets/gif/calico-juggling.gif" width="130"> |
-| SubagentStart (2+) | conducting | Conducting | <img src="assets/gif/clawd-conducting.gif" width="160"> | <img src="assets/gif/calico-conducting.gif" width="130"> |
-| PostToolUseFailure | error | Error | <img src="assets/gif/clawd-error.gif" width="160"> | <img src="assets/gif/calico-error.gif" width="130"> |
-| Stop / PostCompact | attention | Happy | <img src="assets/gif/clawd-happy.gif" width="160"> | <img src="assets/gif/calico-happy.gif" width="130"> |
-| PermissionRequest | notification | Alert | <img src="assets/gif/clawd-notification.gif" width="160"> | <img src="assets/gif/calico-notification.gif" width="130"> |
-| PreCompact | sweeping | Sweeping | <img src="assets/gif/clawd-sweeping.gif" width="160"> | <img src="assets/gif/calico-sweeping.gif" width="130"> |
-| WorktreeCreate | carrying | Carrying | <img src="assets/gif/clawd-carrying.gif" width="160"> | <img src="assets/gif/calico-carrying.gif" width="130"> |
-| 60s no events | sleeping | Sleep | <img src="assets/gif/clawd-sleeping.gif" width="160"> | <img src="assets/gif/calico-sleeping.gif" width="130"> |
-
-### Mini Mode
-
-Drag to the right screen edge (or right-click → "Mini Mode") to enter mini mode — half-body visible at screen edge, peeking out on hover.
-
-| Trigger | Mini Reaction | Clawd | Calico |
-|---|---|---|---|
-| Default | Breathing + blinking + eye tracking | <img src="assets/gif/clawd-mini-idle.gif" width="100"> | <img src="assets/gif/calico-mini-idle.gif" width="80"> |
-| Hover | Peek out + wave | <img src="assets/gif/clawd-mini-peek.gif" width="100"> | <img src="assets/gif/calico-mini-peek.gif" width="80"> |
-| Notification | Alert pop | <img src="assets/gif/clawd-mini-alert.gif" width="100"> | <img src="assets/gif/calico-mini-alert.gif" width="80"> |
-| Task complete | Happy celebration | <img src="assets/gif/clawd-mini-happy.gif" width="100"> | <img src="assets/gif/calico-mini-happy.gif" width="80"> |
-
-### Click Reactions
-
-Easter eggs — try double-clicking, rapid 4-clicks, or poking Clawd repeatedly to discover hidden reactions.
+Full event-to-state mapping, mini mode, and click reactions: **[docs/state-mapping.md](docs/state-mapping.md)**
 
 ## Quick Start
 
@@ -105,89 +101,11 @@ npm install
 npm start
 ```
 
-### Agent Setup
-
-**Claude Code** — works out of the box. Hooks are auto-registered on launch. Versioned hooks (`PreCompact`, `PostCompact`, `StopFailure`) are registered only when Clawd can positively detect a compatible Claude Code version; if detection fails (common for packaged macOS launches), Clawd falls back to core hooks and removes stale incompatible versioned hooks automatically.
-
-**Codex CLI** — works out of the box. Clawd polls `~/.codex/sessions/` for JSONL logs automatically.
-
-**VS Code Codex in devcontainers/Docker** — Clawd now has a split bridge design: the bundled local `clawd-terminal-focus` extension runs on your desktop VS Code and forwards events into the local app, while a separate `workspace` helper extension must run inside the remote container/VS Code Server to read `~/.codex/sessions`. The helper is not auto-installed yet; for now, install it manually in the remote environment before testing this path.
-
-**Copilot CLI** — requires manual hook setup. See [docs/copilot-setup.md](docs/copilot-setup.md) for instructions.
-
-**Kiro CLI** — run `npm run install:kiro-hooks` if you want hooks registered before launching Clawd. Kiro's built-in `kiro_default` agent is not backed by an editable JSON file, so Clawd creates a custom `clawd` agent and re-syncs it from the latest `kiro_default` each time Clawd starts, then appends hooks. Use `kiro-cli --agent clawd` for a new chat, or `/agent swap clawd` inside an existing Kiro session, when you want hooks enabled. On macOS, state-driven animations have been verified; native terminal permission prompts such as `t / y / n` still need to be answered in the terminal.
-
-### Remote SSH (Claude Code & Codex CLI)
-
-<img src="assets/screenshot-remote-ssh.png" width="560" alt="Remote SSH — permission bubble from Raspberry Pi">
-
-Clawd can sense AI agent activity on remote servers via SSH reverse port forwarding. Hook events and permission requests travel through the SSH tunnel back to your local Clawd — no code changes needed on the Clawd side.
-
-**One-click deploy:**
-
-```bash
-bash scripts/remote-deploy.sh user@remote-host
-```
-
-This copies hook files to the remote server, registers Claude Code hooks in remote mode, and prints SSH configuration instructions.
-
-**SSH configuration** (add to your local `~/.ssh/config`):
-
-```
-Host my-server
-    HostName remote-host
-    User user
-    RemoteForward 127.0.0.1:23333 127.0.0.1:23333
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-```
-
-**How it works:**
-- **Claude Code** — command hooks on the remote server POST state changes to `localhost:23333`, which the SSH tunnel forwards back to your local Clawd. Permission bubbles work too — the HTTP round-trip goes through the tunnel.
-- **Codex CLI** — a standalone log monitor (`codex-remote-monitor.js`) polls JSONL files on the remote server and POSTs state changes through the same tunnel. Start it on the remote: `node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
-
-Remote hooks run in `CLAWD_REMOTE` mode which skips PID collection (remote PIDs are meaningless locally). Terminal focus is not available for remote sessions.
-
-> Thanks to [@Magic-Bytes](https://github.com/Magic-Bytes) for the original SSH tunneling idea ([#9](https://github.com/rullerzhou-afk/clawd-on-desk/issues/9)).
-
-### macOS Notes
-
-- **From source** (`npm start`): works out of the box on Intel and Apple Silicon.
-- **DMG installer**: the app is not signed with an Apple Developer certificate, so macOS Gatekeeper will block it. To open:
-  - Right-click the app → **Open** → click **Open** in the dialog, or
-  - Run `xattr -cr /Applications/Clawd\ on\ Desk.app` in Terminal.
-
-### Linux Notes
-
-- **From source** (`npm start`): `--no-sandbox` is passed automatically to work around chrome-sandbox SUID requirements in dev mode.
-- **Packages**: AppImage and `.deb` are available from [GitHub Releases](https://github.com/rullerzhou-afk/clawd-on-desk/releases). After deb install, the app icon appears in GNOME's app menu.
-- **Terminal focus**: uses `wmctrl` or `xdotool` (whichever is available). Install one for session terminal jumping to work: `sudo apt install wmctrl` or `sudo apt install xdotool`.
-- **Auto-update**: when running from a cloned repo, "Check for Updates" performs `git pull` + `npm install` (if dependencies changed) and restarts the app automatically.
+**Claude Code** and **Codex CLI** work out of the box. Other agents (Copilot, Kiro, etc.) need one-time setup. Also covers VS Code Codex in devcontainers/Docker, remote SSH, WSL, and platform-specific notes (macOS / Linux): **[docs/setup-guide.md](docs/setup-guide.md)**
 
 ## Known Limitations
 
-| Limitation | Details |
-|---|---|
-| **Codex CLI: no terminal focus** | Codex sessions use JSONL log polling which doesn't carry terminal PID info. Clicking Clawd won't jump to the Codex terminal. Claude Code and Copilot CLI work fine. |
-| **Codex CLI: Windows hooks disabled** | Codex hardcodes hooks off on Windows, so we poll log files instead. This means ~1.5s latency vs near-instant for hook-based agents. |
-| **VS Code Codex in devcontainers: helper install is manual** | The local bridge extension auto-installs, but the remote workspace helper still needs to be installed into the container's VS Code Server manually. |
-| **VS Code Codex in devcontainers: focus not wired yet** | Remote VS Code Codex sessions can drive pet state once the helper is installed, but clicking the session menu does not yet jump to the exact remote Codex surface. |
-| **Copilot CLI: manual hook setup** | Copilot hooks require manually creating `~/.copilot/hooks/hooks.json`. Claude Code and Codex work out of the box. |
-| **Copilot CLI: no permission bubble** | Copilot's `preToolUse` hook only supports deny, not the full allow/deny flow. Permission bubbles only work with Claude Code. |
-| **Gemini CLI: no working state** | Gemini's session JSON only records completed messages, not in-progress tool execution. The pet jumps from thinking straight to happy/error — no typing animation during work. |
-| **Gemini CLI: no permission bubble** | Gemini handles tool approval inside the terminal. File polling can't intercept or display approval requests. |
-| **Gemini CLI: no terminal focus** | Session JSON doesn't carry terminal PID info, same limitation as Codex. |
-| **Gemini CLI: polling latency** | ~1.5s poll interval + 4s defer window for batching tool completion signals. Noticeably slower than hook-based agents. |
-| **Cursor Agent: no permission bubble** | Cursor handles permissions via stdout JSON in the hook, not HTTP blocking — Clawd can't intercept the approval flow. |
-| **Cursor Agent: startup recovery** | No process detection on startup (matching the editor PID would false-trigger on any Cursor instance). Clawd stays idle until the first hook event fires. |
-| **Kiro CLI: no session tracking** | Kiro CLI stdin JSON has no session_id — all Kiro sessions are merged into a single tracked session. |
-| **Kiro CLI: no SessionEnd** | Kiro CLI has no session end event, so Clawd can't detect when a Kiro session ends. |
-| **Kiro CLI: no subagent detection** | Kiro CLI has no subagent events, so juggling/conducting animations won't trigger. |
-| **Kiro CLI: terminal permission prompts stay in terminal** | Kiro state hooks are verified on macOS, but when Kiro shows native terminal permission prompts such as `t / y / n`, those still need to be handled in the terminal. Clawd does not currently replace that flow. |
-| **opencode: subtask menu clutter** | When opencode delegates to parallel subagents via the `task` tool, the subagent sessions briefly appear in the Sessions submenu while they run (5-8 seconds), then self-clean. Cosmetic only — the building animation fires correctly. |
-| **opencode: terminal focus limited to spawning terminal** | The plugin runs in-process with opencode, so `source_pid` points to the terminal that launched opencode. If you use `opencode attach` from a different window, terminal focus jumps to the original launcher. |
-| **macOS/Linux packaged auto-update** | DMG/AppImage/deb installs cannot auto-update — use `git clone` + `npm start` for auto-update via `git pull`, or download new versions manually from GitHub Releases. |
-| **No test framework for Electron** | Unit tests cover agents and log polling, but the Electron main process (state machine, windows, tray) has no automated tests. |
+Some agents have feature gaps (no permission bubble, polling latency, no terminal focus). See the full table: **[docs/known-limitations.md](docs/known-limitations.md)**
 
 ## Custom Themes
 
@@ -256,6 +174,7 @@ Thanks to everyone who has helped make Clawd better:
     <td align="center"><a href="https://github.com/stickycandy"><img src="https://github.com/stickycandy.png" width="50" style="border-radius:50%" /><br /><sub>stickycandy</sub></a></td>
     <td align="center"><a href="https://github.com/Rladmsrl"><img src="https://github.com/Rladmsrl.png" width="50" style="border-radius:50%" /><br /><sub>Rladmsrl</sub></a></td>
     <td align="center"><a href="https://github.com/YOIMIYA66"><img src="https://github.com/YOIMIYA66.png" width="50" style="border-radius:50%" /><br /><sub>YOIMIYA66</sub></a></td>
+    <td align="center"><a href="https://github.com/Kevin7Qi"><img src="https://github.com/Kevin7Qi.png" width="50" style="border-radius:50%" /><br /><sub>Kevin7Qi</sub></a></td>
   </tr>
 </table>
 

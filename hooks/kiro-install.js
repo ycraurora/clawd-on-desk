@@ -16,6 +16,7 @@ const { resolveNodeBin } = require("./server-config");
 const { writeJsonAtomic, extractExistingNodeBin } = require("./json-utils");
 const MARKER = "kiro-hook.js";
 const CLAWD_AGENT_NAME = "clawd";
+const CLAWD_AGENT_DESCRIPTION = "Clawd desktop pet hook integration";
 const BUILTIN_DEFAULT_AGENT = "kiro_default";
 
 const KIRO_HOOK_EVENTS = [
@@ -54,7 +55,7 @@ function injectHooksIntoFile(filePath, options = {}) {
   }
   if (created) {
     settings.description = baseName === CLAWD_AGENT_NAME
-      ? "Clawd desktop pet hook integration"
+      ? CLAWD_AGENT_DESCRIPTION
       : `${baseName} agent with Clawd desktop pet hooks`;
   }
 
@@ -128,6 +129,9 @@ function getKiroCliCandidates(homeDir = os.homedir()) {
   ];
 }
 
+// Properties excluded from kiro_default template.
+const EXCLUDED_KEYS = new Set(["model", "includeMcpJson", "description", "hooks", "name"]);
+
 function generateClawdTemplateFromBuiltin(options = {}) {
   const homeDir = options.homeDir || os.homedir();
   const kiroCliCandidates = options.kiroCliCandidates || getKiroCliCandidates(homeDir);
@@ -156,7 +160,6 @@ function generateClawdTemplateFromBuiltin(options = {}) {
         );
         const templatePath = path.join(tempDir, `${tempName}.json`);
         const template = JSON.parse(fs.readFileSync(templatePath, "utf-8"));
-        template.name = CLAWD_AGENT_NAME;
         return { template, command: candidate };
       } catch (err) {
         lastError = err;
@@ -171,11 +174,6 @@ function generateClawdTemplateFromBuiltin(options = {}) {
 }
 
 function syncClawdAgentFromBuiltin(filePath, options = {}) {
-  const result = generateClawdTemplateFromBuiltin(options);
-  if (!result.template) {
-    return { synced: false, changed: false, error: result.error };
-  }
-
   let current = null;
   try {
     current = JSON.parse(fs.readFileSync(filePath, "utf-8"));
@@ -183,18 +181,45 @@ function syncClawdAgentFromBuiltin(filePath, options = {}) {
     if (err.code !== "ENOENT") throw err;
   }
 
-  const desired = { ...result.template };
-  desired.name = CLAWD_AGENT_NAME;
+  const result = generateClawdTemplateFromBuiltin(options);
+
+  if (!result.template) {
+    // Preserve existing file — may have prompt/tools/resources from a prior successful sync.
+    if (!options.silent) {
+      const fate = current
+        ? `preserving existing ${path.basename(filePath)}`
+        : "seeding minimal clawd agent (no prompt/tools/resources)";
+      console.warn(`Clawd: kiro-cli template generation failed — ${fate}. Reason: ${result.error?.message || "unknown"}`);
+    }
+    if (current) return { synced: true, changed: false };
+    const minimal = {
+      name: CLAWD_AGENT_NAME,
+      description: CLAWD_AGENT_DESCRIPTION,
+      hooks: {},
+    };
+    writeJsonAtomic(filePath, minimal);
+    return { synced: true, changed: true };
+  }
+
+  const desired = {
+    name: CLAWD_AGENT_NAME,
+    description: CLAWD_AGENT_DESCRIPTION,
+  };
+  for (const key of Object.keys(result.template)) {
+    if (!EXCLUDED_KEYS.has(key)) {
+      desired[key] = result.template[key];
+    }
+  }
   desired.hooks = current && current.hooks && typeof current.hooks === "object"
     ? current.hooks
     : {};
 
   if (!current || JSON.stringify(current) !== JSON.stringify(desired)) {
     writeJsonAtomic(filePath, desired);
-    return { synced: true, changed: true, command: result.command };
+    return { synced: true, changed: true };
   }
 
-  return { synced: true, changed: false, command: result.command };
+  return { synced: true, changed: false };
 }
 
 /**

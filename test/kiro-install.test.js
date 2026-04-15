@@ -187,6 +187,11 @@ describe("Kiro hook installer", () => {
       agentsDir,
       settingsPath,
       nodeBin: "/usr/local/bin/node",
+      syncClawdAgent(filePath) {
+        // Preserve existing content — sync is not the focus of this test
+        const current = readJson(filePath);
+        return { synced: true, changed: false };
+      },
     });
 
     const clawdAgent = readJson(clawdPath);
@@ -250,5 +255,122 @@ describe("Kiro hook installer", () => {
     assert.strictEqual(clawdAgent.model, null);
     assert.ok(result.updated >= 1);
     assert.ok(clawdAgent.hooks.stop[0].command.includes("hooks/kiro-hook.js"));
+  });
+
+  it("EXCLUDED_KEYS filtering: model/includeMcpJson absent, description always Clawd's", {
+    skip: process.platform === "win32" ? "fake kiro-cli uses POSIX shell script" : false,
+  }, () => {
+    const { agentsDir } = makeTempKiroHome();
+    const clawdPath = path.join(agentsDir, "clawd.json");
+
+    // Create a fake kiro-cli script that writes a template JSON
+    const fakeBin = path.join(agentsDir, "fake-kiro-cli");
+    const templateDir = path.join(agentsDir, "_template_out");
+    fs.mkdirSync(templateDir, { recursive: true });
+    const templateData = {
+      name: "kiro_default",
+      description: "Default agent",
+      prompt: "# Default prompt",
+      model: "claude-sonnet-4-20250514",
+      includeMcpJson: true,
+      tools: ["*"],
+      resources: ["file://README.md"],
+      mcpServers: { foo: { command: "bar" } },
+      hooks: {},
+    };
+    // Fake script: on "agent create", write template JSON to the specified directory
+    fs.writeFileSync(fakeBin, `#!/bin/sh
+if [ "$1" = "agent" ] && [ "$2" = "create" ]; then
+  name="$3"
+  shift 3
+  dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --directory) dir="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  cat > "$dir/$name.json" << 'TEMPLATE'
+${JSON.stringify(templateData, null, 2)}
+TEMPLATE
+fi
+`, "utf8");
+    fs.chmodSync(fakeBin, 0o755);
+
+    const { __test } = require("../hooks/kiro-install");
+    const syncResult = __test.syncClawdAgentFromBuiltin(clawdPath, {
+      homeDir: path.dirname(agentsDir),
+      kiroCliCandidates: [fakeBin],
+      silent: true,
+    });
+
+    assert.ok(syncResult.synced);
+    assert.ok(fs.existsSync(clawdPath));
+
+    const agent = readJson(clawdPath);
+    // Name is always overridden to "clawd"
+    assert.strictEqual(agent.name, "clawd");
+    // Prompt, tools, resources, mcpServers should pass through
+    assert.strictEqual(agent.prompt, "# Default prompt");
+    assert.deepStrictEqual(agent.tools, ["*"]);
+    assert.deepStrictEqual(agent.resources, ["file://README.md"]);
+    assert.deepStrictEqual(agent.mcpServers, { foo: { command: "bar" } });
+    // EXCLUDED_KEYS must NOT appear
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(agent, "model"), false,
+      "model should be excluded");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(agent, "includeMcpJson"), false,
+      "includeMcpJson should be excluded");
+    assert.strictEqual(agent.description, "Clawd desktop pet hook integration");
+    assert.deepStrictEqual(agent.hooks, {});
+  });
+
+  it("fallback to minimal agent when kiro-cli is unavailable", () => {
+    const { agentsDir } = makeTempKiroHome();
+    const clawdPath = path.join(agentsDir, "clawd.json");
+
+    const { __test } = require("../hooks/kiro-install");
+    const syncResult = __test.syncClawdAgentFromBuiltin(clawdPath, {
+      homeDir: path.dirname(agentsDir),
+      kiroCliCandidates: ["/nonexistent/kiro-cli"],
+      silent: true,
+    });
+
+    assert.ok(syncResult.synced);
+    assert.ok(fs.existsSync(clawdPath));
+
+    const agent = readJson(clawdPath);
+    assert.strictEqual(agent.name, "clawd");
+    assert.strictEqual(agent.description, "Clawd desktop pet hook integration");
+    // No prompt/tools/resources in fallback
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(agent, "prompt"), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(agent, "tools"), false);
+  });
+
+  it("fallback preserves existing clawd.json when kiro-cli is unavailable", () => {
+    const { agentsDir } = makeTempKiroHome();
+    const clawdPath = path.join(agentsDir, "clawd.json");
+
+    // Pre-seed a full clawd.json (simulates a prior successful sync)
+    const preExisting = {
+      name: "clawd",
+      description: "Clawd desktop pet hook integration",
+      prompt: "# Custom prompt from previous run",
+      tools: ["*"],
+      resources: ["file://README.md"],
+      mcpServers: { foo: { command: "bar" } },
+      hooks: { stop: [{ command: "node /path/to/kiro-hook.js" }] },
+    };
+    fs.writeFileSync(clawdPath, JSON.stringify(preExisting, null, 2), "utf8");
+
+    const { __test } = require("../hooks/kiro-install");
+    const syncResult = __test.syncClawdAgentFromBuiltin(clawdPath, {
+      homeDir: path.dirname(agentsDir),
+      kiroCliCandidates: ["/nonexistent/kiro-cli"],
+      silent: true,
+    });
+
+    assert.ok(syncResult.synced);
+    assert.strictEqual(syncResult.changed, false, "should not touch existing file");
+    assert.deepStrictEqual(readJson(clawdPath), preExisting, "content must be byte-identical");
   });
 });
