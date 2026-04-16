@@ -13,6 +13,8 @@
     "build:remote-vsix": "node tools/build-vsix.js extensions/vscode-remote-codex",
     "build:vscode-vsix": "npm run build:local-vsix && npm run build:remote-vsix",
     "test": "node --test test/*.test.js",
+    "install:claude-hooks": "node hooks/install.js",
+    "uninstall:claude-hooks": "node hooks/uninstall.js",
     "install:gemini-hooks": "node hooks/gemini-install.js",
     "install:cursor-hooks": "node hooks/cursor-install.js",
     "install:kiro-hooks": "node hooks/kiro-install.js"
