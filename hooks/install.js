@@ -118,6 +118,13 @@ function getClaudePathCandidates(options = {}) {
   return candidates;
 }
 
+function isAbsolutePathForPlatform(candidatePath, platform) {
+  if (typeof candidatePath !== "string" || !candidatePath) return false;
+  if (path.isAbsolute(candidatePath)) return true;
+  if (platform !== "win32") return false;
+  return /^[a-zA-Z]:[\\/]/.test(candidatePath) || /^\\\\/.test(candidatePath);
+}
+
 function getClaudePackageJsonCandidates(candidatePath, options = {}) {
   const platform = options.platform || process.platform;
   const existsSync = options.existsSync || fs.existsSync;
@@ -125,7 +132,7 @@ function getClaudePackageJsonCandidates(candidatePath, options = {}) {
   const realpathSync = options.realpathSync || fs.realpathSync;
   const statSync = options.statSync || fs.statSync;
 
-  if (!path.isAbsolute(candidatePath)) return [];
+  if (!isAbsolutePathForPlatform(candidatePath, platform)) return [];
 
   const candidates = [];
   const seen = new Set();

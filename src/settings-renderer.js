@@ -62,11 +62,18 @@ const STRINGS = {
     toastSaveFailed: "Couldn't save: ",
     langEnglish: "English",
     langChinese: "中文",
+    langKorean: "한국어",
     themeTitle: "Theme",
-    themeSubtitle: "Pick a theme for Clawd. Community themes land in your user themes folder and can be removed from here.",
+    themeSubtitle: "Pick a theme for Clawd. Cards show built-in + capability badges so you can see tracked/static/mini differences before switching.",
     themeEmpty: "No themes available.",
     themeBadgeBuiltin: "Built-in",
     themeBadgeActive: "Active",
+    themeCapabilityTracked: "Tracked idle",
+    themeCapabilityAnimated: "Animated idle",
+    themeCapabilityStatic: "Static theme",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "Direct sleep",
+    themeCapabilityNoReactions: "No reactions",
     themeActiveIndicator: "\u2713 Active",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "Delete theme",
@@ -110,7 +117,20 @@ const STRINGS = {
     animOverridesTimingFallback: "theme default",
     animOverridesTimingUnavailable: "unavailable",
     animOverridesDisplayHintWarning: "displayHintMap can override this slot at runtime.",
+    animOverridesFallbackHint: "This slot currently falls back to {state}.",
     animOverridesOverriddenTooltip: "Modified from default",
+    animOverridesUseOwnFile: "Use own file",
+    animOverridesDurationIdle: "Pool hold",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "Work",
+    animOverridesSectionInterrupts: "Interrupts",
+    animOverridesSectionSleep: "Sleep",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionIdleTracked: "Cursor-follow idle",
+    animOverridesSectionIdleAnimated: "Idle random pool",
+    animOverridesSectionIdleStatic: "Single static idle",
+    animOverridesSectionSleepFull: "Full sleep sequence",
+    animOverridesSectionSleepDirect: "Direct sleep only",
     animOverridesExpandRow: "Expand",
     animOverridesModalTitle: "Choose an asset file",
     animOverridesModalSubtitle: "Add files to the current theme assets folder, then refresh the list here.",
@@ -167,11 +187,18 @@ const STRINGS = {
     toastSaveFailed: "保存失败：",
     langEnglish: "English",
     langChinese: "中文",
+    langKorean: "한국어",
     themeTitle: "主题",
-    themeSubtitle: "为 Clawd 选择一个主题。社区主题会放在你的用户主题目录里，可以在此删除。",
+    themeSubtitle: "为 Clawd 选择一个主题。卡片会显示内建和能力角标，切换前就能看出 tracked / static / mini 等差异。",
     themeEmpty: "没有可用的主题。",
     themeBadgeBuiltin: "内建",
     themeBadgeActive: "当前",
+    themeCapabilityTracked: "跟随 idle",
+    themeCapabilityAnimated: "动画 idle",
+    themeCapabilityStatic: "静态主题",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "直睡",
+    themeCapabilityNoReactions: "无反应",
     themeActiveIndicator: "\u2713 当前",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "删除主题",
@@ -215,7 +242,20 @@ const STRINGS = {
     animOverridesTimingFallback: "主题默认值",
     animOverridesTimingUnavailable: "不可用",
     animOverridesDisplayHintWarning: "运行时可能被 displayHintMap 盖掉。",
+    animOverridesFallbackHint: "这个槽位当前回退到 {state}。",
     animOverridesOverriddenTooltip: "已修改（非默认值）",
+    animOverridesUseOwnFile: "使用独立素材",
+    animOverridesDurationIdle: "驻留时长",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "工作态",
+    animOverridesSectionInterrupts: "打扰态",
+    animOverridesSectionSleep: "睡眠",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionIdleTracked: "跟随鼠标的 idle",
+    animOverridesSectionIdleAnimated: "idle 随机池",
+    animOverridesSectionIdleStatic: "单张静态 idle",
+    animOverridesSectionSleepFull: "完整睡眠序列",
+    animOverridesSectionSleepDirect: "直睡模式",
     animOverridesExpandRow: "展开",
     animOverridesModalTitle: "选择素材文件",
     animOverridesModalSubtitle: "把文件放进当前主题 assets 目录后，可在这里刷新列表重新选择。",
@@ -224,6 +264,131 @@ const STRINGS = {
     animOverridesModalUse: "使用这个文件",
     animOverridesModalCancel: "取消",
     animOverridesRefresh: "刷新列表",
+  },
+  ko: {
+    settingsTitle: "설정",
+    settingsSubtitle: "데스크톱에서 Clawd의 동작 방식을 설정합니다.",
+    sidebarGeneral: "일반",
+    sidebarAgents: "에이전트",
+    sidebarTheme: "테마",
+    sidebarAnimMap: "애니메이션 맵",
+    sidebarAnimOverrides: "애니메이션 오버라이드",
+    sidebarShortcuts: "단축키",
+    sidebarAbout: "정보",
+    sidebarSoon: "예정",
+    sectionAppearance: "외관",
+    sectionStartup: "시작",
+    sectionBubbles: "말풍선",
+    agentsTitle: "에이전트",
+    agentsSubtitle: "에이전트별로 추적을 켜거나 끕니다. 비활성화된 에이전트는 로그 모니터를 멈추고 HTTP 경계에서 hook 이벤트를 버리므로, 펫을 움직이거나 권한 말풍선을 띄우거나 세션을 유지하지 않습니다.",
+    agentsEmpty: "등록된 에이전트가 없습니다.",
+    eventSourceHook: "훅",
+    eventSourceLogPoll: "로그 폴링",
+    eventSourcePlugin: "플러그인",
+    badgePermissionBubble: "권한 말풍선",
+    rowAgentPermissions: "팝업 말풍선 표시",
+    rowAgentPermissionsDesc: "끄면 이 에이전트는 Clawd 말풍선 대신 자체 터미널에서 프롬프트를 처리합니다.",
+    rowLanguage: "언어",
+    rowLanguageDesc: "메뉴와 말풍선의 인터페이스 언어입니다.",
+    rowSound: "효과음",
+    rowSoundDesc: "Clawd가 작업을 마치거나 입력을 요청할 때 알림음을 재생합니다.",
+    rowOpenAtLogin: "로그인 시 자동 실행",
+    rowOpenAtLoginDesc: "로그인할 때 Clawd를 자동으로 시작합니다.",
+    rowManageClaudeHooks: "Claude hooks 자동 관리",
+    rowManageClaudeHooksDesc: "시작 시 Claude hooks를 동기화하고 `~/.claude/settings.json`이 덮어써지면 다시 복구합니다.",
+    rowManageClaudeHooksOffNote: "이 옵션을 꺼도 이후 자동 관리만 중지됩니다. 기존 Claude hooks는 직접 연결 해제하기 전까지 남아 있습니다.",
+    actionDisconnectClaudeHooks: "연결 해제",
+    rowStartWithClaude: "Claude Code와 함께 시작",
+    rowStartWithClaudeDesc: "Claude Code 세션이 시작될 때마다 Clawd를 자동으로 실행합니다.",
+    rowStartWithClaudeDisabledDesc: "Claude hooks 자동 관리가 필요합니다. 관리가 꺼져 있는 동안에는 포트 변경이나 설정 덮어쓰기를 자동으로 복구하지 않습니다.",
+    rowBubbleFollow: "말풍선이 Clawd를 따라다님",
+    rowBubbleFollowDesc: "권한 및 업데이트 말풍선을 화면 구석 대신 펫 옆에 표시합니다.",
+    rowHideBubbles: "모든 말풍선 숨기기",
+    rowHideBubblesDesc: "권한, 알림, 업데이트 말풍선을 모두 숨깁니다.",
+    rowShowSessionId: "세션 ID 표시",
+    rowShowSessionIdDesc: "말풍선 제목과 Sessions 메뉴에 짧은 세션 ID를 덧붙입니다.",
+    placeholderTitle: "곧 제공 예정",
+    placeholderDesc: "이 패널은 향후 Clawd 릴리스에 추가됩니다. 계획은 docs/plan-settings-panel.md에 있습니다.",
+    toastSaveFailed: "저장 실패: ",
+    langEnglish: "English",
+    langChinese: "中文",
+    langKorean: "한국어",
+    themeTitle: "테마",
+    themeSubtitle: "Clawd의 테마를 선택합니다. 카드에는 기본 제공/능력 배지가 표시되어 tracked/static/mini 차이를 미리 볼 수 있습니다.",
+    themeEmpty: "사용 가능한 테마가 없습니다.",
+    themeBadgeBuiltin: "기본 제공",
+    themeBadgeActive: "활성",
+    themeCapabilityTracked: "커서 추적 idle",
+    themeCapabilityAnimated: "애니메이션 idle",
+    themeCapabilityStatic: "정적 테마",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "직접 수면",
+    themeCapabilityNoReactions: "반응 없음",
+    themeActiveIndicator: "\u2713 활성",
+    themeThumbMissing: "\u{1F3AD}",
+    themeDeleteLabel: "테마 삭제",
+    themeVariantStripLabel: "변형",
+    toastThemeDeleted: "테마를 삭제했습니다.",
+    toastThemeDeleteFailed: "테마 삭제 실패: ",
+    animMapTitle: "애니메이션 맵",
+    animMapSubtitle: "개별 인터럽트 애니메이션을 끕니다. 이벤트는 계속 발생하지만 Clawd는 선택한 상태의 화면과 소리만 건너뜁니다.",
+    animMapSemanticsNote: "비활성화 = 화면 없음 + 소리 없음. 권한 말풍선, 세션, 터미널 포커스는 그대로 작동합니다.",
+    animMapResetAll: "모두 초기화",
+    animMapAttentionLabel: "작업 완료 (happy)",
+    animMapAttentionDesc: "에이전트가 한 턴을 마쳤을 때 재생되는 즐거운 바운스 애니메이션입니다. (Stop / PostCompact)",
+    animMapErrorLabel: "오류 플래시",
+    animMapErrorDesc: "도구 호출이 실패했을 때 흔들리는 애니메이션입니다.",
+    animMapSweepingLabel: "컨텍스트 정리",
+    animMapSweepingDesc: "PreCompact / 컨텍스트 정리 중 빗자루 애니메이션입니다.",
+    animMapNotificationLabel: "알림",
+    animMapNotificationDesc: "권한 요청과 입력 요청 시 재생되는 종 애니메이션입니다.",
+    animMapCarryingLabel: "워크트리 운반",
+    animMapCarryingDesc: "worktree가 생성될 때 재생되는 운반 애니메이션입니다.",
+    toastAnimMapResetOk: "애니메이션 오버라이드를 초기화했습니다.",
+    animOverridesTitle: "애니메이션 오버라이드",
+    animOverridesSubtitle: "현재 테마의 카드별 파일을 바꾸고 페이드/복귀 타이밍을 조정합니다.",
+    animOverridesCurrentTheme: "현재 테마",
+    animOverridesOpenThemeTab: "테마 탭 열기",
+    animOverridesOpenAssets: "assets 폴더 열기",
+    animOverridesResetAll: "모두 기본값으로 복원",
+    animOverridesChangeFile: "파일 변경",
+    animOverridesPreview: "한 번 미리보기",
+    animOverridesReset: "슬롯 초기화",
+    animOverridesFade: "페이드",
+    animOverridesFadeIn: "입장",
+    animOverridesFadeOut: "퇴장",
+    animOverridesSaveFade: "페이드 저장",
+    animOverridesDuration: "자동 복귀",
+    animOverridesSaveDuration: "타이밍 저장",
+    animOverridesContinuousHint: "지속 상태는 여기서 auto-return을 편집할 수 없습니다.",
+    animOverridesAssetCycle: "에셋 주기",
+    animOverridesSuggestedTiming: "권장 타이밍",
+    animOverridesTimingEstimated: "추정값",
+    animOverridesTimingFallback: "테마 기본값",
+    animOverridesTimingUnavailable: "사용할 수 없음",
+    animOverridesDisplayHintWarning: "displayHintMap이 런타임에 이 슬롯을 덮어쓸 수 있습니다.",
+    animOverridesFallbackHint: "이 슬롯은 현재 {state}(으)로 폴백됩니다.",
+    animOverridesOverriddenTooltip: "기본값에서 변경됨",
+    animOverridesUseOwnFile: "개별 파일 사용",
+    animOverridesDurationIdle: "유지 시간",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "작업",
+    animOverridesSectionInterrupts: "인터럽트",
+    animOverridesSectionSleep: "수면",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionIdleTracked: "커서 추적 idle",
+    animOverridesSectionIdleAnimated: "idle 랜덤 풀",
+    animOverridesSectionIdleStatic: "단일 정적 idle",
+    animOverridesSectionSleepFull: "전체 수면 시퀀스",
+    animOverridesSectionSleepDirect: "직접 수면",
+    animOverridesExpandRow: "펼치기",
+    animOverridesModalTitle: "에셋 파일 선택",
+    animOverridesModalSubtitle: "파일을 현재 테마의 assets 폴더에 추가한 뒤 여기서 목록을 새로고침하세요.",
+    animOverridesModalEmpty: "이 테마에는 아직 지원되는 에셋이 없습니다.",
+    animOverridesModalSelected: "선택된 파일",
+    animOverridesModalUse: "이 파일 사용",
+    animOverridesModalCancel: "취소",
+    animOverridesRefresh: "목록 새로고침",
   },
 };
 
@@ -511,6 +676,19 @@ function applyThemePreviewOffset(img, offsetPct) {
   img.style.transform = `translate(${x.toFixed(2)}%, ${y.toFixed(2)}%)`;
 }
 
+function getThemeCapabilityBadgeLabels(theme) {
+  const caps = theme && theme.capabilities;
+  if (!caps || typeof caps !== "object") return [];
+  const badges = [];
+  if (caps.idleMode === "tracked") badges.push(t("themeCapabilityTracked"));
+  else if (caps.idleMode === "animated") badges.push(t("themeCapabilityAnimated"));
+  else if (caps.idleMode === "static") badges.push(t("themeCapabilityStatic"));
+  if (caps.miniMode) badges.push(t("themeCapabilityMini"));
+  if (caps.sleepMode === "direct") badges.push(t("themeCapabilityDirectSleep"));
+  if (caps.reactions === false) badges.push(t("themeCapabilityNoReactions"));
+  return badges;
+}
+
 function buildThemeCard(theme) {
   const card = document.createElement("div");
   card.className = "theme-card";
@@ -550,6 +728,19 @@ function buildThemeCard(theme) {
     name.appendChild(badge);
   }
   card.appendChild(name);
+
+  const capLabels = getThemeCapabilityBadgeLabels(theme);
+  if (capLabels.length) {
+    const caps = document.createElement("div");
+    caps.className = "theme-card-capabilities";
+    for (const label of capLabels) {
+      const badge = document.createElement("span");
+      badge.className = "theme-card-badge";
+      badge.textContent = label;
+      caps.appendChild(badge);
+    }
+    card.appendChild(caps);
+  }
 
   const canDelete = !theme.builtin && !theme.active;
   if (theme.active || canDelete) {
@@ -704,6 +895,7 @@ function previewStateForCard(card) {
   if (card.slotType === "tier") {
     return card.tierGroup === "jugglingTiers" ? "juggling" : "working";
   }
+  if (card.slotType === "idleAnimation") return "idle";
   return card.stateKey;
 }
 
@@ -715,6 +907,8 @@ function buildAnimOverrideRequest(card, patch) {
   };
   if (card.slotType === "tier") {
     base.tierGroup = card.tierGroup;
+    base.originalFile = card.originalFile;
+  } else if (card.slotType === "idleAnimation") {
     base.originalFile = card.originalFile;
   } else {
     base.stateKey = card.stateKey;
@@ -745,14 +939,27 @@ function openAssetPicker(card) {
 }
 
 function formatSessionRange(minSessions, maxSessions) {
-  const isZh = ((snapshot && snapshot.lang) || "en") === "zh";
-  if (maxSessions == null) return isZh ? `${minSessions}+ 会话` : `${minSessions}+ sessions`;
-  if (minSessions === maxSessions) return isZh ? `${minSessions} 会话` : `${minSessions} session${minSessions === 1 ? "" : "s"}`;
-  return isZh ? `${minSessions}-${maxSessions} 会话` : `${minSessions}-${maxSessions} sessions`;
+  const lang = (snapshot && snapshot.lang) || "en";
+  if (lang === "zh") {
+    if (maxSessions == null) return `${minSessions}+ 会话`;
+    if (minSessions === maxSessions) return `${minSessions} 会话`;
+    return `${minSessions}-${maxSessions} 会话`;
+  }
+  if (lang === "ko") {
+    if (maxSessions == null) return `${minSessions}+ 세션`;
+    if (minSessions === maxSessions) return `${minSessions} 세션`;
+    return `${minSessions}-${maxSessions} 세션`;
+  }
+  if (maxSessions == null) return `${minSessions}+ sessions`;
+  if (minSessions === maxSessions) return `${minSessions} session${minSessions === 1 ? "" : "s"}`;
+  return `${minSessions}-${maxSessions} sessions`;
 }
 
 function getAnimOverrideTriggerLabel(card) {
   switch (card.triggerKind) {
+    case "idleTracked": return "Idle follow";
+    case "idleStatic": return "Idle";
+    case "idleAnimation": return `Idle random #${card.poolIndex || 1}`;
     case "thinking": return "UserPromptSubmit";
     case "working": return `PreToolUse (${formatSessionRange(card.minSessions, card.maxSessions)})`;
     case "juggling": return `SubagentStart (${formatSessionRange(card.minSessions, card.maxSessions)})`;
@@ -761,10 +968,77 @@ function getAnimOverrideTriggerLabel(card) {
     case "notification": return "PermissionRequest";
     case "sweeping": return "PreCompact";
     case "carrying": return "WorktreeCreate";
+    case "yawning": return "Sleep: yawn";
+    case "dozing": return "Sleep: doze";
+    case "collapsing": return "Sleep: collapse";
     case "sleeping": return "60s no events";
     case "waking": return "Wake";
+    case "mini-idle": return "Mini idle";
+    case "mini-enter": return "Mini enter";
+    case "mini-enter-sleep": return "Mini enter sleep";
+    case "mini-crabwalk": return "Mini crabwalk";
+    case "mini-peek": return "Mini peek";
+    case "mini-alert": return "Mini alert";
+    case "mini-happy": return "Mini happy";
+    case "mini-sleep": return "Mini sleep";
     default: return card.triggerKind || card.stateKey || card.id;
   }
+}
+
+function getAnimOverrideSectionTitle(section) {
+  if (!section || !section.id) return "";
+  switch (section.id) {
+    case "idle": return t("animOverridesSectionIdle");
+    case "work": return t("animOverridesSectionWork");
+    case "interrupts": return t("animOverridesSectionInterrupts");
+    case "sleep": return t("animOverridesSectionSleep");
+    case "mini": return t("animOverridesSectionMini");
+    default: return section.id;
+  }
+}
+
+function getAnimOverrideSectionSubtitle(section) {
+  if (!section) return "";
+  if (section.id === "idle") {
+    if (section.mode === "tracked") return t("animOverridesSectionIdleTracked");
+    if (section.mode === "animated") return t("animOverridesSectionIdleAnimated");
+    if (section.mode === "static") return t("animOverridesSectionIdleStatic");
+  }
+  if (section.id === "sleep") {
+    if (section.mode === "full") return t("animOverridesSectionSleepFull");
+    if (section.mode === "direct") return t("animOverridesSectionSleepDirect");
+  }
+  return "";
+}
+
+function buildAnimOverrideSection(section) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "anim-override-section";
+
+  const head = document.createElement("div");
+  head.className = "anim-override-section-head";
+
+  const title = document.createElement("div");
+  title.className = "section-title";
+  title.textContent = getAnimOverrideSectionTitle(section);
+  head.appendChild(title);
+
+  const subtitleText = getAnimOverrideSectionSubtitle(section);
+  if (subtitleText) {
+    const subtitle = document.createElement("div");
+    subtitle.className = "anim-override-section-subtitle";
+    subtitle.textContent = subtitleText;
+    head.appendChild(subtitle);
+  }
+  wrapper.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "anim-override-list";
+  for (const card of (section.cards || [])) {
+    list.appendChild(buildAnimOverrideRow(card));
+  }
+  wrapper.appendChild(list);
+  return wrapper;
 }
 
 function buildAnimPreviewNode(fileUrl) {
@@ -848,13 +1122,11 @@ function renderAnimOverridesTab(parent) {
   themeMeta.appendChild(resetAllBtn);
   parent.appendChild(themeMeta);
 
-  const cards = Array.isArray(data.cards) ? data.cards : [];
-  const list = document.createElement("div");
-  list.className = "anim-override-list";
-  for (const card of cards) {
-    list.appendChild(buildAnimOverrideRow(card));
+  const sections = Array.isArray(data.sections) ? data.sections : [];
+  for (const section of sections) {
+    if (!section || !Array.isArray(section.cards) || !section.cards.length) continue;
+    parent.appendChild(buildAnimOverrideSection(section));
   }
-  parent.appendChild(list);
   renderAssetPickerModal();
 }
 
@@ -875,6 +1147,10 @@ function isCardOverridden(card) {
     const group = map.tiers && map.tiers[card.tierGroup];
     return !!(group && group[card.originalFile]);
   }
+  if (card.slotType === "idleAnimation") {
+    const group = map.idleAnimations;
+    return !!(group && group[card.originalFile]);
+  }
   const entry = map.states && map.states[card.stateKey];
   if (entry) return true;
   const autoReturn = map.timings && map.timings.autoReturn;
@@ -884,6 +1160,7 @@ function isCardOverridden(card) {
 function buildAnimOverrideRow(card) {
   const row = document.createElement("details");
   row.className = "anim-override-row";
+  if (card.fallbackTargetState) row.classList.add("inherited");
   row.dataset.rowId = card.id;
   if (expandedOverrideRowIds.has(card.id)) row.open = true;
   row.addEventListener("toggle", () => {
@@ -933,6 +1210,20 @@ function buildAnimOverrideSummary(card) {
   file.textContent = card.currentFile;
   file.title = card.bindingLabel || "";
   text.appendChild(file);
+  if (card.fallbackTargetState) {
+    const chip = document.createElement("div");
+    chip.className = "anim-override-fallback-chip";
+    chip.title = getAnimFallbackHint(card);
+    const arrow = document.createElement("span");
+    arrow.className = "anim-override-fallback-chip-arrow";
+    arrow.textContent = "\u21B7"; // ↷
+    arrow.setAttribute("aria-hidden", "true");
+    chip.appendChild(arrow);
+    const target = document.createElement("span");
+    target.textContent = card.fallbackTargetState;
+    chip.appendChild(target);
+    text.appendChild(chip);
+  }
   summary.appendChild(text);
 
   const badges = document.createElement("div");
@@ -958,7 +1249,7 @@ function buildAnimOverrideSummary(card) {
   const changeBtn = document.createElement("button");
   changeBtn.type = "button";
   changeBtn.className = "soft-btn accent anim-override-summary-change";
-  changeBtn.textContent = t("animOverridesChangeFile");
+  changeBtn.textContent = card.fallbackTargetState ? t("animOverridesUseOwnFile") : t("animOverridesChangeFile");
   changeBtn.addEventListener("click", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -972,6 +1263,13 @@ function buildAnimOverrideSummary(card) {
 function buildAnimOverrideDrawer(card) {
   const drawer = document.createElement("div");
   drawer.className = "anim-override-drawer";
+
+  if (card.fallbackTargetState) {
+    const hint = document.createElement("div");
+    hint.className = "anim-override-binding";
+    hint.textContent = getAnimFallbackHint(card);
+    drawer.appendChild(hint);
+  }
 
   if (card.displayHintWarning) {
     const warning = document.createElement("div");
@@ -1006,14 +1304,14 @@ function buildAnimOverrideDrawer(card) {
     card.assetCycleMs,
     card.assetCycleStatus
   ));
-  if (card.supportsAutoReturn && card.assetCycleMs == null && card.suggestedDurationMs != null) {
+  if ((card.supportsAutoReturn || card.supportsDuration) && card.assetCycleMs == null && card.suggestedDurationMs != null) {
     info.appendChild(buildAnimTimingHint(
-      t("animOverridesSuggestedTiming"),
+      card.supportsDuration ? t("animOverridesDurationIdle") : t("animOverridesSuggestedTiming"),
       card.suggestedDurationMs,
       card.suggestedDurationStatus
     ));
   }
-  if (!card.supportsAutoReturn) {
+  if (!card.supportsAutoReturn && !card.supportsDuration) {
     const hint = document.createElement("div");
     hint.className = "anim-override-binding";
     hint.textContent = t("animOverridesContinuousHint");
@@ -1054,6 +1352,20 @@ function buildAnimOverrideDrawer(card) {
       },
     }));
   }
+  if (card.supportsDuration) {
+    const current = Number.isFinite(card.durationMs) ? card.durationMs : (card.suggestedDurationMs || 3000);
+    sliders.appendChild(buildAnimOverrideSliderRow({
+      label: t("animOverridesDurationIdle"),
+      min: 500, max: 20000, step: 100,
+      value: current,
+      numberMin: 500,
+      numberMax: 60000,
+      onCommit: (v) => {
+        if (!Number.isFinite(v) || v < 500 || v > 60000) return;
+        return runAnimationOverrideCommand(card, { durationMs: v });
+      },
+    }));
+  }
   drawer.appendChild(sliders);
 
   const footer = document.createElement("div");
@@ -1063,13 +1375,15 @@ function buildAnimOverrideDrawer(card) {
   resetBtn.className = "soft-btn";
   resetBtn.textContent = t("animOverridesReset");
   resetBtn.disabled = !isCardOverridden(card);
-  attachActivation(resetBtn, () =>
-    runAnimationOverrideCommand(card, {
+  attachActivation(resetBtn, () => {
+    const patch = {
       file: null,
       transition: null,
       ...(card.supportsAutoReturn ? { autoReturnMs: null } : {}),
-    })
-  );
+      ...(card.supportsDuration ? { durationMs: null } : {}),
+    };
+    return runAnimationOverrideCommand(card, patch);
+  });
   footer.appendChild(resetBtn);
   drawer.appendChild(footer);
 
@@ -1128,12 +1442,18 @@ function clampNumber(v, min, max) {
 }
 
 function formatAnimTimingValue(ms, status) {
+  if (status === "static") return "—";
   let text = Number.isFinite(ms) && ms > 0
     ? `${ms} ms`
     : t("animOverridesTimingUnavailable");
   if (status === "estimated") text += ` (${t("animOverridesTimingEstimated")})`;
   else if (status === "fallback") text += ` (${t("animOverridesTimingFallback")})`;
   return text;
+}
+
+function getAnimFallbackHint(card) {
+  if (!card || !card.fallbackTargetState) return "";
+  return t("animOverridesFallbackHint").replace("{state}", card.fallbackTargetState);
 }
 
 function buildAnimTimingHint(label, ms, status) {
@@ -1660,17 +1980,19 @@ function buildLanguageRow() {
       `<span class="row-label"></span>` +
       `<span class="row-desc"></span>` +
     `</div>` +
-    `<div class="row-control">` +
-      `<div class="segmented" role="tablist">` +
-        `<button data-lang="en"></button>` +
-        `<button data-lang="zh"></button>` +
-      `</div>` +
-    `</div>`;
+      `<div class="row-control">` +
+        `<div class="segmented" role="tablist">` +
+          `<button data-lang="en"></button>` +
+          `<button data-lang="zh"></button>` +
+          `<button data-lang="ko"></button>` +
+        `</div>` +
+      `</div>`;
   row.querySelector(".row-label").textContent = t("rowLanguage");
   row.querySelector(".row-desc").textContent = t("rowLanguageDesc");
   const buttons = row.querySelectorAll(".segmented button");
   buttons[0].textContent = t("langEnglish");
   buttons[1].textContent = t("langChinese");
+  buttons[2].textContent = t("langKorean");
   const current = (snapshot && snapshot.lang) || "en";
   for (const btn of buttons) {
     if (btn.dataset.lang === current) btn.classList.add("active");

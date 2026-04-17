@@ -537,6 +537,9 @@ function reapplyMacVisibility() {
   if (!isMac) return;
   const apply = (w) => {
     if (w && !w.isDestroyed()) {
+      const deferUntil = Number(w.__clawdMacDeferredVisibilityUntil) || 0;
+      if (deferUntil > Date.now()) return;
+      if (deferUntil) delete w.__clawdMacDeferredVisibilityUntil;
       w.setAlwaysOnTop(true, MAC_TOPMOST_LEVEL);
       if (!applyStationaryCollectionBehavior(w)) {
         const opts = { visibleOnFullScreen: true };
@@ -859,6 +862,7 @@ const _menuCtx = {
   reapplyMacVisibility,
   discoverThemes: () => themeLoader.discoverThemes(),
   getActiveThemeId: () => activeTheme ? activeTheme._id : "clawd",
+  getActiveThemeCapabilities: () => activeTheme ? activeTheme._capabilities : null,
   ensureUserThemesDir: () => themeLoader.ensureUserThemesDir(),
   openSettingsWindow: () => openSettingsWindow(),
 };
@@ -952,7 +956,7 @@ function wireSettingsSubscribers() {
 }
 wireSettingsSubscribers();
 
-const ANIMATION_OVERRIDE_ASSET_EXTS = new Set([".svg", ".gif", ".apng", ".png", ".webp"]);
+const ANIMATION_OVERRIDE_ASSET_EXTS = new Set([".svg", ".gif", ".apng", ".png", ".webp", ".jpg", ".jpeg"]);
 let animationOverridePreviewTimer = null;
 
 function _buildFileUrl(absPath) {
@@ -1076,7 +1080,19 @@ function _readResolvedTransition(file) {
   };
 }
 
-function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, baseHintMap) {
+function _hasOwnStateFiles(stateKey) {
+  if (!activeTheme) return false;
+  const binding = activeTheme._stateBindings && activeTheme._stateBindings[stateKey];
+  if (binding && Array.isArray(binding.files) && binding.files[0]) return true;
+  if (activeTheme.states && Array.isArray(activeTheme.states[stateKey]) && activeTheme.states[stateKey][0]) return true;
+  if (activeTheme.miniMode && activeTheme.miniMode.states
+      && Array.isArray(activeTheme.miniMode.states[stateKey]) && activeTheme.miniMode.states[stateKey][0]) {
+    return true;
+  }
+  return false;
+}
+
+function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, baseHintMap, sectionId = "work") {
   if (!Array.isArray(resolvedTiers)) return [];
   return resolvedTiers.map((tier, index) => {
     const baseTier = Array.isArray(baseTiers) ? baseTiers[index] : null;
@@ -1088,6 +1104,7 @@ function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, b
     return {
       id: `${tierGroup}:${originalFile}`,
       slotType: "tier",
+      sectionId,
       tierGroup,
       triggerKind,
       originalFile,
@@ -1099,7 +1116,9 @@ function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, b
       bindingLabel: `${tierGroup}[${originalFile}]`,
       transition: _readResolvedTransition(tier.file),
       supportsAutoReturn: false,
+      supportsDuration: false,
       autoReturnMs: null,
+      durationMs: null,
       hasAutoReturnOverride: false,
       ...timingHint,
       displayHintWarning: !!(hintTarget && hintTarget !== originalFile),
@@ -1108,26 +1127,76 @@ function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, b
   });
 }
 
-function _buildStateCard(stateKey, triggerKind, themeOverrideMap) {
-  const files = activeTheme && activeTheme.states && activeTheme.states[stateKey];
-  if (!Array.isArray(files) || !files[0]) return null;
-  const currentFile = files[0];
+function _getResolvedStateCardBinding(stateKey) {
+  if (!activeTheme) return null;
+  const bindingMap = activeTheme._stateBindings || {};
+  let cursor = stateKey;
+  let hops = 0;
+  const visited = new Set([stateKey]);
+
+  while (cursor && hops <= 3) {
+    const binding = bindingMap[cursor] || {};
+    const files = Array.isArray(binding.files)
+      ? binding.files
+      : (
+        activeTheme.states && Array.isArray(activeTheme.states[cursor]) ? activeTheme.states[cursor]
+          : (
+            activeTheme.miniMode && activeTheme.miniMode.states && Array.isArray(activeTheme.miniMode.states[cursor])
+              ? activeTheme.miniMode.states[cursor]
+              : []
+          )
+      );
+    if (files[0]) {
+      return {
+        currentFile: files[0],
+        resolvedState: cursor,
+        fallbackTargetState: cursor !== stateKey ? cursor : null,
+      };
+    }
+    const fallbackTo = typeof binding.fallbackTo === "string" && binding.fallbackTo ? binding.fallbackTo : null;
+    if (!fallbackTo || visited.has(fallbackTo)) break;
+    visited.add(fallbackTo);
+    cursor = fallbackTo;
+    hops += 1;
+  }
+
+  return null;
+}
+
+function _buildStateCard(stateKey, triggerKind, themeOverrideMap, options = {}) {
+  const resolved = _getResolvedStateCardBinding(stateKey);
+  if (!resolved || !resolved.currentFile) return null;
+  const currentFile = resolved.currentFile;
   const autoReturnMap = (activeTheme && activeTheme.timings && activeTheme.timings.autoReturn) || {};
   const supportsAutoReturn = Object.prototype.hasOwnProperty.call(autoReturnMap, stateKey);
   const resolvedAutoReturnMs = supportsAutoReturn ? autoReturnMap[stateKey] : null;
   const timingHint = _buildTimingHint(currentFile, resolvedAutoReturnMs);
+  const fallbackTargetState = resolved.fallbackTargetState;
+  const bindingMap = options.bindingMap || (
+    options.bindingPathPrefix === "miniMode.states"
+      ? ((activeTheme._bindingBase && activeTheme._bindingBase.miniStates) || {})
+      : ((activeTheme._bindingBase && activeTheme._bindingBase.states) || {})
+  );
+  const bindingPathPrefix = options.bindingPathPrefix || "states";
   return {
     id: `state:${stateKey}`,
     slotType: "state",
+    sectionId: options.sectionId || null,
     stateKey,
     triggerKind,
     currentFile,
-    baseFile: (activeTheme._bindingBase && activeTheme._bindingBase.states && activeTheme._bindingBase.states[stateKey]) || currentFile,
+    resolvedState: resolved.resolvedState,
+    fallbackTargetState,
+    baseFile: bindingMap[stateKey] || currentFile,
     currentFileUrl: _buildAnimationAssetUrl(currentFile),
-    bindingLabel: `states.${stateKey}[0]`,
+    bindingLabel: fallbackTargetState
+      ? `${bindingPathPrefix}.${stateKey}.fallbackTo -> ${fallbackTargetState}`
+      : `${bindingPathPrefix}.${stateKey}[0]`,
     transition: _readResolvedTransition(currentFile),
     supportsAutoReturn,
+    supportsDuration: false,
     autoReturnMs: resolvedAutoReturnMs,
+    durationMs: null,
     hasAutoReturnOverride: supportsAutoReturn ? _hasExplicitAutoReturnOverride(themeOverrideMap, stateKey) : false,
     ...timingHint,
     displayHintWarning: false,
@@ -1135,56 +1204,162 @@ function _buildStateCard(stateKey, triggerKind, themeOverrideMap) {
   };
 }
 
-function _buildAnimationOverrideCards() {
-  if (!activeTheme) return [];
-  const cards = [];
-  const themeOverrideMap = _readCurrentThemeOverrideMap();
-  const thinking = _buildStateCard("thinking", "thinking", themeOverrideMap);
-  if (thinking) cards.push(thinking);
+function _buildIdleAnimationCards(themeOverrideMap) {
+  if (!activeTheme || !Array.isArray(activeTheme.idleAnimations)) return [];
+  const baseIdleAnimations = (activeTheme._bindingBase && activeTheme._bindingBase.idleAnimations) || [];
+  const overrideMap = themeOverrideMap && themeOverrideMap.idleAnimations;
+  return activeTheme.idleAnimations
+    .map((entry, index) => {
+      if (!entry || typeof entry.file !== "string" || !entry.file) return null;
+      const baseEntry = baseIdleAnimations[index] || null;
+      const originalFile = (baseEntry && baseEntry.originalFile) || entry.file;
+      const durationMs = Number.isFinite(entry.duration) ? entry.duration : null;
+      const timingHint = _buildTimingHint(entry.file, durationMs);
+      const hasDurationOverride = !!(overrideMap
+        && overrideMap[originalFile]
+        && Object.prototype.hasOwnProperty.call(overrideMap[originalFile], "durationMs"));
+      return {
+        id: `idleAnimation:${originalFile}`,
+        slotType: "idleAnimation",
+        sectionId: "idle",
+        triggerKind: "idleAnimation",
+        poolIndex: index + 1,
+        originalFile,
+        baseFile: originalFile,
+        currentFile: entry.file,
+        currentFileUrl: _buildAnimationAssetUrl(entry.file),
+        bindingLabel: `idleAnimations[${index}] (${originalFile})`,
+        transition: _readResolvedTransition(entry.file),
+        supportsAutoReturn: false,
+        supportsDuration: true,
+        autoReturnMs: null,
+        durationMs,
+        hasDurationOverride,
+        hasAutoReturnOverride: false,
+        ...timingHint,
+        previewDurationMs: timingHint.previewDurationMs || durationMs,
+        displayHintWarning: false,
+        displayHintTarget: null,
+      };
+    })
+    .filter(Boolean);
+}
 
+function _pushSection(sections, id, mode, cards) {
+  if (!Array.isArray(cards) || cards.length === 0) return;
+  sections.push({ id, mode: mode || null, cards });
+}
+
+function _buildAnimationOverrideSections() {
+  if (!activeTheme) return [];
+  const themeOverrideMap = _readCurrentThemeOverrideMap();
+  const sections = [];
+  const thinking = _buildStateCard("thinking", "thinking", themeOverrideMap);
   const baseBindings = activeTheme._bindingBase || {};
-  cards.push(..._buildTierCardGroup(
+  const workCards = [];
+  if (thinking) {
+    thinking.sectionId = "work";
+    workCards.push(thinking);
+  }
+  workCards.push(..._buildTierCardGroup(
     "workingTiers",
     "working",
     activeTheme.workingTiers || [],
     baseBindings.workingTiers || [],
-    baseBindings.displayHintMap || {}
+    baseBindings.displayHintMap || {},
+    "work"
   ));
-  cards.push(..._buildTierCardGroup(
+  workCards.push(..._buildTierCardGroup(
     "jugglingTiers",
     "juggling",
     activeTheme.jugglingTiers || [],
     baseBindings.jugglingTiers || [],
-    baseBindings.displayHintMap || {}
+    baseBindings.displayHintMap || {},
+    "work"
   ));
+  _pushSection(sections, "work", null, workCards);
 
+  const idleMode = activeTheme._capabilities && activeTheme._capabilities.idleMode;
+  if (idleMode === "animated") {
+    _pushSection(sections, "idle", idleMode, _buildIdleAnimationCards(themeOverrideMap));
+  } else {
+    const idleCard = _buildStateCard("idle", idleMode === "tracked" ? "idleTracked" : "idleStatic", themeOverrideMap, {
+      sectionId: "idle",
+    });
+    _pushSection(sections, "idle", idleMode, idleCard ? [idleCard] : []);
+  }
+
+  const interruptCards = [];
   for (const [stateKey, triggerKind] of [
     ["error", "error"],
     ["attention", "attention"],
     ["notification", "notification"],
     ["sweeping", "sweeping"],
     ["carrying", "carrying"],
-    ["sleeping", "sleeping"],
-    ["waking", "waking"],
   ]) {
-    const card = _buildStateCard(stateKey, triggerKind, themeOverrideMap);
-    if (card) cards.push(card);
+    const card = _buildStateCard(stateKey, triggerKind, themeOverrideMap, { sectionId: "interrupts" });
+    if (card) interruptCards.push(card);
   }
-  return cards;
+  _pushSection(sections, "interrupts", null, interruptCards);
+
+  const sleepCards = [];
+  const sleepMode = activeTheme._capabilities && activeTheme._capabilities.sleepMode;
+  const sleepStates = sleepMode === "direct"
+    ? [["sleeping", "sleeping"]]
+    : [
+      ["yawning", "yawning"],
+      ["dozing", "dozing"],
+      ["collapsing", "collapsing"],
+      ["sleeping", "sleeping"],
+    ];
+  for (const [stateKey, triggerKind] of sleepStates) {
+    const card = _buildStateCard(stateKey, triggerKind, themeOverrideMap, { sectionId: "sleep" });
+    if (card) sleepCards.push(card);
+  }
+  if (_hasOwnStateFiles("waking")) {
+    const waking = _buildStateCard("waking", "waking", themeOverrideMap, { sectionId: "sleep" });
+    if (waking) sleepCards.push(waking);
+  }
+  _pushSection(sections, "sleep", sleepMode, sleepCards);
+
+  if (activeTheme.miniMode && activeTheme.miniMode.supported) {
+    const miniCards = [];
+    for (const stateKey of [
+      "mini-idle",
+      "mini-enter",
+      "mini-enter-sleep",
+      "mini-crabwalk",
+      "mini-peek",
+      "mini-alert",
+      "mini-happy",
+      "mini-sleep",
+    ]) {
+      const card = _buildStateCard(stateKey, stateKey, themeOverrideMap, {
+        sectionId: "mini",
+        bindingPathPrefix: "miniMode.states",
+      });
+      if (card) miniCards.push(card);
+    }
+    _pushSection(sections, "mini", null, miniCards);
+  }
+  return sections;
 }
 
 function _buildAnimationOverrideData() {
   if (!activeTheme) return null;
   const meta = themeLoader.getThemeMetadata(activeTheme._id) || {};
+  const sections = _buildAnimationOverrideSections();
   return {
     theme: {
       id: activeTheme._id,
       name: meta.name || activeTheme._id,
       variantId: activeTheme._variantId || "default",
       assetsDir: _resolveAnimationAssetsDir(activeTheme),
+      capabilities: activeTheme._capabilities || meta.capabilities || null,
     },
     assets: _listAnimationOverrideAssets(activeTheme),
-    cards: _buildAnimationOverrideCards(),
+    sections,
+    cards: sections.flatMap((section) => section.cards || []),
   };
 }
 
@@ -1285,6 +1460,12 @@ const REMOVE_THEME_DIALOG_STRINGS = {
     message: (name) => `确认删除主题 "${name}"？`,
     detail: "此操作不可撤销。主题的所有文件将从磁盘移除。",
   },
+  ko: {
+    delete: "삭제",
+    cancel: "취소",
+    message: (name) => `테마 "${name}"을(를) 삭제할까요?`,
+    detail: "이 작업은 되돌릴 수 없습니다. 이 테마의 모든 파일이 디스크에서 제거됩니다.",
+  },
 };
 ipcMain.handle("settings:confirm-remove-theme", async (event, themeId) => {
   if (typeof themeId !== "string" || !themeId) return { confirmed: false };
@@ -1329,6 +1510,16 @@ const CLAUDE_HOOKS_DIALOG_STRINGS = {
     disconnectTitle: "断开 Claude hooks？",
     disconnectDetail: "这会从 `~/.claude/settings.json` 移除 Clawd 管理的 Claude hooks，并关闭自动管理。`随 Claude Code 启动` 的偏好会保留，方便以后重新启用。",
     disconnect: "断开 hooks",
+  },
+  ko: {
+    disableTitle: "Claude hooks 자동 관리를 끌까요?",
+    disableDetail: "지금 제거하지 않으면 `~/.claude/settings.json`에 설치된 Claude hooks는 그대로 유지됩니다.",
+    disableOnly: "자동 관리만 끄기",
+    disableAndRemove: "끄고 설치된 hooks 제거",
+    cancel: "취소",
+    disconnectTitle: "Claude hooks 연결을 해제할까요?",
+    disconnectDetail: "`~/.claude/settings.json`에서 Clawd가 관리하는 Claude hooks를 제거하고 자동 관리를 끕니다. `Claude Code와 함께 시작` 설정은 나중에 다시 켤 수 있도록 유지됩니다.",
+    disconnect: "hooks 연결 해제",
   },
 };
 function _getSettingsDialogParent(event) {

@@ -31,8 +31,22 @@ function restoreFrontApp(appName) {
 }
 
 const RESTORE_FOCUS_DELAY_MS = 300;
+const MAC_FLOATING_TOPMOST_DELAY_MS = 120;
 const WIN_TOPMOST_LEVEL = "pop-up-menu";
 const LINUX_WINDOW_TYPE = "toolbar";
+
+function deferMacFloatingVisibility(ctx, win) {
+  if (!isMac || !win || win.isDestroyed()) return;
+  const deferUntil = Date.now() + MAC_FLOATING_TOPMOST_DELAY_MS;
+  win.__clawdMacDeferredVisibilityUntil = deferUntil;
+  setTimeout(() => {
+    if (!win || win.isDestroyed()) return;
+    if (win.__clawdMacDeferredVisibilityUntil === deferUntil) {
+      delete win.__clawdMacDeferredVisibilityUntil;
+    }
+    if (typeof ctx.reapplyMacVisibility === "function") ctx.reapplyMacVisibility();
+  }, MAC_FLOATING_TOPMOST_DELAY_MS);
+}
 
 // Codex doesn't come through /permission, so its sub-gate is checked at
 // the bubble-creation callsite instead of at the route entrance.
@@ -159,6 +173,28 @@ function computeBubbleStackLayout({
   return bounds;
 }
 
+function buildElicitationUpdatedInput(toolInput, answers) {
+  const input = toolInput && typeof toolInput === "object" ? toolInput : {};
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  const normalizedAnswers = {};
+
+  for (const question of questions) {
+    if (!question || typeof question.question !== "string" || !question.question) continue;
+    const answer = answers && Object.prototype.hasOwnProperty.call(answers, question.question)
+      ? answers[question.question]
+      : undefined;
+    if (typeof answer === "string" && answer.trim()) {
+      normalizedAnswers[question.question] = answer.trim();
+    }
+  }
+
+  return {
+    ...input,
+    questions,
+    answers: normalizedAnswers,
+  };
+}
+
 module.exports = function initPermission(ctx) {
 
   // Each entry: { res, abortHandler, suggestions, sessionId, bubble, hideTimer, toolName, toolInput, resolvedSuggestion, createdAt, measuredHeight }
@@ -281,7 +317,7 @@ module.exports = function initPermission(ctx) {
       show: false, // Fix lost focus
       frame: false,
       transparent: true,
-      alwaysOnTop: true,
+      alwaysOnTop: !isMac,
       resizable: false,
       skipTaskbar: true,
       hasShadow: false,
@@ -333,8 +369,10 @@ module.exports = function initPermission(ctx) {
     bub.showInactive();
     // Linux WMs may reset skipTaskbar after showInactive — re-apply explicitly
     if (isLinux) bub.setSkipTaskbar(true);
-    // macOS: apply after showInactive() — it resets NSWindowCollectionBehavior
-    ctx.reapplyMacVisibility();
+    // macOS: constructing/raising a topmost panel too early can still activate
+    // Clawd on some setups. Defer topmost restoration until after showInactive.
+    if (isMac) deferMacFloatingVisibility(ctx, bub);
+    else ctx.reapplyMacVisibility();
 
     bub.on("closed", () => {
       const idx = pendingPermissions.indexOf(permEntry);
@@ -408,8 +446,15 @@ module.exports = function initPermission(ctx) {
     if (!res || res.writableEnded || res.destroyed) return;
 
     if (permEntry.isElicitation) {
-      sendPermissionResponse(res, "deny", null, "Elicitation");
-      ctx.focusTerminalForSession(permEntry.sessionId);
+      if (behavior === "allow" && permEntry.resolvedUpdatedInput) {
+        sendPermissionResponse(res, {
+          behavior: "allow",
+          updatedInput: permEntry.resolvedUpdatedInput,
+        });
+      } else {
+        sendPermissionResponse(res, "deny", message, "Elicitation");
+        ctx.focusTerminalForSession(permEntry.sessionId);
+      }
       return;
     }
 
@@ -528,6 +573,11 @@ module.exports = function initPermission(ctx) {
     if (!perm) return;
     if (perm.isCodexNotify) {
       dismissCodexNotify(perm);
+      return;
+    }
+    if (perm.isElicitation && behavior && typeof behavior === "object" && behavior.type === "elicitation-submit") {
+      perm.resolvedUpdatedInput = buildElicitationUpdatedInput(perm.toolInput, behavior.answers);
+      resolvePermissionEntry(perm, "allow");
       return;
     }
     // opencode "Always" button — map to reply="always" via resolvePermissionEntry
@@ -696,4 +746,8 @@ module.exports = function initPermission(ctx) {
 
 // Test-only exports — bypasses the initPermission factory so unit tests can
 // hit the pure layout function without standing up Electron / ctx mocks.
-module.exports.__test = { computeBubbleStackLayout, shouldSuppressCodexNotifyBubble };
+module.exports.__test = {
+  computeBubbleStackLayout,
+  shouldSuppressCodexNotifyBubble,
+  buildElicitationUpdatedInput,
+};

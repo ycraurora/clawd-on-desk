@@ -18,6 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { isPlainObject } = require("./theme-loader");
 
 const CURRENT_VERSION = 1;
 
@@ -47,7 +48,7 @@ const SCHEMA = {
   preMiniX: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   preMiniY: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   // Pure data prefs
-  lang: { type: "string", default: "en", enum: ["en", "zh"] },
+  lang: { type: "string", default: "en", enum: ["en", "zh", "ko"] },
   showTray: { type: "boolean", default: true },
   showDock: { type: "boolean", default: true },
   manageClaudeHooksAutomatically: { type: "boolean", default: true },
@@ -194,10 +195,6 @@ function normalizeAgents(value, defaultsValue) {
   return out;
 }
 
-function isPlainObject(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
 function normalizeTransitionOverride(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
@@ -212,6 +209,7 @@ function normalizeSlotOverride(entry, { allowDisabled = true } = {}) {
   if (allowDisabled && entry.disabled === true) out.disabled = true;
   if (typeof entry.file === "string" && entry.file) out.file = entry.file;
   if (typeof entry.sourceThemeId === "string" && entry.sourceThemeId) out.sourceThemeId = entry.sourceThemeId;
+  if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs)) out.durationMs = entry.durationMs;
   const transition = normalizeTransitionOverride(entry.transition);
   if (transition) out.transition = transition;
   return Object.keys(out).length > 0 ? out : null;
@@ -228,7 +226,7 @@ function normalizeStateOverridesMap(value) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-function normalizeTierOverrideGroup(value) {
+function normalizeFileKeyedOverrideMap(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
   for (const [originalFile, entry] of Object.entries(value)) {
@@ -261,7 +259,7 @@ function normalizeThemeOverrides(value, defaultsValue) {
     // Back-compat: older prefs wrote state entries directly under themeId.
     const legacyStates = {};
     for (const [key, entry] of Object.entries(themeMap)) {
-      if (key === "states" || key === "tiers" || key === "timings") continue;
+      if (key === "states" || key === "tiers" || key === "timings" || key === "idleAnimations") continue;
       const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: true });
       if (cleanEntry) legacyStates[key] = cleanEntry;
     }
@@ -273,8 +271,8 @@ function normalizeThemeOverrides(value, defaultsValue) {
     const tierGroups = isPlainObject(themeMap.tiers) ? themeMap.tiers : null;
     const cleanTiers = {};
     if (tierGroups) {
-      const working = normalizeTierOverrideGroup(tierGroups.workingTiers);
-      const juggling = normalizeTierOverrideGroup(tierGroups.jugglingTiers);
+      const working = normalizeFileKeyedOverrideMap(tierGroups.workingTiers);
+      const juggling = normalizeFileKeyedOverrideMap(tierGroups.jugglingTiers);
       if (working) cleanTiers.workingTiers = working;
       if (juggling) cleanTiers.jugglingTiers = juggling;
     }
@@ -287,6 +285,9 @@ function normalizeThemeOverrides(value, defaultsValue) {
         cleanThemeMap.timings = { autoReturn: cleanAutoReturn };
       }
     }
+
+    const idleAnimations = normalizeFileKeyedOverrideMap(themeMap.idleAnimations);
+    if (idleAnimations) cleanThemeMap.idleAnimations = idleAnimations;
 
     if (Object.keys(cleanThemeMap).length > 0) {
       out[themeId] = cleanThemeMap;

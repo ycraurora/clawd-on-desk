@@ -45,10 +45,30 @@ function validThemeJson(overrides = {}) {
     viewBox: { x: 0, y: 0, width: 100, height: 100 },
     states: {
       idle: ["idle.svg"],
+      yawning: ["yawning.svg"],
+      dozing: ["dozing.svg"],
+      collapsing: ["collapsing.svg"],
       thinking: ["thinking.svg"],
       working: ["working.svg"],
       sleeping: ["sleeping.svg"],
       waking: ["waking.svg"],
+    },
+    ...overrides,
+  };
+}
+
+function fullMiniMode(overrides = {}) {
+  return {
+    supported: true,
+    states: {
+      "mini-idle": ["mini-idle.svg"],
+      "mini-enter": ["mini-enter.svg"],
+      "mini-enter-sleep": ["mini-enter-sleep.svg"],
+      "mini-crabwalk": ["mini-crabwalk.svg"],
+      "mini-peek": ["mini-peek.svg"],
+      "mini-alert": ["mini-alert.svg"],
+      "mini-happy": ["mini-happy.svg"],
+      "mini-sleep": ["mini-sleep.svg"],
     },
     ...overrides,
   };
@@ -141,6 +161,291 @@ describe("theme-loader getThemeMetadata", () => {
     // (Exercising the positive path requires writing assets; we trust
     // path.basename() + fs.existsSync as leaf pieces.)
     assert.strictEqual(meta.previewFileUrl, null);
+  });
+});
+
+describe("theme-loader discovery", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      {
+        id: "clawd",
+        builtin: true,
+        json: validThemeJson({ name: "Clawd" }),
+      },
+      {
+        id: "template",
+        builtin: true,
+        json: validThemeJson({ name: "My Theme", _scaffoldOnly: true }),
+      },
+      {
+        id: "user-cat",
+        builtin: false,
+        json: validThemeJson({ name: "User Cat" }),
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("skips the built-in template from discoverThemes and metadata scans", () => {
+    const discovered = themeLoader.discoverThemes().map((theme) => theme.id);
+    assert.deepStrictEqual(discovered.sort(), ["clawd", "user-cat"]);
+
+    const listed = themeLoader.listThemesWithMetadata().map((theme) => theme.id);
+    assert.deepStrictEqual(listed.sort(), ["clawd", "user-cat"]);
+  });
+});
+
+describe("theme-loader capability metadata", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      { id: "clawd", builtin: true, json: validThemeJson({ name: "Clawd" }) },
+      {
+        id: "capTheme",
+        builtin: true,
+        json: validThemeJson({
+          name: "Capabilities",
+          eyeTracking: { enabled: true, states: ["idle"] },
+          workingTiers: [{ minSessions: 1, file: "working-tier.svg" }],
+          jugglingTiers: [{ minSessions: 1, file: "juggling-tier.svg" }],
+          idleAnimations: [{ file: "idle-loop.png", duration: 1200 }],
+          reactions: { drag: { file: "drag.png" } },
+          miniMode: { supported: false },
+        }),
+      },
+      {
+        id: "implicitMini",
+        builtin: true,
+        json: validThemeJson({
+          name: "Implicit Mini",
+          miniMode: fullMiniMode({ supported: undefined }),
+        }),
+      },
+      {
+        id: "badMini",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Mini",
+          miniMode: {
+            supported: true,
+            states: {
+              "mini-idle": ["mini-idle.svg"],
+              "mini-enter": ["mini-enter.svg"],
+            },
+          },
+        }),
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("derives _capabilities from the current schema fields", () => {
+    const theme = themeLoader.loadTheme("capTheme", { strict: true });
+    assert.deepStrictEqual(theme._capabilities, {
+      eyeTracking: true,
+      miniMode: false,
+      idleAnimations: true,
+      reactions: true,
+      workingTiers: true,
+      jugglingTiers: true,
+      idleMode: "tracked",
+      sleepMode: "full",
+    });
+  });
+
+  it("includes capabilities in theme metadata scans", () => {
+    const meta = themeLoader.getThemeMetadata("capTheme");
+    assert.deepStrictEqual(meta.capabilities, {
+      eyeTracking: true,
+      miniMode: false,
+      idleAnimations: true,
+      reactions: true,
+      workingTiers: true,
+      jugglingTiers: true,
+      idleMode: "tracked",
+      sleepMode: "full",
+    });
+
+    const listed = themeLoader.listThemesWithMetadata().find((theme) => theme.id === "capTheme");
+    assert.ok(listed, "capTheme should appear in metadata list");
+    assert.deepStrictEqual(listed.capabilities, meta.capabilities);
+  });
+
+  it("treats a miniMode block as supported unless supported=false", () => {
+    const theme = themeLoader.loadTheme("implicitMini", { strict: true });
+    assert.strictEqual(theme._capabilities.miniMode, true);
+  });
+
+  it("strict load rejects mini themes that do not define all 8 mini states", () => {
+    assert.throws(
+      () => themeLoader.loadTheme("badMini", { strict: true }),
+      /miniMode\.supported=true requires miniMode\.states\.mini-enter-sleep/
+    );
+  });
+});
+
+describe("theme-loader fallback + sleepSequence", () => {
+  let fixture;
+  before(() => {
+    const directSleepStates = {
+      idle: ["idle.svg"],
+      thinking: ["thinking.svg"],
+      working: ["working.svg"],
+      attention: ["attention.svg"],
+      error: { fallbackTo: "attention" },
+      sleeping: { fallbackTo: "idle" },
+    };
+    fixture = makeFixture([
+      { id: "clawd", builtin: true, json: validThemeJson({ name: "Clawd" }) },
+      {
+        id: "directSleep",
+        builtin: true,
+        json: validThemeJson({
+          name: "Direct Sleep",
+          states: directSleepStates,
+          idleAnimations: [{ file: "idle-loop.svg", duration: 1800 }],
+          miniMode: fullMiniMode(),
+          sleepSequence: { mode: "direct" },
+        }),
+      },
+      {
+        id: "badSleepMode",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Sleep Mode",
+          sleepSequence: { mode: "instant" },
+        }),
+      },
+      {
+        id: "badFallbackCycle",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Fallback Cycle",
+          states: {
+            ...validThemeJson().states,
+            error: { fallbackTo: "attention" },
+            attention: { fallbackTo: "error" },
+          },
+        }),
+      },
+      {
+        id: "badFallbackHop",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Fallback Hop",
+          states: {
+            ...validThemeJson().states,
+            error: { fallbackTo: "attention" },
+            attention: { fallbackTo: "notification" },
+            notification: { fallbackTo: "carrying" },
+            carrying: { fallbackTo: "sleeping" },
+          },
+        }),
+      },
+      {
+        id: "badFallbackSource",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Fallback Source",
+          states: {
+            ...validThemeJson().states,
+            waking: { fallbackTo: "idle" },
+          },
+          sleepSequence: { mode: "direct" },
+        }),
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("normalizes object-form state bindings and direct sleep mode", () => {
+    const theme = themeLoader.loadTheme("directSleep", { strict: true });
+    assert.strictEqual(theme.sleepSequence.mode, "direct");
+    assert.deepStrictEqual(theme.states.error, []);
+    assert.deepStrictEqual(theme._stateBindings.error, {
+      files: [],
+      fallbackTo: "attention",
+    });
+    assert.deepStrictEqual(theme._stateBindings.sleeping, {
+      files: [],
+      fallbackTo: "idle",
+    });
+    assert.strictEqual(theme._capabilities.sleepMode, "direct");
+
+    const meta = themeLoader.getThemeMetadata("directSleep");
+    assert.strictEqual(meta.capabilities.sleepMode, "direct");
+  });
+
+  it("user overrides can materialize a fallback-only state without dropping fallbackTo", () => {
+    const theme = themeLoader.loadTheme("directSleep", {
+      strict: true,
+      overrides: {
+        states: {
+          error: {
+            file: "custom-error.svg",
+            transition: { in: 30, out: 60 },
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(theme.states.error, ["custom-error.svg"]);
+    assert.deepStrictEqual(theme._stateBindings.error, {
+      files: ["custom-error.svg"],
+      fallbackTo: "attention",
+    });
+    assert.deepStrictEqual(theme.transitions["custom-error.svg"], { in: 30, out: 60 });
+  });
+
+  it("user overrides can patch mini states and idle animations", () => {
+    const theme = themeLoader.loadTheme("directSleep", {
+      strict: true,
+      overrides: {
+        states: {
+          "mini-idle": {
+            file: "custom-mini-idle.svg",
+            transition: { in: 10, out: 20 },
+          },
+        },
+        idleAnimations: {
+          "idle-loop.svg": {
+            file: "custom-idle-loop.svg",
+            transition: { in: 25, out: 35 },
+            durationMs: 4200,
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(theme.miniMode.states["mini-idle"], ["custom-mini-idle.svg"]);
+    assert.strictEqual(theme.idleAnimations[0].file, "custom-idle-loop.svg");
+    assert.strictEqual(theme.idleAnimations[0].duration, 4200);
+    assert.deepStrictEqual(theme.transitions["custom-mini-idle.svg"], { in: 10, out: 20 });
+    assert.deepStrictEqual(theme.transitions["custom-idle-loop.svg"], { in: 25, out: 35 });
+  });
+
+  it("rejects invalid sleepSequence values", () => {
+    assert.throws(
+      () => themeLoader.loadTheme("badSleepMode", { strict: true }),
+      /sleepSequence\.mode must be "full" or "direct"/
+    );
+  });
+
+  it("rejects fallback cycles and overlong chains", () => {
+    assert.throws(
+      () => themeLoader.loadTheme("badFallbackCycle", { strict: true }),
+      /forms a cycle|does not terminate in real files/
+    );
+    assert.throws(
+      () => themeLoader.loadTheme("badFallbackHop", { strict: true }),
+      /exceeds 3 hop limit/
+    );
+  });
+
+  it("rejects fallbackTo on unsupported source states", () => {
+    assert.throws(
+      () => themeLoader.loadTheme("badFallbackSource", { strict: true }),
+      /states\.waking\.fallbackTo is only allowed on/
+    );
   });
 });
 

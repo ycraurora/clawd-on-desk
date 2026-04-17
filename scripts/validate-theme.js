@@ -18,6 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const themeLoader = require("../src/theme-loader");
 
 // ── Colors (ANSI) ──
 const R = "\x1b[31m";  // red
@@ -29,6 +30,21 @@ const D = "\x1b[0m";   // reset
 const PASS = `${G}\u2713${D}`;
 const FAIL = `${R}\u2717${D}`;
 const WARN = `${Y}!${D}`;
+const {
+  REQUIRED_STATES,
+  FULL_SLEEP_REQUIRED_STATES,
+  MINI_REQUIRED_STATES,
+  VISUAL_FALLBACK_STATES,
+  isPlainObject,
+  hasNonEmptyArray,
+  getStateFiles,
+  hasStateFiles,
+  hasStateBinding,
+  normalizeStateBindings,
+  hasReactionBindings,
+  deriveIdleMode,
+  deriveSleepMode,
+} = themeLoader;
 
 // ── Main ──
 
@@ -92,6 +108,13 @@ function warn(condition, msg) {
   }
 }
 
+function svgHasClass(content, className) {
+  if (typeof content !== "string" || typeof className !== "string" || !className) return false;
+  const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const classAttrRe = new RegExp(`class=["'][^"']*\\b${escaped}\\b[^"']*["']`);
+  return classAttrRe.test(content);
+}
+
 check(raw.schemaVersion === 1, `schemaVersion = 1 (got: ${raw.schemaVersion})`);
 check(!!raw.name, `name is set (got: "${raw.name || ""}")`);
 check(!!raw.version, `version is set (got: "${raw.version || ""}")`);
@@ -104,14 +127,33 @@ if (check(vb && vb.x != null && vb.y != null && vb.width != null && vb.height !=
   check(vb.width > 0, `viewBox.width > 0 (got: ${vb.width})`);
   check(vb.height > 0, `viewBox.height > 0 (got: ${vb.height})`);
 }
-
-const REQUIRED_STATES = ["idle", "working", "thinking", "sleeping", "waking"];
+const sleepMode = deriveSleepMode(raw);
+const normalizedStates = normalizeStateBindings(raw.states);
 
 if (check(!!raw.states, "states object exists")) {
   for (const s of REQUIRED_STATES) {
     check(
-      raw.states[s] && Array.isArray(raw.states[s]) && raw.states[s].length > 0,
-      `states.${s} is a non-empty array`
+      hasStateFiles(raw.states[s]),
+      `states.${s} has at least one file`
+    );
+  }
+  check(
+    hasStateBinding(raw.states && raw.states.sleeping),
+    "states.sleeping has files or fallbackTo"
+  );
+}
+
+check(
+  raw.sleepSequence === undefined
+    || (isPlainObject(raw.sleepSequence) && (raw.sleepSequence.mode === "full" || raw.sleepSequence.mode === "direct")),
+  `sleepSequence.mode is "full" or "direct" (resolved: ${sleepMode})`
+);
+
+if (sleepMode === "full") {
+  for (const s of FULL_SLEEP_REQUIRED_STATES) {
+    check(
+      hasStateFiles(raw.states && raw.states[s]),
+      `sleepSequence.mode=full requires states.${s} with real files`
     );
   }
 }
@@ -126,8 +168,10 @@ if (raw.eyeTracking && raw.eyeTracking.enabled) {
   // All eye tracking states must reference .svg files
   if (raw.states && raw.eyeTracking.states) {
     for (const stateName of raw.eyeTracking.states) {
-      const files = raw.states[stateName] ||
-                    (raw.miniMode && raw.miniMode.states && raw.miniMode.states[stateName]);
+      const stateFiles = getStateFiles(raw.states[stateName]);
+      const files = stateFiles.length > 0
+        ? stateFiles
+        : (raw.miniMode && raw.miniMode.states && raw.miniMode.states[stateName]);
       if (files) {
         for (const f of files) {
           check(f.endsWith(".svg"),
@@ -152,9 +196,9 @@ function collectFiles() {
   const files = new Set();
   // States
   if (raw.states) {
-    for (const [key, arr] of Object.entries(raw.states)) {
+    for (const [key, entry] of Object.entries(raw.states)) {
       if (key.startsWith("_")) continue; // skip _comment
-      if (Array.isArray(arr)) arr.forEach(f => files.add(f));
+      getStateFiles(entry).forEach((f) => files.add(f));
     }
   }
   // Mini mode states
@@ -239,12 +283,15 @@ if (raw.eyeTracking && raw.eyeTracking.enabled && assetsDirExists) {
   const ids = raw.eyeTracking.ids || { eyes: "eyes-js", body: "body-js", shadow: "shadow-js" };
   const eyesId = ids.eyes;
   const optionalIds = [ids.body, ids.shadow].filter(Boolean);
+  const trackingLayers = isPlainObject(raw.eyeTracking.trackingLayers) ? raw.eyeTracking.trackingLayers : null;
 
   // Check each eye tracking SVG
   const eyeStates = raw.eyeTracking.states || [];
   for (const stateName of eyeStates) {
-    const files = raw.states && raw.states[stateName] ||
-                  (raw.miniMode && raw.miniMode.states && raw.miniMode.states[stateName]) || [];
+    const stateFiles = getStateFiles(raw.states && raw.states[stateName]);
+    const files = stateFiles.length > 0
+      ? stateFiles
+      : (raw.miniMode && raw.miniMode.states && raw.miniMode.states[stateName]) || [];
     for (const file of files) {
       if (!file.endsWith(".svg")) continue;
       const svgPath = path.join(assetsDir, file);
@@ -252,22 +299,45 @@ if (raw.eyeTracking && raw.eyeTracking.enabled && assetsDirExists) {
 
       try {
         const content = fs.readFileSync(svgPath, "utf8");
-        // Eyes ID is required for eye tracking to work
-        const hasEyes = content.includes(`id="${eyesId}"`);
-        // Doze states may use dozeEyes instead
-        const dozeId = ids.dozeEyes;
-        const hasDoze = dozeId && content.includes(`id="${dozeId}"`);
-        if (hasEyes) {
-          console.log(`  ${PASS} ${file}: contains id="${eyesId}"`);
-        } else if (hasDoze) {
-          console.log(`  ${PASS} ${file}: contains id="${dozeId}" (doze eyes)`);
+        if (trackingLayers) {
+          let matchedAnyLayer = false;
+          for (const [layerName, layerCfg] of Object.entries(trackingLayers)) {
+            const layerIds = Array.isArray(layerCfg && layerCfg.ids) ? layerCfg.ids : [];
+            const layerClasses = Array.isArray(layerCfg && layerCfg.classes) ? layerCfg.classes : [];
+            if (layerIds.length === 0 && layerClasses.length === 0) {
+              warn(false, `${file}: trackingLayers.${layerName} has no ids/classes`);
+              continue;
+            }
+            let layerMatched = false;
+            for (const id of layerIds) {
+              if (content.includes(`id="${id}"`)) layerMatched = true;
+              else warn(false, `${file}: missing trackingLayers.${layerName}.ids entry "${id}"`);
+            }
+            for (const className of layerClasses) {
+              if (svgHasClass(content, className)) layerMatched = true;
+              else warn(false, `${file}: missing trackingLayers.${layerName}.classes entry "${className}"`);
+            }
+            if (layerMatched) matchedAnyLayer = true;
+          }
+          check(matchedAnyLayer, `${file}: trackingLayers matched at least one configured element/class`);
         } else {
-          check(false, `${file}: missing id="${eyesId}" (required for eye tracking)`);
-        }
-        // Body and shadow are optional (renderer null-checks them)
-        for (const id of optionalIds) {
-          if (!content.includes(`id="${id}"`)) {
-            warn(false, `${file}: missing id="${id}" (optional, enables body lean/shadow stretch)`);
+          // Eyes ID is required for legacy eye tracking to work
+          const hasEyes = content.includes(`id="${eyesId}"`);
+          // Doze states may use dozeEyes instead
+          const dozeId = ids.dozeEyes;
+          const hasDoze = dozeId && content.includes(`id="${dozeId}"`);
+          if (hasEyes) {
+            console.log(`  ${PASS} ${file}: contains id="${eyesId}"`);
+          } else if (hasDoze) {
+            console.log(`  ${PASS} ${file}: contains id="${dozeId}" (doze eyes)`);
+          } else {
+            check(false, `${file}: missing id="${eyesId}" (required for eye tracking)`);
+          }
+          // Body and shadow are optional (renderer null-checks them)
+          for (const id of optionalIds) {
+            if (!content.includes(`id="${id}"`)) {
+              warn(false, `${file}: missing id="${id}" (optional, enables body lean/shadow stretch)`);
+            }
           }
         }
       } catch (e) {
@@ -302,14 +372,65 @@ if (raw.workingTiers && raw.workingTiers.length > 1) {
 }
 
 // Mini mode
-if (raw.miniMode && raw.miniMode.supported) {
-  const miniStates = ["mini-idle", "mini-enter", "mini-peek", "mini-sleep"];
-  for (const s of miniStates) {
-    if (!raw.miniMode.states || !raw.miniMode.states[s]) {
-      warn(false, `miniMode.supported=true but missing miniMode.states.${s}`);
-    }
+if (isPlainObject(raw.miniMode) && raw.miniMode.supported !== false) {
+  for (const s of MINI_REQUIRED_STATES) {
+    check(
+      raw.miniMode.states && Array.isArray(raw.miniMode.states[s]) && raw.miniMode.states[s].length > 0,
+      `miniMode.supported=true requires miniMode.states.${s}`
+    );
   }
 }
+
+console.log(`\n${C}[Fallback]${D}`);
+const fallbackEntries = Object.entries(normalizedStates).filter(([, entry]) => !!entry.fallbackTo);
+if (fallbackEntries.length === 0) {
+  console.log(`  ${PASS} no states.<x>.fallbackTo entries declared`);
+} else {
+  for (const [stateKey, entry] of fallbackEntries) {
+    check(
+      VISUAL_FALLBACK_STATES.has(stateKey),
+      `states.${stateKey}.fallbackTo is only allowed on error/attention/notification/sweeping/carrying/sleeping`
+    );
+    check(
+      Object.prototype.hasOwnProperty.call(normalizedStates, entry.fallbackTo),
+      `states.${stateKey}.fallbackTo target "${entry.fallbackTo}" exists`
+    );
+    const visited = new Set([stateKey]);
+    let hops = 0;
+    let cursor = stateKey;
+    let cycle = false;
+    let missingTarget = false;
+    while (true) {
+      const current = normalizedStates[cursor];
+      if (!current || !current.fallbackTo) break;
+      const target = current.fallbackTo;
+      hops++;
+      if (hops > 3) break;
+      if (visited.has(target)) {
+        cycle = true;
+        break;
+      }
+      if (!Object.prototype.hasOwnProperty.call(normalizedStates, target)) {
+        missingTarget = true;
+        break;
+      }
+      visited.add(target);
+      cursor = target;
+    }
+    check(!cycle, `states.${stateKey}.fallbackTo chain is acyclic`);
+    check(!missingTarget, `states.${stateKey}.fallbackTo chain targets existing states`);
+    check(hops <= 3, `states.${stateKey}.fallbackTo resolves within 3 hop(s)`);
+    const terminal = normalizedStates[cursor];
+    check(
+      !!terminal && hasStateFiles(terminal),
+      `states.${stateKey}.fallbackTo chain terminates in real files`
+    );
+  }
+}
+check(
+  Object.keys(normalizedStates).some((stateKey) => hasStateFiles(normalizedStates[stateKey])),
+  "theme declares at least one state with real files"
+);
 
 // ── 5. Variants (Phase 3b-swap) ──
 // Spec lives in docs/plan-settings-panel-3b-swap.md §6.4 "Validator Spec".
@@ -370,8 +491,8 @@ function collectBaseAssetFiles(base) {
     }
   }
   if (base.states) {
-    for (const arr of Object.values(base.states)) {
-      if (Array.isArray(arr)) for (const f of arr) files.add(f);
+    for (const entry of Object.values(base.states)) {
+      for (const f of getStateFiles(entry)) files.add(f);
     }
   }
   if (base.miniMode && base.miniMode.states) {
@@ -491,6 +612,25 @@ if (raw.variants !== undefined) {
       console.log(`    ${PASS} variant "${variantId}" structurally valid (${variantAssets.size} asset ref${variantAssets.size === 1 ? "" : "s"})`);
     }
   }
+}
+
+console.log(`\n${C}[Capabilities]${D}`);
+const capabilities = {
+  eyeTracking: !!(
+    isPlainObject(raw.eyeTracking)
+    && raw.eyeTracking.enabled
+    && hasNonEmptyArray(raw.eyeTracking.states)
+  ),
+  miniMode: !!(isPlainObject(raw.miniMode) && raw.miniMode.supported !== false),
+  idleAnimations: hasNonEmptyArray(raw.idleAnimations),
+  reactions: hasReactionBindings(raw.reactions),
+  workingTiers: hasNonEmptyArray(raw.workingTiers),
+  jugglingTiers: hasNonEmptyArray(raw.jugglingTiers),
+  idleMode: deriveIdleMode(raw),
+  sleepMode,
+};
+for (const [key, value] of Object.entries(capabilities)) {
+  console.log(`  ${PASS} ${key}: ${value}`);
 }
 
 // ── Summary ──

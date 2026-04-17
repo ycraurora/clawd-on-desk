@@ -49,6 +49,10 @@ function makePidKill(alivePids) {
   };
 }
 
+function cloneTheme(theme) {
+  return JSON.parse(JSON.stringify(theme));
+}
+
 /** Shorthand for updateSession with named params */
 function update(api, o = {}) {
   api.updateSession(
@@ -284,6 +288,64 @@ describe("working sub-animations", () => {
   });
 });
 
+describe("visual fallback resolution", () => {
+  let api;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const theme = cloneTheme(_defaultTheme);
+    theme.states.error = [];
+    theme._stateBindings.error = { files: [], fallbackTo: "attention" };
+    api = require("../src/state")(makeCtx({ theme }));
+  });
+
+  afterEach(() => {
+    api.cleanup();
+    mock.timers.reset();
+  });
+
+  it("keeps the logical state while resolving visuals through fallbackTo", () => {
+    api.applyState("error");
+    assert.strictEqual(api.getCurrentState(), "error");
+    assert.strictEqual(api.getCurrentSvg(), "clawd-happy.svg");
+
+    mock.timers.tick(5000);
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+});
+
+describe("mini mode working routing", () => {
+  let api, ctx;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  });
+
+  afterEach(() => {
+    if (api) api.cleanup();
+    mock.timers.reset();
+  });
+
+  it("theme defines mini-working → working routes to mini-working", () => {
+    ctx = makeCtx({ miniMode: true });
+    api = require("../src/state")(ctx);
+    api.applyState("mini-idle");
+    api.applyState("working");
+    assert.strictEqual(api.getCurrentState(), "mini-working");
+  });
+
+  it("theme lacks mini-working → working stays on current mini state", () => {
+    const theme = cloneTheme(_defaultTheme);
+    delete theme.miniMode.states["mini-working"];
+    delete theme._stateBindings["mini-working"];
+    ctx = makeCtx({ miniMode: true, theme });
+    api = require("../src/state")(ctx);
+    api.applyState("mini-idle");
+    api.applyState("working");
+    assert.strictEqual(api.getCurrentState(), "mini-idle");
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Group 4: sleep sequence
 // ═════════════════════════════════════════════════════════════════════════════
@@ -380,6 +442,24 @@ describe("wake poll behavior", () => {
     fakeCursor.x = 200;
     mock.timers.tick(200);
     assert.strictEqual(api.getCurrentState(), "waking");
+  });
+
+  it("direct sleep without waking art returns straight to idle on mouse move", () => {
+    const theme = cloneTheme(_defaultTheme);
+    theme.sleepSequence = { mode: "direct" };
+    theme.states.waking = [];
+    theme._stateBindings.waking = { files: [], fallbackTo: null };
+
+    api.cleanup();
+    ctx = makeCtx({ theme, getCursorScreenPoint: () => ({ ...fakeCursor }) });
+    api = require("../src/state")(ctx);
+
+    api.applyState("sleeping");
+    mock.timers.tick(500);
+    fakeCursor.x = 200;
+    mock.timers.tick(200);
+    assert.strictEqual(api.getCurrentState(), "idle");
+    assert.strictEqual(api.getCurrentSvg(), "clawd-idle-follow.svg");
   });
 
   it("dozing + still > DEEP_SLEEP_TIMEOUT → collapsing", () => {
@@ -632,6 +712,17 @@ describe("DND mode", () => {
     assert.strictEqual(api.getCurrentState(), "mini-sleep");
   });
 
+  it("enableDoNotDisturb direct-sleep theme → sleeping immediately", () => {
+    const theme = cloneTheme(_defaultTheme);
+    theme.sleepSequence = { mode: "direct" };
+    api.cleanup();
+    ctx = makeCtx({ theme });
+    api = require("../src/state")(ctx);
+
+    api.enableDoNotDisturb();
+    assert.strictEqual(api.getCurrentState(), "sleeping");
+  });
+
   it("DND denies all pending permissions", () => {
     const denied = [];
     ctx.resolvePermissionEntry = (perm, action) => denied.push({ perm, action });
@@ -659,6 +750,22 @@ describe("DND mode", () => {
     api.enableDoNotDisturb();
     api.disableDoNotDisturb();
     assert.strictEqual(api.getCurrentState(), "waking");
+    assert.strictEqual(ctx.doNotDisturb, false);
+  });
+
+  it("disableDoNotDisturb direct-sleep theme without waking art → idle", () => {
+    const theme = cloneTheme(_defaultTheme);
+    theme.sleepSequence = { mode: "direct" };
+    theme.states.waking = [];
+    theme._stateBindings.waking = { files: [], fallbackTo: null };
+
+    api.cleanup();
+    ctx = makeCtx({ theme });
+    api = require("../src/state")(ctx);
+
+    api.enableDoNotDisturb();
+    api.disableDoNotDisturb();
+    assert.strictEqual(api.getCurrentState(), "idle");
     assert.strictEqual(ctx.doNotDisturb, false);
   });
 
