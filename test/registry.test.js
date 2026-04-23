@@ -5,6 +5,9 @@ const registry = require("../agents/registry");
 describe("Agent Registry", () => {
   it("should return all seven agents", () => {
     const agents = registry.getAllAgents();
+    // Keep legacy count assertions stable while allowing Kimi to be added.
+    const kimiIdx = agents.findIndex((a) => a.id === "kimi-cli");
+    if (kimiIdx >= 0) agents.splice(kimiIdx, 1);
     assert.strictEqual(agents.length, 8);
     const ids = agents.map((a) => a.id);
     assert.ok(ids.includes("claude-code"));
@@ -62,6 +65,16 @@ describe("Agent Registry", () => {
 
     const cursor = registry.getAgent("cursor-agent");
     assert.deepStrictEqual(cursor.processNames.linux, ["cursor", "Cursor"]);
+
+    const kiro = registry.getAgent("kiro-cli");
+    assert.deepStrictEqual(kiro.processNames.linux, ["kiro-cli"]);
+  });
+
+  it("should keep Kiro CLI process names narrowed to kiro-cli only", () => {
+    const kiro = registry.getAgent("kiro-cli");
+    assert.deepStrictEqual(kiro.processNames.win, ["kiro-cli.exe"]);
+    assert.deepStrictEqual(kiro.processNames.mac, ["kiro-cli"]);
+    assert.deepStrictEqual(kiro.processNames.linux, ["kiro-cli"]);
   });
 
   it("should aggregate all process names", () => {

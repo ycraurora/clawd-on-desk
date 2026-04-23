@@ -7,11 +7,13 @@ const themeLoader = require("../src/theme-loader");
 themeLoader.init(require("path").join(__dirname, "..", "src"));
 const _defaultTheme = themeLoader.loadTheme("clawd");
 const _calicoTheme = themeLoader.loadTheme("calico");
+const { createTranslator } = require("../src/i18n");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function makeCtx(overrides = {}) {
-  return {
+  const ctx = {
+    lang: "en",
     theme: _defaultTheme,
     doNotDisturb: false,
     miniTransitioning: false,
@@ -32,7 +34,6 @@ function makeCtx(overrides = {}) {
     buildTrayMenu: () => {},
     pendingPermissions: [],
     resolvePermissionEntry: () => {},
-    t: (k) => k,
     showSessionId: false,
     focusTerminalWindow: () => {},
     // Default: all pids dead
@@ -40,6 +41,12 @@ function makeCtx(overrides = {}) {
     getCursorScreenPoint: () => ({ x: 100, y: 100 }),
     ...overrides,
   };
+  // Real translator — reads ctx.lang at call time so tests that flip
+  // ctx.lang between assertions see different strings. Unknown keys fall
+  // back to the key itself (existing createTranslator behavior), so tests
+  // that predate C2 and still pass internal state keys get identity behavior.
+  ctx.t = createTranslator(() => ctx.lang);
+  return ctx;
 }
 
 function makePidKill(alivePids) {
@@ -56,10 +63,21 @@ function cloneTheme(theme) {
 /** Shorthand for updateSession with named params */
 function update(api, o = {}) {
   api.updateSession(
-    o.id || "s1", o.state || "working", o.event || "PreToolUse",
-    o.sourcePid ?? null, o.cwd || "/tmp", o.editor || null,
-    o.pidChain || null, o.agentPid ?? null, o.agentId || "claude-code",
-    o.host || null, o.headless || false, o.displayHint,
+    o.id || "s1",
+    o.state || "working",
+    o.event || "PreToolUse",
+    {
+      sourcePid: o.sourcePid ?? null,
+      cwd: o.cwd || "/tmp",
+      editor: o.editor || null,
+      pidChain: o.pidChain || null,
+      agentPid: o.agentPid ?? null,
+      agentId: o.agentId || "claude-code",
+      host: o.host || null,
+      headless: o.headless || false,
+      displayHint: o.displayHint,
+      sessionTitle: o.sessionTitle ?? null,
+    },
   );
 }
 
@@ -77,6 +95,8 @@ function rawSession(state, opts = {}) {
     agentId: opts.agentId || null,
     host: opts.host || null,
     headless: opts.headless || false,
+    sessionTitle: opts.sessionTitle ?? null,
+    recentEvents: opts.recentEvents || [],
     pidReachable: opts.pidReachable ?? false,
     resumeState: opts.resumeState || null,
   };
@@ -678,6 +698,354 @@ describe("updateSession()", () => {
     update(api, { id: "s1", state: "sleeping", event: "SessionEnd" });
     // s2 remains with thinking
     assert.strictEqual(api.resolveDisplayState(), "thinking");
+  });
+
+  // ── session title (B1) ──
+
+  it("stores sessionTitle from updateSession positional arg", () => {
+    update(api, { id: "s1", state: "working", sessionTitle: "My Task" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "My Task");
+  });
+
+  it("trims whitespace on sessionTitle", () => {
+    update(api, { id: "s1", state: "working", sessionTitle: "  Spaced  " });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Spaced");
+  });
+
+  it("strips control characters and truncates long sessionTitle values", () => {
+    update(api, {
+      id: "s1",
+      state: "working",
+      sessionTitle: `  Fix\tlogin\nbug ${"x".repeat(100)}  `,
+    });
+    const title = api.sessions.get("s1").sessionTitle;
+    assert.strictEqual(title.startsWith("Fix login bug "), true);
+    assert.strictEqual(title.length, 80);
+    assert.strictEqual(title.endsWith("…"), true);
+    assert.strictEqual(/[\u0000-\u001F\u007F-\u009F]/.test(title), false);
+  });
+
+  it("sticky sessionTitle: follow-up events without title keep existing", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Persistent Title" });
+    update(api, { id: "s1", state: "working" }); // no title in this update
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Persistent Title");
+  });
+
+  it("sticky sessionTitle: empty string does not clear existing title", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Keep Me" });
+    update(api, { id: "s1", state: "working", sessionTitle: "" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Keep Me");
+  });
+
+  it("sticky sessionTitle: whitespace-only input does not clear existing title", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Keep Me" });
+    update(api, { id: "s1", state: "working", sessionTitle: "   " });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Keep Me");
+  });
+
+  it("sessionTitle can be updated to a new non-empty value", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Old Name" });
+    update(api, { id: "s1", state: "working", sessionTitle: "New Name" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "New Name");
+  });
+
+  it("new session with no sessionTitle has null field", () => {
+    update(api, { id: "s1", state: "working" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, null);
+  });
+
+  it("buildSessionSubmenu uses sessionTitle over cwd folder name", () => {
+    update(api, {
+      id: "s1",
+      state: "idle",
+      cwd: "/tmp/project-abc",
+      sessionTitle: "Fix login bug",
+    });
+    const menu = api.buildSessionSubmenu();
+    // Label format: `${name}  ${stateText}  ${elapsed}` — name should be the title
+    assert.ok(
+      menu[0].label.includes("Fix login bug"),
+      `expected label to include title, got: ${menu[0].label}`
+    );
+    assert.ok(
+      !menu[0].label.includes("project-abc"),
+      `expected label to NOT include folder when title present, got: ${menu[0].label}`
+    );
+  });
+
+  it("buildSessionSubmenu falls back to folder name when sessionTitle is null", () => {
+    update(api, {
+      id: "s1",
+      state: "idle",
+      cwd: "/tmp/project-abc",
+      // no sessionTitle
+    });
+    const menu = api.buildSessionSubmenu();
+    assert.ok(
+      menu[0].label.includes("project-abc"),
+      `expected folder fallback, got: ${menu[0].label}`
+    );
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Group 6b: recentEvents + deriveSessionBadge (C1)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("recentEvents tracking", () => {
+  let api;
+  beforeEach(() => { api = require("../src/state")(makeCtx()); });
+  afterEach(() => { api.cleanup(); });
+
+  it("pushes events in order, capped at 8 (RECENT_EVENT_LIMIT)", () => {
+    for (let i = 0; i < 12; i++) {
+      update(api, { id: "s1", state: "working", event: `Event${i}` });
+    }
+    const events = api.sessions.get("s1").recentEvents;
+    assert.strictEqual(events.length, 8);
+    // Oldest 4 should have been dropped (Event0..Event3), keeping Event4..Event11
+    assert.strictEqual(events[0].event, "Event4");
+    assert.strictEqual(events[7].event, "Event11");
+  });
+
+  it("does not store an i18n label on events (derived at render time)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
+    const evt = api.sessions.get("s1").recentEvents[0];
+    assert.ok(!("label" in evt), "recentEvents entries must not persist a 'label' field");
+  });
+
+  it("records state + event + at timestamp on each entry", () => {
+    const before = Date.now();
+    update(api, { id: "s1", state: "thinking", event: "UserPromptSubmit" });
+    const after = Date.now();
+    const evt = api.sessions.get("s1").recentEvents[0];
+    assert.strictEqual(evt.event, "UserPromptSubmit");
+    assert.strictEqual(evt.state, "thinking");
+    assert.ok(evt.at >= before && evt.at <= after);
+  });
+
+  it("recentEvents survives across multiple updates to the same session", () => {
+    update(api, { id: "s1", state: "thinking", event: "UserPromptSubmit" });
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
+    update(api, { id: "s1", state: "idle", event: "Stop" });
+    const events = api.sessions.get("s1").recentEvents;
+    assert.strictEqual(events.length, 3);
+    assert.deepStrictEqual(
+      events.map((e) => e.event),
+      ["UserPromptSubmit", "PreToolUse", "Stop"]
+    );
+  });
+
+  it("handles null event as null (not crash, not skipped)", () => {
+    // The update() helper falls back to "PreToolUse" on null event —
+    // bypass it here to test the null path directly.
+    api.updateSession("s1", "working", null, { cwd: "/tmp", agentId: "claude-code" });
+    const events = api.sessions.get("s1").recentEvents;
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].event, null);
+  });
+});
+
+describe("deriveSessionBadge", () => {
+  let api;
+  beforeEach(() => { api = require("../src/state")(makeCtx()); });
+  afterEach(() => { api.cleanup(); });
+
+  // ── reachable states (what updateSession actually keeps on session.state) ──
+  // oneshot states (attention/error/sweeping/notification/carrying) get
+  // normalized to idle by updateSession, so they aren't tested here.
+
+  it("returns 'running' for reachable active states", () => {
+    // working / thinking / juggling are what the state machine stores
+    for (const st of ["working", "thinking", "juggling"]) {
+      assert.strictEqual(
+        api.deriveSessionBadge({ state: st, recentEvents: [] }),
+        "running",
+        `state=${st}`
+      );
+    }
+  });
+
+  it("returns 'interrupted' when idle with StopFailure in recentEvents", () => {
+    const s = { state: "idle", recentEvents: [{ event: "StopFailure" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "interrupted");
+  });
+
+  it("returns 'interrupted' when idle with PostToolUseFailure in recentEvents", () => {
+    const s = { state: "idle", recentEvents: [{ event: "PostToolUseFailure" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "interrupted");
+  });
+
+  it("returns 'done' when idle with Stop in recentEvents", () => {
+    const s = { state: "idle", recentEvents: [{ event: "Stop" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "done");
+  });
+
+  it("returns 'done' when idle with PostCompact in recentEvents", () => {
+    const s = { state: "idle", recentEvents: [{ event: "PostCompact" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "done");
+  });
+
+  it("returns 'idle' when sleeping (no tombstone, not 'exited')", () => {
+    // SessionEnd deletes the session from the Map so menu iteration never
+    // sees it — sleeping here comes from other paths (idle timeout etc).
+    const s = { state: "sleeping", recentEvents: [{ event: "Stop" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "idle");
+  });
+
+  it("returns 'idle' when idle with no notable recentEvents", () => {
+    assert.strictEqual(api.deriveSessionBadge({ state: "idle", recentEvents: [] }), "idle");
+  });
+
+  it("uses the LATEST event for idle disambiguation", () => {
+    // PostToolUseFailure (interrupted) comes before Stop (done)
+    // Latest = Stop, so badge should be 'done', not 'interrupted'
+    const s = {
+      state: "idle",
+      recentEvents: [
+        { event: "PreToolUse" },
+        { event: "PostToolUseFailure" },
+        { event: "Stop" },
+      ],
+    };
+    assert.strictEqual(api.deriveSessionBadge(s), "done");
+  });
+
+  // ── defensive inputs (not reachable session states but safe to pass) ──
+
+  it("is defensive against null session", () => {
+    assert.strictEqual(api.deriveSessionBadge(null), "idle");
+  });
+
+  it("is defensive against undefined session", () => {
+    assert.strictEqual(api.deriveSessionBadge(undefined), "idle");
+  });
+
+  it("treats unknown non-idle state as 'running'", () => {
+    // If the state machine ever introduces a new active state, the badge
+    // should degrade gracefully to 'running' rather than throw or return
+    // undefined.
+    assert.strictEqual(
+      api.deriveSessionBadge({ state: "bogus-future-state", recentEvents: [] }),
+      "running"
+    );
+  });
+
+  it("handles missing recentEvents field (defensive)", () => {
+    assert.strictEqual(api.deriveSessionBadge({ state: "idle" }), "idle");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Group 6c: Sessions submenu badge + i18n (C2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("buildSessionSubmenu badge + i18n", () => {
+  let api, ctx;
+  const pid = process.pid;
+
+  beforeEach(() => {
+    ctx = makeCtx({ processKill: makePidKill(new Set([pid])) });
+    api = require("../src/state")(ctx);
+  });
+  afterEach(() => api.cleanup());
+
+  function menuLabel() {
+    // First entry's label — assume single session in these tests so no
+    // host-grouping header rows.
+    return api.buildSessionSubmenu()[0].label;
+  }
+
+  it("shows English 'Running' when session is working (lang=en)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    ctx.lang = "en";
+    assert.match(menuLabel(), /Running/);
+  });
+
+  it("shows Chinese '运行中' when lang=zh", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    ctx.lang = "zh";
+    assert.match(menuLabel(), /运行中/);
+  });
+
+  it("shows Korean '실행 중' when lang=ko", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    ctx.lang = "ko";
+    assert.match(menuLabel(), /실행 중/);
+  });
+
+  it("shows 'Done' after Stop event (en)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    update(api, { id: "s1", state: "idle", event: "Stop", sourcePid: pid });
+    ctx.lang = "en";
+    assert.match(menuLabel(), /Done/);
+  });
+
+  it("shows '已完成' after Stop event (zh)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    update(api, { id: "s1", state: "idle", event: "Stop", sourcePid: pid });
+    ctx.lang = "zh";
+    assert.match(menuLabel(), /已完成/);
+  });
+
+  it("shows 'Interrupted' after StopFailure (en)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    update(api, { id: "s1", state: "idle", event: "StopFailure", sourcePid: pid });
+    ctx.lang = "en";
+    assert.match(menuLabel(), /Interrupted/);
+  });
+
+  it("shows '中断' after StopFailure (zh)", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    update(api, { id: "s1", state: "idle", event: "StopFailure", sourcePid: pid });
+    ctx.lang = "zh";
+    assert.match(menuLabel(), /中断/);
+  });
+
+  it("shows 'Idle' for fresh idle session with no notable events (en)", () => {
+    update(api, { id: "s1", state: "idle", event: "SessionStart", sourcePid: pid });
+    ctx.lang = "en";
+    assert.match(menuLabel(), /Idle/);
+  });
+
+  it("language switch changes label without needing a new state event", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: pid });
+    ctx.lang = "en";
+    const enLabel = menuLabel();
+    ctx.lang = "zh";
+    const zhLabel = menuLabel();
+    ctx.lang = "ko";
+    const koLabel = menuLabel();
+    assert.notStrictEqual(enLabel, zhLabel, "en vs zh should differ");
+    assert.notStrictEqual(zhLabel, koLabel, "zh vs ko should differ");
+    assert.match(enLabel, /Running/);
+    assert.match(zhLabel, /运行中/);
+    assert.match(koLabel, /실행 중/);
+  });
+
+  it("badge label falls back for idle sessions with only SessionStart", () => {
+    // SessionStart event shouldn't flip badge to done/interrupted
+    update(api, { id: "s1", state: "idle", event: "SessionStart", sourcePid: pid });
+    ctx.lang = "en";
+    const label = menuLabel();
+    assert.ok(!/Done|Interrupted/.test(label), `unexpected badge in: ${label}`);
+    assert.match(label, /Idle/);
+  });
+
+  it("sessionTitle still takes precedence over folder name when badge is present", () => {
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PreToolUse",
+      sourcePid: pid,
+      cwd: "/tmp/project-abc",
+      sessionTitle: "Fix login bug",
+    });
+    ctx.lang = "en";
+    const label = menuLabel();
+    assert.ok(label.includes("Fix login bug"));
+    assert.ok(!label.includes("project-abc"));
+    assert.match(label, /Running/);
   });
 });
 

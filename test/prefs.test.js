@@ -29,6 +29,7 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a, b);
     assert.notStrictEqual(a.agents, b.agents);
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
+    assert.notStrictEqual(a.shortcuts, b.shortcuts);
     // Mutating one shouldn't affect the other
     a.agents["claude-code"].enabled = false;
     assert.strictEqual(b.agents["claude-code"].enabled, true);
@@ -43,6 +44,10 @@ describe("prefs.getDefaults", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.manageClaudeHooksAutomatically, true);
     assert.strictEqual(d.autoStartWithClaude, false);
+    assert.strictEqual(d.allowEdgePinning, false);
+    assert.strictEqual(d.keepSizeAcrossDisplays, false);
+    assert.strictEqual(d.savedPixelWidth, 0);
+    assert.strictEqual(d.savedPixelHeight, 0);
   });
 
   it("seeds all known agents as enabled", () => {
@@ -69,23 +74,36 @@ describe("prefs.validate", () => {
     const v = prefs.validate({
       lang: "klingon",       // not in enum
       soundMuted: "yes",     // wrong type
+      soundVolume: 2,        // out of range → default 1
       x: NaN,                // not finite
       bubbleFollowPet: true, // ok
       hideBubbles: 0,        // wrong type
+      allowEdgePinning: "yes",
+      savedPixelWidth: -1,
+      savedPixelHeight: "286",
     });
     const d = prefs.getDefaults();
     assert.strictEqual(v.lang, d.lang);
     assert.strictEqual(v.soundMuted, false);
+    assert.strictEqual(v.soundVolume, 1);
     assert.strictEqual(v.x, 0);
     assert.strictEqual(v.bubbleFollowPet, true);
     assert.strictEqual(v.hideBubbles, false);
+    assert.strictEqual(v.allowEdgePinning, false);
+    assert.strictEqual(v.savedPixelWidth, 0);
+    assert.strictEqual(v.savedPixelHeight, 0);
   });
 
   it("keeps valid fields verbatim", () => {
     const v = prefs.validate({
       lang: "ko",
       soundMuted: true,
+      soundVolume: 0.4,
       bubbleFollowPet: true,
+      allowEdgePinning: true,
+      keepSizeAcrossDisplays: true,
+      savedPixelWidth: 286,
+      savedPixelHeight: 286,
       x: 100,
       y: -50,
       size: "P:15",
@@ -94,12 +112,22 @@ describe("prefs.validate", () => {
     });
     assert.strictEqual(v.lang, "ko");
     assert.strictEqual(v.soundMuted, true);
+    assert.strictEqual(v.soundVolume, 0.4);
     assert.strictEqual(v.bubbleFollowPet, true);
+    assert.strictEqual(v.allowEdgePinning, true);
+    assert.strictEqual(v.keepSizeAcrossDisplays, true);
+    assert.strictEqual(v.savedPixelWidth, 286);
+    assert.strictEqual(v.savedPixelHeight, 286);
     assert.strictEqual(v.x, 100);
     assert.strictEqual(v.y, -50);
     assert.strictEqual(v.size, "P:15");
     assert.strictEqual(v.miniEdge, "left");
     assert.strictEqual(v.theme, "calico");
+  });
+
+  it("accepts soundVolume 0 (silent playback is valid)", () => {
+    const v = prefs.validate({ soundVolume: 0 });
+    assert.strictEqual(v.soundVolume, 0);
   });
 
   it("normalizes agents (drops malformed entries)", () => {
@@ -159,6 +187,39 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(b, d);
   });
 
+  it("positionDisplay defaults to null and round-trips a valid snapshot", () => {
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.positionDisplay, null);
+
+    const v = prefs.validate({
+      positionDisplay: {
+        id: 42,
+        scaleFactor: 2,
+        bounds: { x: 0, y: 0, width: 2560, height: 1440 },
+        workArea: { x: 0, y: 0, width: 2560, height: 1392 },
+        stray: "ignored",
+      },
+    });
+    assert.deepStrictEqual(v.positionDisplay, {
+      id: 42,
+      scaleFactor: 2,
+      bounds: { x: 0, y: 0, width: 2560, height: 1440 },
+      workArea: { x: 0, y: 0, width: 2560, height: 1392 },
+    });
+  });
+
+  it("positionDisplay drops malformed snapshots back to null", () => {
+    for (const bad of [
+      { positionDisplay: "not an object" },
+      { positionDisplay: { bounds: null } },
+      { positionDisplay: { bounds: { x: 0, y: 0, width: 0, height: 1080 } } },
+      { positionDisplay: { bounds: { x: NaN, y: 0, width: 1920, height: 1080 } } },
+    ]) {
+      const v = prefs.validate(bad);
+      assert.strictEqual(v.positionDisplay, null, `expected null for ${JSON.stringify(bad)}`);
+    }
+  });
+
   // Phase 3b-swap: themeVariant field
   it("themeVariant defaults to empty object (no migration needed)", () => {
     const d = prefs.getDefaults();
@@ -183,6 +244,58 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(v.themeVariant, {});
     const w = prefs.validate({ themeVariant: [1, 2] });
     assert.deepStrictEqual(w.themeVariant, {});
+  });
+
+  it("shortcuts defaults to the built-in shortcut map", () => {
+    const d = prefs.getDefaults();
+    assert.deepStrictEqual(d.shortcuts, {
+      togglePet: "CommandOrControl+Shift+Alt+C",
+      permissionAllow: "CommandOrControl+Shift+Y",
+      permissionDeny: "CommandOrControl+Shift+N",
+    });
+  });
+
+  it("shortcuts fills missing keys and normalizes valid values", () => {
+    const v = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+K",
+      },
+    });
+    assert.deepStrictEqual(v.shortcuts, {
+      togglePet: "CommandOrControl+K",
+      permissionAllow: "CommandOrControl+Shift+Y",
+      permissionDeny: "CommandOrControl+Shift+N",
+    });
+  });
+
+  it("shortcuts falls back to defaults for invalid or dangerous values", () => {
+    const v = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+C",
+        permissionAllow: "bad accelerator",
+        permissionDeny: 42,
+      },
+    });
+    assert.deepStrictEqual(v.shortcuts, {
+      togglePet: "CommandOrControl+Shift+Alt+C",
+      permissionAllow: "CommandOrControl+Shift+Y",
+      permissionDeny: "CommandOrControl+Shift+N",
+    });
+  });
+
+  it("shortcuts de-duplicates conflicting load-time values with default priority", () => {
+    const v = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+K",
+        permissionAllow: "Ctrl+K",
+        permissionDeny: "Ctrl+Shift+Y",
+      },
+    });
+    assert.deepStrictEqual(v.shortcuts, {
+      togglePet: "CommandOrControl+K",
+      permissionAllow: "CommandOrControl+Shift+Y",
+      permissionDeny: "CommandOrControl+Shift+N",
+    });
   });
 });
 
@@ -406,6 +519,111 @@ describe("prefs.save", () => {
     });
   });
 
+  it("themeOverrides.sounds: round-trips per-soundName file entries", () => {
+    const p = makeTempPath();
+    const snap = prefs.getDefaults();
+    snap.themeOverrides = {
+      clawd: {
+        sounds: {
+          complete: { file: "my-done.mp3" },
+          confirm: { file: "nope.wav" },
+        },
+      },
+    };
+    prefs.save(p, snap);
+    const { snapshot } = prefs.load(p);
+    assert.deepStrictEqual(snapshot.themeOverrides.clawd.sounds, {
+      complete: { file: "my-done.mp3" },
+      confirm: { file: "nope.wav" },
+    });
+  });
+
+  it("themeOverrides.sounds: drops entries with invalid / empty file and non-string keys", () => {
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          sounds: {
+            complete: { file: "ok.mp3" },
+            confirm: { file: "" },    // empty
+            weird:    { durationMs: 1000 }, // no file → dropped
+            "":       { file: "x.mp3" }, // empty key → dropped
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(validated.themeOverrides.clawd.sounds, {
+      complete: { file: "ok.mp3" },
+    });
+  });
+
+  it("themeOverrides.sounds: strips ancillary fields (durationMs / transition / sourceThemeId) — sounds only keep file", () => {
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          sounds: {
+            complete: { file: "ok.mp3", durationMs: 1000, transition: { in: 50 }, sourceThemeId: "x" },
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(validated.themeOverrides.clawd.sounds, {
+      complete: { file: "ok.mp3" },
+    });
+  });
+
+  it("themeOverrides.sounds: preserves originalName when valid, basename-strips and caps length", () => {
+    // originalName is display-only — stores what the user picked before the
+    // copy renamed it to `${soundName}${ext}`. Sanitised to guard hand-edited
+    // pref files from shoving path traversal / absurd strings into the UI.
+    const longName = "a".repeat(300) + ".mp3";
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          sounds: {
+            complete: { file: "complete.mp3", originalName: "cat-demo.mp3" },
+            confirm:  { file: "confirm.wav", originalName: "../../etc/passwd.wav" }, // basenamed
+            hiss:     { file: "hiss.mp3", originalName: ".." },                      // dropped
+            purr:     { file: "purr.mp3", originalName: "" },                        // dropped
+            growl:    { file: "growl.mp3", originalName: longName },                 // capped
+          },
+        },
+      },
+    });
+    assert.strictEqual(validated.themeOverrides.clawd.sounds.complete.originalName, "cat-demo.mp3");
+    assert.strictEqual(validated.themeOverrides.clawd.sounds.confirm.originalName, "passwd.wav");
+    assert.strictEqual(validated.themeOverrides.clawd.sounds.hiss.originalName, undefined);
+    assert.strictEqual(validated.themeOverrides.clawd.sounds.purr.originalName, undefined);
+    assert.strictEqual(validated.themeOverrides.clawd.sounds.growl.originalName.length, 256);
+  });
+
+  it("themeOverrides.sounds: rejects path-unsafe soundName keys and basename-sanitises file", () => {
+    // soundName becomes a filename stem under sound-overrides/<themeId>/ —
+    // a malicious theme or hand-edited pref must not be able to escape that
+    // directory. File paths with separators get basename-stripped.
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          sounds: {
+            complete:      { file: "ok.mp3" },
+            "../../evil":  { file: "x.mp3" },           // unsafe key → dropped
+            "foo/bar":     { file: "x.mp3" },           // unsafe key → dropped
+            "spaces bad":  { file: "x.mp3" },           // unsafe key → dropped
+            confirm:       { file: "../../etc/passwd" },// unsafe file → basenamed
+            quiet:         { file: ".." },               // bare `..` → dropped
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(validated.themeOverrides.clawd.sounds, {
+      complete: { file: "ok.mp3" },
+      confirm:  { file: "passwd" },
+    });
+  });
+
   it("themeOverrides: legacy flat state entries normalize into states map", () => {
     const validated = prefs.validate({
       ...prefs.getDefaults(),
@@ -421,6 +639,96 @@ describe("prefs.save", () => {
           attention: { disabled: true },
         },
       },
+    });
+  });
+
+  it("themeOverrides: reactions round-trip with file + durationMs + transition", () => {
+    const p = makeTempPath();
+    const snap = prefs.getDefaults();
+    snap.themeOverrides = {
+      clawd: {
+        reactions: {
+          clickLeft: {
+            file: "my-poke.svg",
+            durationMs: 2200,
+            transition: { in: 50, out: 100 },
+          },
+          double: { file: "my-double.svg", durationMs: 4000 },
+        },
+      },
+    };
+    prefs.save(p, snap);
+    const { snapshot } = prefs.load(p);
+    assert.deepStrictEqual(snapshot.themeOverrides.clawd.reactions, {
+      clickLeft: {
+        file: "my-poke.svg",
+        durationMs: 2200,
+        transition: { in: 50, out: 100 },
+      },
+      double: { file: "my-double.svg", durationMs: 4000 },
+    });
+  });
+
+  it("themeOverrides: hitbox.wide round-trips boolean per-file flags", () => {
+    const p = makeTempPath();
+    const snap = prefs.getDefaults();
+    snap.themeOverrides = {
+      clawd: {
+        hitbox: {
+          wide: {
+            "clawd-error.svg": true,
+            "clawd-idle.svg": false,
+          },
+        },
+      },
+    };
+    prefs.save(p, snap);
+    const { snapshot } = prefs.load(p);
+    assert.deepStrictEqual(snapshot.themeOverrides.clawd.hitbox, {
+      wide: {
+        "clawd-error.svg": true,
+        "clawd-idle.svg": false,
+      },
+    });
+  });
+
+  it("themeOverrides: hitbox normalize drops non-boolean values", () => {
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          hitbox: {
+            wide: {
+              "ok.svg": true,
+              "bad.svg": "yes",   // dropped
+              "null-val.svg": null,  // dropped
+            },
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(validated.themeOverrides.clawd.hitbox, {
+      wide: { "ok.svg": true },
+    });
+  });
+
+  it("themeOverrides: normalize drops unknown reaction keys and strips durationMs from drag", () => {
+    const validated = prefs.validate({
+      ...prefs.getDefaults(),
+      themeOverrides: {
+        clawd: {
+          reactions: {
+            explode: { file: "bogus.svg" },           // invalid key
+            drag: { file: "my-drag.svg", durationMs: 9999 },  // drag can't have duration
+            clickLeft: { file: "p.svg" },             // valid
+          },
+        },
+      },
+    });
+    assert.deepStrictEqual(validated.themeOverrides.clawd.reactions, {
+      drag: { file: "my-drag.svg" },     // durationMs stripped
+      clickLeft: { file: "p.svg" },
+      // explode: absent
     });
   });
 });

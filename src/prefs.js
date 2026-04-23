@@ -19,6 +19,8 @@
 const fs = require("fs");
 const path = require("path");
 const { isPlainObject } = require("./theme-loader");
+const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions");
+const { isValidDisplaySnapshot } = require("./work-area");
 
 const CURRENT_VERSION = 1;
 
@@ -34,9 +36,25 @@ const SCHEMA = {
   x: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   y: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   positionSaved: { type: "boolean", default: false },
+  positionThemeId: { type: "string", default: "" },
+  positionVariantId: { type: "string", default: "" },
+  // Snapshot of the display the pet sat on at save time. Used on next launch
+  // to distinguish "monitor got unplugged" (saved position is now stranded on
+  // a phantom screen) from "monitor still here" (saved position is still
+  // safe, even if a generic clamp would nudge it). `null` when no snapshot
+  // was captured (legacy prefs, headless CI, startup race).
+  positionDisplay: {
+    type: "object",
+    defaultFactory: () => null,
+    normalize: normalizePositionDisplay,
+  },
+  // Last realized pixel bounds. Used to restore proportional mode exactly
+  // when keepSizeAcrossDisplays is enabled.
+  savedPixelWidth: { type: "number", default: 0, validate: (v) => Number.isFinite(v) && v >= 0 },
+  savedPixelHeight: { type: "number", default: 0, validate: (v) => Number.isFinite(v) && v >= 0 },
   size: {
     type: "string",
-    default: "P:10",
+    default: "P:9",
     // Accept "S"/"M"/"L" (legacy) or "P:<num>" — full migration happens elsewhere.
     validate: (v) =>
       typeof v === "string" &&
@@ -64,6 +82,21 @@ const SCHEMA = {
   hideBubbles: { type: "boolean", default: false },
   showSessionId: { type: "boolean", default: false },
   soundMuted: { type: "boolean", default: false },
+  soundVolume: {
+    type: "number",
+    default: 1,
+    validate: (v) => Number.isFinite(v) && v >= 0 && v <= 1,
+  },
+  allowEdgePinning: { type: "boolean", default: false },
+  // When true, moving the pet between displays does not trigger a
+  // proportional pixel-size recomputation. The pet keeps its current
+  // window size; the size slider still works (per-display proportional).
+  keepSizeAcrossDisplays: { type: "boolean", default: false },
+  shortcuts: {
+    type: "object",
+    defaultFactory: () => getDefaultShortcuts(),
+    normalize: normalizeShortcuts,
+  },
   // Theme
   theme: { type: "string", default: "clawd" },
   // Phase 2/3 placeholders — schema reserves the keys so future migrations don't need v2.
@@ -175,6 +208,25 @@ function migrate(raw) {
 
 const AGENT_FLAGS = ["enabled", "permissionsEnabled"];
 
+function normalizePositionDisplay(value) {
+  if (!isValidDisplaySnapshot(value)) return null;
+  const b = value.bounds;
+  const out = {
+    bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+  };
+  const wa = value.workArea;
+  if (wa && typeof wa === "object"
+    && Number.isFinite(wa.x) && Number.isFinite(wa.y)
+    && Number.isFinite(wa.width) && Number.isFinite(wa.height)) {
+    out.workArea = { x: wa.x, y: wa.y, width: wa.width, height: wa.height };
+  }
+  if (typeof value.id === "number" && Number.isFinite(value.id)) out.id = value.id;
+  if (typeof value.scaleFactor === "number" && Number.isFinite(value.scaleFactor)) {
+    out.scaleFactor = value.scaleFactor;
+  }
+  return out;
+}
+
 function normalizeAgents(value, defaultsValue) {
   if (!value || typeof value !== "object") return defaultsValue;
   const out = { ...defaultsValue };
@@ -215,6 +267,44 @@ function normalizeSlotOverride(entry, { allowDisabled = true } = {}) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+const REACTION_KEYS = new Set(["drag", "clickLeft", "clickRight", "annoyed", "double"]);
+
+// Per-file hitbox override: { file.svg: boolean }.
+// true  = force the file INTO the wide-hitbox set (even if the theme author didn't list it)
+// false = force the file OUT of the wide-hitbox set (even if the theme author did list it)
+// absent = follow whatever the theme declares
+function normalizeHitboxOverrides(value) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  if (isPlainObject(value.wide)) {
+    const wide = {};
+    for (const [file, enabled] of Object.entries(value.wide)) {
+      if (typeof file !== "string" || !file) continue;
+      if (typeof enabled !== "boolean") continue;
+      wide[file] = enabled;
+    }
+    if (Object.keys(wide).length > 0) out.wide = wide;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function normalizeReactionOverridesMap(value) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  for (const [reactionKey, entry] of Object.entries(value)) {
+    if (!REACTION_KEYS.has(reactionKey)) continue;
+    const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: false });
+    if (!cleanEntry) continue;
+    // drag has no duration semantically (it plays until pointer-up), so strip
+    // any durationMs written by a wayward import.
+    if (reactionKey === "drag" && Object.prototype.hasOwnProperty.call(cleanEntry, "durationMs")) {
+      delete cleanEntry.durationMs;
+    }
+    if (Object.keys(cleanEntry).length > 0) out[reactionKey] = cleanEntry;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function normalizeStateOverridesMap(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
@@ -222,6 +312,46 @@ function normalizeStateOverridesMap(value) {
     if (typeof stateKey !== "string" || !stateKey) continue;
     const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: true });
     if (cleanEntry) out[stateKey] = cleanEntry;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+// Sound overrides are per-sound-name (complete / confirm / theme-author-defined).
+// Structurally simpler than state overrides: only `file` matters (no transition,
+// duration, disabled, or sourceThemeId). We reuse normalizeSlotOverride to
+// strip the animation-only fields, then enforce path-segment safety on both
+// the key (used as filename stem when copying) and the file (joined into the
+// overrides dir at load time) — defence in depth against malicious themes or
+// hand-edited pref files.
+// Strips any path segments and rejects traversal-only names. Returns null if
+// the result isn't a usable basename, otherwise the (optionally capped) name.
+function _safeBasename(raw, { maxLen } = {}) {
+  if (typeof raw !== "string" || !raw) return null;
+  let name = raw.replace(/^.*[\/\\]/, "");
+  if (maxLen && name.length > maxLen) name = name.slice(0, maxLen);
+  if (!name || name === "." || name === "..") return null;
+  return name;
+}
+
+function normalizeSoundOverridesMap(value) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  for (const [soundName, entry] of Object.entries(value)) {
+    if (typeof soundName !== "string" || !soundName) continue;
+    if (!/^[a-zA-Z0-9_-]+$/.test(soundName)) continue;
+    const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: false });
+    if (!cleanEntry) continue;
+    const safeFile = _safeBasename(cleanEntry.file);
+    if (!safeFile) continue;
+    const soundEntry = { file: safeFile };
+    // Preserves the user-picked filename; on-disk dest is renamed to
+    // `${soundName}${ext}`, so without this a same-ext replacement would
+    // render identically to the theme default in the UI.
+    if (isPlainObject(entry)) {
+      const safeOriginal = _safeBasename(entry.originalName, { maxLen: 256 });
+      if (safeOriginal) soundEntry.originalName = safeOriginal;
+    }
+    out[soundName] = soundEntry;
   }
   return Object.keys(out).length > 0 ? out : null;
 }
@@ -259,7 +389,7 @@ function normalizeThemeOverrides(value, defaultsValue) {
     // Back-compat: older prefs wrote state entries directly under themeId.
     const legacyStates = {};
     for (const [key, entry] of Object.entries(themeMap)) {
-      if (key === "states" || key === "tiers" || key === "timings" || key === "idleAnimations") continue;
+      if (key === "states" || key === "tiers" || key === "timings" || key === "idleAnimations" || key === "reactions" || key === "hitbox" || key === "sounds") continue;
       const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: true });
       if (cleanEntry) legacyStates[key] = cleanEntry;
     }
@@ -288,6 +418,15 @@ function normalizeThemeOverrides(value, defaultsValue) {
 
     const idleAnimations = normalizeFileKeyedOverrideMap(themeMap.idleAnimations);
     if (idleAnimations) cleanThemeMap.idleAnimations = idleAnimations;
+
+    const reactions = normalizeReactionOverridesMap(themeMap.reactions);
+    if (reactions) cleanThemeMap.reactions = reactions;
+
+    const hitbox = normalizeHitboxOverrides(themeMap.hitbox);
+    if (hitbox) cleanThemeMap.hitbox = hitbox;
+
+    const sounds = normalizeSoundOverridesMap(themeMap.sounds);
+    if (sounds) cleanThemeMap.sounds = sounds;
 
     if (Object.keys(cleanThemeMap).length > 0) {
       out[themeId] = cleanThemeMap;
@@ -370,4 +509,6 @@ module.exports = {
   migrate,
   load,
   save,
+  normalizeThemeOverrides,
+  normalizeShortcuts,
 };

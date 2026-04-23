@@ -3,10 +3,45 @@ const path = require("path");
 const fs = require("fs");
 const { pathToFileURL } = require("url");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
+const {
+  applyWindowsAppUserModelId,
+  getSettingsWindowIconPath,
+  getSettingsWindowTaskbarDetails: getSettingsWindowTaskbarDetailsHelper,
+  shouldOpenSettingsWindowFromArgv,
+  SETTINGS_WINDOW_TITLE,
+} = require("./settings-window-icon");
+const {
+  createSettingsSizePreviewSession,
+} = require("./settings-size-preview-session");
 const hitGeometry = require("./hit-geometry");
 const animationCycle = require("./animation-cycle");
-const { findNearestWorkArea, computeLooseClamp, SYNTHETIC_WORK_AREA } = require("./work-area");
-const { getLaunchSizingWorkArea, getProportionalPixelSize } = require("./size-utils");
+const {
+  findNearestWorkArea,
+  computeLooseClamp,
+  getDisplayInsets,
+  buildDisplaySnapshot,
+  findMatchingDisplay,
+  isPointInAnyWorkArea,
+  SYNTHETIC_WORK_AREA,
+} = require("./work-area");
+const {
+  getThemeMarginBox,
+  computeStableVisibleContentMargins,
+  getLooseDragMargins,
+  getRestClampMargins,
+} = require("./visible-margins");
+const {
+  createDragSnapshot,
+  computeAnchoredDragBounds,
+  computeFinalDragBounds,
+  needsFinalClampAdjustment,
+  materializeVirtualBounds,
+} = require("./drag-position");
+const {
+  getLaunchPixelSize,
+  getLaunchSizingWorkArea,
+  getProportionalPixelSize,
+} = require("./size-utils");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -24,6 +59,7 @@ if (isLinux) {
   app.commandLine.appendSwitch("disable-accelerated-2d-canvas");
   app.commandLine.appendSwitch("disable-accelerated-video-decode");
 }
+applyWindowsAppUserModelId(app, process.platform);
 
 
 // ── Windows: AllowSetForegroundWindow via FFI ──
@@ -55,6 +91,11 @@ const SIZES = {
 // `_settingsController.applyUpdate()`, which auto-persists.
 const prefsModule = require("./prefs");
 const { createSettingsController } = require("./settings-controller");
+const { ANIMATION_OVERRIDES_EXPORT_VERSION } = require("./settings-actions");
+const {
+  SHORTCUT_ACTIONS,
+  SHORTCUT_ACTION_IDS,
+} = require("./shortcut-actions");
 const loginItemHelpers = require("./login-item");
 const PREFS_PATH = path.join(app.getPath("userData"), "clawd-prefs.json");
 const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
@@ -119,9 +160,30 @@ function _deferredClearSessionsByAgent(id) {
     : 0;
 }
 function _deferredDismissPermissionsByAgent(id) {
-  return _perm && typeof _perm.dismissPermissionsByAgent === "function"
+  const removed = _perm && typeof _perm.dismissPermissionsByAgent === "function"
     ? _perm.dismissPermissionsByAgent(id)
     : 0;
+  // Symmetric cleanup for Kimi's state.js animation lock: dismissing the
+  // passive bubble alone would leave `kimiPermissionHolds` pinning
+  // notification forever with nothing actionable (same class of bug we
+  // already fixed for DND). Kimi is the only agent with a state-side
+  // permission lock today, so scope the extra work to it.
+  if (id === "kimi-cli" && _state && typeof _state.disposeAllKimiPermissionState === "function") {
+    const disposed = _state.disposeAllKimiPermissionState();
+    if (disposed && typeof _state.resolveDisplayState === "function" && typeof _state.setState === "function") {
+      const resolved = _state.resolveDisplayState();
+      _state.setState(resolved, _state.getSvgOverride ? _state.getSvgOverride(resolved) : undefined);
+    }
+  }
+  return removed;
+}
+function _deferredResizePet(sizeKey) {
+  // Bound to _menu.resizeWindow after menu module is created below. Settings
+  // panel's size slider commands route through here so they get the same
+  // window resize + hitWin sync + bubble reposition as the context menu.
+  if (_menu && typeof _menu.resizeWindow === "function") {
+    _menu.resizeWindow(sizeKey);
+  }
 }
 
 const _settingsController = createSettingsController({
@@ -139,6 +201,7 @@ const _settingsController = createSettingsController({
     stopMonitorForAgent: _deferredStopMonitorForAgent,
     clearSessionsByAgent: _deferredClearSessionsByAgent,
     dismissPermissionsByAgent: _deferredDismissPermissionsByAgent,
+    resizePet: _deferredResizePet,
     // Theme deps — defined much later in the file, wrapped in lazy closures.
     // activateTheme accepts (themeId, variantId?, overrideMap?) and returns
     // { themeId, variantId } with the actually-resolved variantId
@@ -146,6 +209,12 @@ const _settingsController = createSettingsController({
     activateTheme: (id, variantId, overrideMap) => _deferredActivateTheme(id, variantId, overrideMap),
     getThemeInfo: (id) => _deferredGetThemeInfo(id),
     removeThemeDir: (id) => _deferredRemoveThemeDir(id),
+    globalShortcut,
+    shortcutHandlers: {
+      togglePet: () => togglePetVisibility(),
+    },
+    getShortcutFailure: (actionId) => getShortcutFailure(actionId),
+    clearShortcutFailure: (actionId) => clearShortcutFailure(actionId),
   },
 });
 
@@ -188,17 +257,38 @@ function hydrateSystemBackedSettings() {
 // `win.getBounds()` and `_mini.*` at save time, so we mirror that here.
 function flushRuntimeStateToPrefs() {
   if (!win || win.isDestroyed()) return;
-  const bounds = win.getBounds();
+  const bounds = getPetWindowBounds();
   _settingsController.applyBulk({
     x: bounds.x,
     y: bounds.y,
     positionSaved: true,
+    positionThemeId: activeTheme ? activeTheme._id : "",
+    positionVariantId: activeTheme ? activeTheme._variantId : "",
+    positionDisplay: captureCurrentDisplaySnapshot(bounds),
+    savedPixelWidth: bounds.width,
+    savedPixelHeight: bounds.height,
     size: currentSize,
     miniMode: _mini.getMiniMode(),
     miniEdge: _mini.getMiniEdge(),
     preMiniX: _mini.getPreMiniX(),
     preMiniY: _mini.getPreMiniY(),
   });
+}
+
+// Snapshot the display the pet is currently on so the next launch can tell
+// whether the same physical monitor is still attached (see startup regularize
+// logic below). Returns null if screen.* is unavailable — any truthy snapshot
+// here unlocks the "trust saved position" path, so we fail closed.
+function captureCurrentDisplaySnapshot(bounds) {
+  try {
+    const display = screen.getDisplayNearestPoint({
+      x: Math.round(bounds.x + bounds.width / 2),
+      y: Math.round(bounds.y + bounds.height / 2),
+    });
+    return buildDisplaySnapshot(display);
+  } catch {
+    return null;
+  }
 }
 
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
@@ -217,6 +307,7 @@ function stopMonitorForAgent(agentId) {
 
 // ── Theme loader ──
 const themeLoader = require("./theme-loader");
+const { isPlainObject: _isPlainObject } = themeLoader;
 themeLoader.init(__dirname, app.getPath("userData"));
 
 // Lenient load so a missing/corrupt user-selected theme can't brick boot.
@@ -255,6 +346,7 @@ if (activeTheme._id !== _requestedThemeId || activeTheme._variantId !== _request
 
 // ── CSS <object> sizing (from theme) ──
 function getObjRect(bounds) {
+  if (!bounds) return null;
   const state = _state.getCurrentState();
   const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
   return hitGeometry.getAssetRectScreen(activeTheme, bounds, state, file)
@@ -263,8 +355,11 @@ function getObjRect(bounds) {
 
 let win;
 let hitWin;  // input window — small opaque rect over hitbox, receives all pointer events
+let viewportOffsetY = 0;
+const themeMarginEnvelopeCache = new Map();
 let tray = null;
 let contextMenuOwner = null;
+let settingsSizePreviewSyncFrozen = false;
 // Mirror of _settingsController.get("size") — initialized from disk, kept in
 // sync by the settings subscriber. The legacy S/M/L → P:N migration runs
 // inside createWindow() because it needs the screen API.
@@ -283,16 +378,34 @@ function getProportionalRatio(size) {
   return parseFloat((size || currentSize).slice(2)) || 10;
 }
 
-function getCurrentPixelSize(overrideWa) {
-  if (!isProportionalMode()) return SIZES[currentSize] || SIZES.S;
-  const ratio = getProportionalRatio();
+function getPixelSizeFor(sizeKey, overrideWa) {
+  if (!isProportionalMode(sizeKey)) return SIZES[sizeKey] || SIZES.S;
+  const ratio = getProportionalRatio(sizeKey);
   let wa = overrideWa;
   if (!wa && win && !win.isDestroyed()) {
-    const { x, y, width, height } = win.getBounds();
+    const { x, y, width, height } = getPetWindowBounds();
     wa = getNearestWorkArea(x + width / 2, y + height / 2);
   }
   if (!wa) wa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
   return getProportionalPixelSize(ratio, wa);
+}
+
+function getCurrentPixelSize(overrideWa) {
+  if (!isProportionalMode()) return SIZES[currentSize] || SIZES.S;
+  return getPixelSizeFor(currentSize, overrideWa);
+}
+
+function getEffectiveCurrentPixelSize(overrideWa) {
+  if (
+    keepSizeAcrossDisplaysCached &&
+    isProportionalMode() &&
+    win &&
+    !win.isDestroyed()
+  ) {
+    const bounds = getPetWindowBounds();
+    return { width: bounds.width, height: bounds.height };
+  }
+  return getCurrentPixelSize(overrideWa);
 }
 let contextMenu;
 let doNotDisturb = false;
@@ -309,8 +422,38 @@ let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let hideBubbles = _settingsController.get("hideBubbles");
 let showSessionId = _settingsController.get("showSessionId");
 let soundMuted = _settingsController.get("soundMuted");
+let soundVolume = _settingsController.get("soundVolume");
+let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
+let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
 let petHidden = false;
-const DEFAULT_TOGGLE_SHORTCUT = "CommandOrControl+Shift+Alt+C";
+const shortcutRegistrationFailures = new Map();
+
+function getShortcutFailure(actionId) {
+  return shortcutRegistrationFailures.get(actionId) || null;
+}
+
+function broadcastShortcutFailures() {
+  if (!settingsWindow || settingsWindow.isDestroyed() || !settingsWindow.webContents || settingsWindow.webContents.isDestroyed()) {
+    return;
+  }
+  settingsWindow.webContents.send(
+    "shortcut-failures-changed",
+    Object.fromEntries(shortcutRegistrationFailures)
+  );
+}
+
+function reportShortcutFailure(actionId, reason) {
+  if (!SHORTCUT_ACTIONS[actionId]) return;
+  if (shortcutRegistrationFailures.get(actionId) === reason) return;
+  shortcutRegistrationFailures.set(actionId, reason);
+  broadcastShortcutFailures();
+}
+
+function clearShortcutFailure(actionId) {
+  if (!shortcutRegistrationFailures.has(actionId)) return;
+  shortcutRegistrationFailures.delete(actionId);
+  broadcastShortcutFailures();
+}
 
 function togglePetVisibility() {
   if (!win || win.isDestroyed()) return;
@@ -347,18 +490,66 @@ function togglePetVisibility() {
   buildContextMenu();
 }
 
-function registerToggleShortcut() {
-  try {
-    globalShortcut.register(DEFAULT_TOGGLE_SHORTCUT, togglePetVisibility);
-  } catch (err) {
-    console.warn("Clawd: failed to register global shortcut:", err.message);
+function bringPetToPrimaryDisplay() {
+  if (!win || win.isDestroyed()) return;
+  if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
+
+  const workArea = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
+  const size = getEffectiveCurrentPixelSize(workArea);
+  const bounds = {
+    x: Math.round(workArea.x + (workArea.width - size.width) / 2),
+    y: Math.round(workArea.y + (workArea.height - size.height) / 2),
+    width: size.width,
+    height: size.height,
+  };
+
+  applyPetWindowBounds(bounds);
+  syncHitWin();
+  repositionFloatingBubbles();
+
+  if (petHidden) {
+    togglePetVisibility();
+  } else {
+    win.showInactive();
+    if (isLinux) win.setSkipTaskbar(true);
+    if (hitWin && !hitWin.isDestroyed()) {
+      hitWin.showInactive();
+      if (isLinux) hitWin.setSkipTaskbar(true);
+    }
   }
+
+  reapplyMacVisibility();
+  reassertWinTopmost();
+  scheduleHwndRecovery();
+  flushRuntimeStateToPrefs();
 }
 
-function unregisterToggleShortcut() {
-  try {
-    globalShortcut.unregister(DEFAULT_TOGGLE_SHORTCUT);
-  } catch {}
+function registerPersistentShortcutsFromSettings() {
+  const snapshot = _settingsController.getSnapshot();
+  const shortcuts = (snapshot && snapshot.shortcuts) || {};
+  for (const actionId of SHORTCUT_ACTION_IDS) {
+    const meta = SHORTCUT_ACTIONS[actionId];
+    if (!meta || !meta.persistent) continue;
+    const accelerator = shortcuts[actionId];
+    if (!accelerator) {
+      clearShortcutFailure(actionId);
+      continue;
+    }
+    const handler = actionId === "togglePet" ? togglePetVisibility : null;
+    if (typeof handler !== "function") continue;
+    let ok = false;
+    try {
+      ok = !!globalShortcut.register(accelerator, handler);
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      reportShortcutFailure(actionId, "system conflict");
+      console.warn(`Clawd: failed to register shortcut ${actionId}: ${accelerator}`);
+      continue;
+    }
+    clearShortcutFailure(actionId);
+  }
 }
 
 function sendToRenderer(channel, ...args) {
@@ -366,6 +557,49 @@ function sendToRenderer(channel, ...args) {
 }
 function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
+}
+
+function setViewportOffsetY(offsetY) {
+  const next = Number.isFinite(offsetY) ? Math.max(0, Math.round(offsetY)) : 0;
+  if (next === viewportOffsetY) return;
+  viewportOffsetY = next;
+  sendToRenderer("viewport-offset", viewportOffsetY);
+}
+
+function getPetWindowBounds() {
+  if (!win || win.isDestroyed()) return null;
+  const bounds = win.getBounds();
+  return {
+    x: bounds.x,
+    y: bounds.y - viewportOffsetY,
+    width: bounds.width,
+    height: bounds.height,
+  };
+}
+
+function applyPetWindowBounds(bounds) {
+  if (!win || win.isDestroyed() || !bounds) return null;
+  const workArea = getNearestWorkArea(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2
+  );
+  const materialized = materializeVirtualBounds(bounds, workArea);
+  if (!materialized) return null;
+  win.setBounds(materialized.bounds);
+  setViewportOffsetY(materialized.viewportOffsetY);
+  return materialized.bounds;
+}
+
+function applyPetWindowPosition(x, y) {
+  const bounds = getPetWindowBounds();
+  if (!bounds) return null;
+  return applyPetWindowBounds({ ...bounds, x, y });
+}
+
+function hasStoredPositionThemeMismatch(prefs) {
+  if (!prefs || !activeTheme) return false;
+  return prefs.positionThemeId !== activeTheme._id
+    || prefs.positionVariantId !== activeTheme._variantId;
 }
 
 function syncHitStateAfterLoad() {
@@ -436,7 +670,7 @@ function playSound(name) {
   const url = themeLoader.getSoundUrl(name);
   if (!url) return;
   lastSoundTime = now;
-  sendToRenderer("play-sound", url);
+  sendToRenderer("play-sound", { url, volume: soundVolume });
 }
 
 function resetSoundCooldown() {
@@ -448,7 +682,10 @@ function resetSoundCooldown() {
 let _lastHitW = 0, _lastHitH = 0;
 function syncHitWin() {
   if (!hitWin || hitWin.isDestroyed() || !win || win.isDestroyed()) return;
-  const bounds = win.getBounds();
+  // Keep the captured pointer stable while dragging. Repositioning the input
+  // window mid-drag can break pointer capture on Windows.
+  if (dragLocked) return;
+  const bounds = getPetWindowBounds();
   const hit = getHitRectScreen(bounds);
   const x = Math.round(hit.left);
   const y = Math.round(hit.top);
@@ -465,10 +702,57 @@ function syncHitWin() {
 
 let mouseOverPet = false;
 let dragLocked = false;
+let dragSnapshot = null;
 let menuOpen = false;
 let idlePaused = false;
 let forceEyeResend = false;
 let themeReloadInProgress = false;
+
+// Keep drag math in Electron's main-process DIP coordinate space. Renderer
+// PointerEvent.screenX/Y can be scaled differently on high-DPI displays.
+function beginDragSnapshot() {
+  if (!win || win.isDestroyed()) {
+    dragSnapshot = null;
+    return;
+  }
+  const bounds = getPetWindowBounds();
+  // When keepSizeAcrossDisplays is on, the pet may currently be sized from
+  // a prior display (e.g. dragged from a small monitor and kept small on a
+  // large one). Snapshotting getCurrentPixelSize() here would snap it to
+  // the large display's proportional size at drag start, which is the
+  // exact behaviour the user disabled.
+  const size = keepSizeAcrossDisplaysCached
+    ? { width: bounds.width, height: bounds.height }
+    : getCurrentPixelSize();
+  dragSnapshot = createDragSnapshot(
+    screen.getCursorScreenPoint(),
+    bounds,
+    size
+  );
+}
+
+function clearDragSnapshot() {
+  dragSnapshot = null;
+}
+
+function moveWindowForDrag() {
+  if (!dragLocked) return;
+  if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
+  if (!win || win.isDestroyed()) return;
+  if (!dragSnapshot) return;
+
+  const bounds = computeAnchoredDragBounds(
+    dragSnapshot,
+    screen.getCursorScreenPoint(),
+    looseClampPetToDisplays
+  );
+  if (!bounds) return;
+
+  applyPetWindowBounds(bounds);
+  if (isWin && isNearWorkAreaEdge(bounds)) reassertWinTopmost();
+  syncHitWin();
+  repositionFloatingBubbles();
+}
 
 // ── Mini Mode — delegated to src/mini.js ──
 // Initialized after state module (needs applyState, resolveDisplayState, etc.)
@@ -486,6 +770,7 @@ const _permCtx = {
   get doNotDisturb() { return doNotDisturb; },
   get hideBubbles() { return hideBubbles; },
   get petHidden() { return petHidden; },
+  getPetWindowBounds,
   getNearestWorkArea,
   getHitRectScreen,
   guardAlwaysOnTop,
@@ -496,9 +781,15 @@ const _permCtx = {
     const s = sessions.get(sessionId);
     if (s && s.sourcePid) focusTerminalWindow(s.sourcePid, s.cwd, s.editor, s.pidChain);
   },
+  getSettingsSnapshot: () => _settingsController.getSnapshot(),
+  subscribeShortcuts: (cb) => _settingsController.subscribeKey("shortcuts", (_value, snapshot) => {
+    if (typeof cb === "function") cb(snapshot);
+  }),
+  reportShortcutFailure: (actionId, reason) => reportShortcutFailure(actionId, reason),
+  clearShortcutFailure: (actionId) => clearShortcutFailure(actionId),
 };
 const _perm = require("./permission")(_permCtx);
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, showCodexNotifyBubble, clearCodexNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -509,6 +800,7 @@ const _updateBubbleCtx = {
   get bubbleFollowPet() { return bubbleFollowPet; },
   get petHidden() { return petHidden; },
   getPendingPermissions: () => pendingPermissions,
+  getPetWindowBounds,
   getNearestWorkArea,
   getHitRectScreen,
   guardAlwaysOnTop,
@@ -587,6 +879,14 @@ const _stateCtx = {
   t: (key) => t(key),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   resolvePermissionEntry: (...args) => resolvePermissionEntry(...args),
+  showKimiNotifyBubble: (...args) => showKimiNotifyBubble(...args),
+  clearKimiNotifyBubbles: (...args) => clearKimiNotifyBubbles(...args),
+  // state.js needs this to gate startKimiPermissionPoll symmetrically with
+  // shouldSuppressKimiNotifyBubble in permission.js — without it the
+  // permissionsEnabled=false toggle would silently rebuild holds on every
+  // incoming Kimi PermissionRequest.
+  isAgentPermissionsEnabled: (agentId) =>
+    _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   miniPeekIn: () => miniPeekIn(),
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
@@ -630,6 +930,7 @@ const STATE_PRIORITY = _state.STATE_PRIORITY;
 
 // ── Hit-test: SVG bounding box → screen coordinates ──
 function getHitRectScreen(bounds) {
+  if (!bounds) return null;
   const state = _state.getCurrentState();
   const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
   const hit = hitGeometry.getHitRectScreen(
@@ -646,10 +947,31 @@ function getHitRectScreen(bounds) {
   return hit || { left: bounds.x, top: bounds.y, right: bounds.x + bounds.width, bottom: bounds.y + bounds.height };
 }
 
+function getVisibleContentMargins(bounds) {
+  if (!bounds || !activeTheme) return { top: 0, bottom: 0 };
+  const box = getThemeMarginBox(activeTheme);
+  if (!box) return { top: 0, bottom: 0 };
+
+  const cacheKey = [
+    activeTheme._id || "",
+    activeTheme._variantId || "",
+    bounds.width,
+    bounds.height,
+    JSON.stringify(box),
+  ].join("|");
+  const cached = themeMarginEnvelopeCache.get(cacheKey);
+  if (cached) return cached;
+
+  const margins = computeStableVisibleContentMargins(activeTheme, bounds, { box });
+  themeMarginEnvelopeCache.set(cacheKey, margins);
+  return margins;
+}
+
 // ── Main tick — delegated to src/tick.js ──
 const _tickCtx = {
   get theme() { return activeTheme; },
   get win() { return win; },
+  getPetWindowBounds,
   get currentState() { return _state.getCurrentState(); },
   get currentSvg() { return _state.getCurrentSvg(); },
   get miniMode() { return _mini.getMiniMode(); },
@@ -719,6 +1041,24 @@ const TOPMOST_WATCHDOG_MS = 5_000;
 let topmostWatchdog = null;
 let hwndRecoveryTimer = null;
 
+function reassertWinTopmost() {
+  if (!isWin) return;
+  if (win && !win.isDestroyed()) win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+  if (hitWin && !hitWin.isDestroyed()) hitWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+}
+
+function isNearWorkAreaEdge(bounds, tolerance = 2) {
+  if (!bounds) return false;
+  const wa = getNearestWorkArea(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  if (!wa) return false;
+  return (
+    bounds.x <= wa.x + tolerance ||
+    bounds.y <= wa.y + tolerance ||
+    bounds.x + bounds.width >= wa.x + wa.width - tolerance ||
+    bounds.y + bounds.height >= wa.y + wa.height - tolerance
+  );
+}
+
 // Reinitialize HWND input routing after DWM z-order disruptions.
 // showInactive() (ShowWindow SW_SHOWNOACTIVATE) is the same call that makes
 // the right-click context menu restore drag capability — it forces Windows to
@@ -730,8 +1070,7 @@ function scheduleHwndRecovery() {
     hwndRecoveryTimer = null;
     if (!win || win.isDestroyed()) return;
     // Just restore z-order — input routing is handled by hitWin now
-    win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
-    if (hitWin && !hitWin.isDestroyed()) hitWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+    reassertWinTopmost();
     forceEyeResend = true;
   }, 1000);
 }
@@ -741,11 +1080,11 @@ function guardAlwaysOnTop(w) {
   w.on("always-on-top-changed", (_, isOnTop) => {
     if (!isOnTop && w && !w.isDestroyed()) {
       w.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
-      if (w === win && !dragLocked && !_mini.getIsAnimating()) {
+      if (w === win && !dragLocked && !_mini.getIsAnimating() && !_mini.getMiniTransitioning()) {
         forceEyeResend = true;
-        const { x, y } = win.getBounds();
-        win.setPosition(x + 1, y);
-        win.setPosition(x, y);
+        const bounds = getPetWindowBounds();
+        applyPetWindowPosition(bounds.x + 1, bounds.y);
+        applyPetWindowPosition(bounds.x, bounds.y);
         syncHitWin();
         scheduleHwndRecovery();
       }
@@ -822,10 +1161,12 @@ const _menuCtx = {
   set showSessionId(v) { _settingsController.applyUpdate("showSessionId", v); },
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
+  get soundVolume() { return soundVolume; },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionFloatingBubbles(),
   get petHidden() { return petHidden; },
   togglePetVisibility: () => togglePetVisibility(),
+  bringPetToPrimaryDisplay: () => bringPetToPrimaryDisplay(),
   get isQuitting() { return isQuitting; },
   set isQuitting(v) { isQuitting = v; },
   get menuOpen() { return menuOpen; },
@@ -853,11 +1194,15 @@ const _menuCtx = {
   flushRuntimeStateToPrefs,
   settings: _settingsController,
   syncHitWin,
+  getPetWindowBounds,
+  applyPetWindowBounds,
   getCurrentPixelSize,
+  getEffectiveCurrentPixelSize,
+  getPixelSizeFor,
   isProportionalMode,
   PROPORTIONAL_RATIOS,
   getHookServerPort: () => getHookServerPort(),
-  clampToScreen,
+  clampToScreenVisual,
   getNearestWorkArea,
   reapplyMacVisibility,
   discoverThemes: () => themeLoader.discoverThemes(),
@@ -883,6 +1228,8 @@ const MENU_AFFECTING_KEYS = new Set([
   "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId",
   "manageClaudeHooksAutomatically", "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
 ]);
+let lastTogglePetShortcut = ((_settingsController.getSnapshot().shortcuts) || {}).togglePet || null;
+
 function wireSettingsSubscribers() {
   _settingsController.subscribe(({ changes }) => {
     // 1. Update mirror caches first so any side-effect handler reads fresh values.
@@ -918,6 +1265,9 @@ function wireSettingsSubscribers() {
     if ("hideBubbles" in changes) hideBubbles = changes.hideBubbles;
     if ("showSessionId" in changes) showSessionId = changes.showSessionId;
     if ("soundMuted" in changes) soundMuted = changes.soundMuted;
+    if ("soundVolume" in changes) soundVolume = changes.soundVolume;
+    if ("allowEdgePinning" in changes) allowEdgePinningCached = changes.allowEdgePinning;
+    if ("keepSizeAcrossDisplays" in changes) keepSizeAcrossDisplaysCached = changes.keepSizeAcrossDisplays;
 
     // 2. Reactive side effects (mirror what the legacy setters / click handlers used to do).
     if ("hideBubbles" in changes) {
@@ -928,6 +1278,25 @@ function wireSettingsSubscribers() {
     if ("bubbleFollowPet" in changes) {
       try { repositionFloatingBubbles(); } catch (err) {
         console.warn("Clawd: repositionFloatingBubbles failed:", err && err.message);
+      }
+    }
+    if ("allowEdgePinning" in changes) {
+      try {
+        if (
+          win && !win.isDestroyed() &&
+          !dragLocked &&
+          !_mini.getMiniMode() &&
+          !_mini.getMiniTransitioning()
+        ) {
+          const size = getEffectiveCurrentPixelSize();
+          const virtualBounds = getPetWindowBounds();
+          const clamped = computeFinalDragBounds(virtualBounds, size, clampToScreenVisual);
+          if (clamped) applyPetWindowBounds(clamped);
+          syncHitWin();
+          repositionFloatingBubbles();
+        }
+      } catch (err) {
+        console.warn("Clawd: allowEdgePinning re-clamp failed:", err && err.message);
       }
     }
 
@@ -955,9 +1324,29 @@ function wireSettingsSubscribers() {
   });
 }
 wireSettingsSubscribers();
+_settingsController.subscribeKey("shortcuts", (_value, snapshot) => {
+  const nextTogglePetShortcut = (snapshot && snapshot.shortcuts && snapshot.shortcuts.togglePet) || null;
+  if (nextTogglePetShortcut === lastTogglePetShortcut) return;
+  lastTogglePetShortcut = nextTogglePetShortcut;
+  try { rebuildAllMenus(); } catch (err) {
+    console.warn("Clawd: rebuildAllMenus failed:", err && err.message);
+  }
+});
 
 const ANIMATION_OVERRIDE_ASSET_EXTS = new Set([".svg", ".gif", ".apng", ".png", ".webp", ".jpg", ".jpeg"]);
 let animationOverridePreviewTimer = null;
+// Tasks queued while activateTheme()'s reload is in progress. Anything that
+// needs to talk to the renderer after a fresh theme load (e.g. the preview
+// animation triggered right after a setAnimationOverride) lands here and fires
+// once both webContents finish reloading. See _previewAnimationOverride.
+let _pendingPostReloadTasks = [];
+function _runPendingPostReloadTasks() {
+  const tasks = _pendingPostReloadTasks;
+  _pendingPostReloadTasks = [];
+  for (const task of tasks) {
+    try { task(); } catch (err) { console.warn("Clawd: post-reload task threw:", err && err.message); }
+  }
+}
 
 function _buildFileUrl(absPath) {
   try { return pathToFileURL(absPath).href; }
@@ -974,6 +1363,73 @@ function _resolveAnimationAssetAbsPath(filename) {
   }
 }
 
+// Cheap regex-based viewBox/width-height parser for SVG. The renderer already
+// uses an <object> element that resolves these at paint time, but for the
+// aspect-ratio warning we compute it in main so the settings panel sees it on
+// initial render without round-tripping through the renderer.
+function _readSvgAspectRatio(absPath) {
+  try {
+    const text = fs.readFileSync(absPath, "utf8");
+    const headMatch = text.match(/<svg\b[^>]*>/i);
+    if (!headMatch) return null;
+    const head = headMatch[0];
+    const vbMatch = head.match(/\sviewBox\s*=\s*["']([-\d.\s]+)["']/i);
+    if (vbMatch) {
+      const parts = vbMatch[1].trim().split(/\s+/).map(Number);
+      if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+        return parts[2] / parts[3];
+      }
+    }
+    const wMatch = head.match(/\swidth\s*=\s*["']([\d.]+)/i);
+    const hMatch = head.match(/\sheight\s*=\s*["']([\d.]+)/i);
+    if (wMatch && hMatch) {
+      const w = parseFloat(wMatch[1]);
+      const h = parseFloat(hMatch[1]);
+      if (w > 0 && h > 0) return w / h;
+    }
+  } catch { /* swallow — callers treat null as "unknown, skip warn" */ }
+  return null;
+}
+
+// Warn when a user-overridden file's aspect ratio diverges enough from the
+// original that the theme's hitbox / objectScale assumptions likely no longer
+// line up. Currently only meaningful for SVG → SVG swaps — bitmap formats
+// skip silently rather than mislead with a false-negative.
+const ASPECT_RATIO_WARN_THRESHOLD = 0.15;
+
+function _computeAspectRatioWarning(baseFile, currentFile) {
+  if (!baseFile || !currentFile) return null;
+  if (baseFile === currentFile) return null;
+  const lowerBase = baseFile.toLowerCase();
+  const lowerCurrent = currentFile.toLowerCase();
+  if (!lowerBase.endsWith(".svg") || !lowerCurrent.endsWith(".svg")) return null;
+  const basePath = _resolveAnimationAssetAbsPath(baseFile);
+  const currentPath = _resolveAnimationAssetAbsPath(currentFile);
+  if (!basePath || !currentPath) return null;
+  const baseAspect = _readSvgAspectRatio(basePath);
+  const currentAspect = _readSvgAspectRatio(currentPath);
+  if (baseAspect == null || currentAspect == null) return null;
+  const diffRatio = Math.abs(baseAspect - currentAspect) / baseAspect;
+  if (diffRatio < ASPECT_RATIO_WARN_THRESHOLD) return null;
+  return {
+    baseAspect,
+    currentAspect,
+    diffRatio,
+  };
+}
+
+function _computeCardHitboxInfo(currentFile, themeOverrideMap) {
+  if (!currentFile || !activeTheme) {
+    return { wideHitboxEnabled: false, wideHitboxOverridden: false };
+  }
+  const wideFiles = Array.isArray(activeTheme.wideHitboxFiles) ? activeTheme.wideHitboxFiles : [];
+  const wideHitboxEnabled = wideFiles.includes(currentFile);
+  const overrideWide = themeOverrideMap && themeOverrideMap.hitbox && themeOverrideMap.hitbox.wide;
+  const wideHitboxOverridden = !!(overrideWide
+    && Object.prototype.hasOwnProperty.call(overrideWide, currentFile));
+  return { wideHitboxEnabled, wideHitboxOverridden };
+}
+
 function _resolveAnimationAssetsDir(theme = activeTheme) {
   if (!theme) return null;
   const themeAssetsDir = theme._themeDir ? path.join(theme._themeDir, "assets") : null;
@@ -982,6 +1438,14 @@ function _resolveAnimationAssetsDir(theme = activeTheme) {
   if (!idleFile) return null;
   const resolved = themeLoader.getAssetPath(idleFile);
   return resolved ? path.dirname(resolved) : null;
+}
+
+function _resolveOpenableFsPath(absPath) {
+  if (!absPath || !app.isPackaged) return absPath;
+  const asarSegment = `${path.sep}app.asar${path.sep}`;
+  if (!absPath.includes(asarSegment)) return absPath;
+  const unpackedPath = absPath.replace(asarSegment, `${path.sep}app.asar.unpacked${path.sep}`);
+  return fs.existsSync(unpackedPath) ? unpackedPath : absPath;
 }
 
 function _buildAnimationAssetUrl(filename) {
@@ -1039,8 +1503,7 @@ function _listAnimationOverrideAssets(theme = activeTheme) {
   const dirs = [];
   const primaryDir = _resolveAnimationAssetsDir(theme);
   const sourceDir = theme._themeDir ? path.join(theme._themeDir, "assets") : null;
-  const cacheDir = theme._assetsDir || null;
-  for (const dir of [primaryDir, sourceDir, cacheDir]) {
+  for (const dir of [primaryDir, sourceDir]) {
     if (!dir || !fs.existsSync(dir)) continue;
     if (!dirs.includes(dir)) dirs.push(dir);
   }
@@ -1245,6 +1708,61 @@ function _buildIdleAnimationCards(themeOverrideMap) {
     .filter(Boolean);
 }
 
+const REACTION_ORDER = [
+  { key: "drag",       triggerKind: "dragReaction",       supportsDuration: false },
+  { key: "clickLeft",  triggerKind: "clickLeftReaction",  supportsDuration: true  },
+  { key: "clickRight", triggerKind: "clickRightReaction", supportsDuration: true  },
+  { key: "annoyed",    triggerKind: "annoyedReaction",    supportsDuration: true  },
+  { key: "double",     triggerKind: "doubleReaction",     supportsDuration: true  },
+];
+
+function _buildReactionCards(themeOverrideMap) {
+  if (!activeTheme || !_isPlainObject(activeTheme.reactions)) return [];
+  const reactionsMap = activeTheme.reactions;
+  const overrideMap = themeOverrideMap && themeOverrideMap.reactions;
+  const cards = [];
+  for (const spec of REACTION_ORDER) {
+    const reactionEntry = reactionsMap[spec.key];
+    if (!_isPlainObject(reactionEntry)) continue;
+    // `double` carries a random pool (files[]); MVP exposes only files[0].
+    // Other reactions carry a single file under `file`.
+    const currentFile = (Array.isArray(reactionEntry.files) && reactionEntry.files[0])
+      || reactionEntry.file
+      || null;
+    if (!currentFile) continue;
+    const durationMs = spec.supportsDuration && Number.isFinite(reactionEntry.duration)
+      ? reactionEntry.duration
+      : null;
+    const timingHint = _buildTimingHint(currentFile, durationMs);
+    const overrideEntry = overrideMap && overrideMap[spec.key];
+    const hasDurationOverride = !!(overrideEntry
+      && Object.prototype.hasOwnProperty.call(overrideEntry, "durationMs"));
+    cards.push({
+      id: `reaction:${spec.key}`,
+      slotType: "reaction",
+      sectionId: "reactions",
+      reactionKey: spec.key,
+      triggerKind: spec.triggerKind,
+      currentFile,
+      baseFile: currentFile,
+      currentFileUrl: _buildAnimationAssetUrl(currentFile),
+      bindingLabel: `reactions.${spec.key}`,
+      transition: _readResolvedTransition(currentFile),
+      supportsAutoReturn: false,
+      supportsDuration: spec.supportsDuration,
+      autoReturnMs: null,
+      durationMs,
+      hasAutoReturnOverride: false,
+      hasDurationOverride,
+      ...timingHint,
+      previewDurationMs: timingHint.previewDurationMs || durationMs,
+      displayHintWarning: false,
+      displayHintTarget: null,
+    });
+  }
+  return cards;
+}
+
 function _pushSection(sections, id, mode, cards) {
   if (!Array.isArray(cards) || cards.length === 0) return;
   sections.push({ id, mode: mode || null, cards });
@@ -1322,6 +1840,9 @@ function _buildAnimationOverrideSections() {
   }
   _pushSection(sections, "sleep", sleepMode, sleepCards);
 
+  const reactionCards = _buildReactionCards(themeOverrideMap);
+  _pushSection(sections, "reactions", null, reactionCards);
+
   if (activeTheme.miniMode && activeTheme.miniMode.supported) {
     const miniCards = [];
     for (const stateKey of [
@@ -1330,6 +1851,7 @@ function _buildAnimationOverrideSections() {
       "mini-enter-sleep",
       "mini-crabwalk",
       "mini-peek",
+      "mini-working",
       "mini-alert",
       "mini-happy",
       "mini-sleep",
@@ -1342,7 +1864,82 @@ function _buildAnimationOverrideSections() {
     }
     _pushSection(sections, "mini", null, miniCards);
   }
+
+  // Annotate every card with wide-hitbox status + aspect-ratio warning so the
+  // settings panel drawer can render the toggle + warning banner. Reactions
+  // are intentionally skipped — they're renderer-owned click animations that
+  // don't consume HIT_BOXES.
+  for (const section of sections) {
+    if (!section || !Array.isArray(section.cards)) continue;
+    if (section.id === "reactions") continue;
+    for (const card of section.cards) {
+      const { wideHitboxEnabled, wideHitboxOverridden } = _computeCardHitboxInfo(card.currentFile, themeOverrideMap);
+      card.wideHitboxEnabled = wideHitboxEnabled;
+      card.wideHitboxOverridden = wideHitboxOverridden;
+      card.aspectRatioWarning = _computeAspectRatioWarning(card.baseFile, card.currentFile);
+    }
+  }
+
   return sections;
+}
+
+// Flat list of replaceable sound slots for the current theme. Enumerates every
+// key the theme publishes under `sounds` (default DEFAULT_SOUNDS keys + anything
+// theme authors added), so custom themes that ship extra sound names become
+// replaceable automatically. UI labels the default `complete`/`confirm` pair via
+// i18n and falls back to the raw key for custom names.
+function _buildSoundOverrideSlots() {
+  if (!activeTheme || !_isPlainObject(activeTheme.sounds)) return [];
+  const themeOverrideMap = _readCurrentThemeOverrideMap();
+  const overrideSoundsMap = themeOverrideMap && _isPlainObject(themeOverrideMap.sounds)
+    ? themeOverrideMap.sounds : null;
+  const runtimeOverrideMap = activeTheme && _isPlainObject(activeTheme._soundOverrideFiles)
+    ? activeTheme._soundOverrideFiles
+    : null;
+  const slots = [];
+  for (const [name, themeDefault] of Object.entries(activeTheme.sounds)) {
+    if (typeof name !== "string" || !name) continue;
+    if (typeof themeDefault !== "string" || !themeDefault) continue;
+    const overrideEntry = overrideSoundsMap ? overrideSoundsMap[name] : null;
+    const hasStoredOverride = !!(
+      overrideEntry
+      && typeof overrideEntry.file === "string"
+      && overrideEntry.file
+    );
+    const runtimeOverridePath = runtimeOverrideMap && typeof runtimeOverrideMap[name] === "string"
+      ? runtimeOverrideMap[name]
+      : null;
+    const overrideFile = runtimeOverridePath && fs.existsSync(runtimeOverridePath)
+      ? path.basename(runtimeOverridePath)
+      : null;
+    const originalName = overrideFile
+      && overrideEntry
+      && typeof overrideEntry.originalName === "string"
+      && overrideEntry.originalName
+      ? overrideEntry.originalName
+      : null;
+    slots.push({
+      name,
+      currentFile: overrideFile || themeDefault,
+      originalName,
+      themeDefaultFile: themeDefault,
+      overridden: !!overrideFile,
+      hasStoredOverride,
+    });
+  }
+  slots.sort((a, b) => a.name.localeCompare(b.name));
+  return slots;
+}
+
+function _rememberRuntimeSoundOverrideFile(themeId, soundName, absPath) {
+  if (!activeTheme || activeTheme._id !== themeId) return;
+  if (typeof soundName !== "string" || !soundName) return;
+  if (typeof absPath !== "string" || !absPath) return;
+  const nextOverrideMap = _isPlainObject(activeTheme._soundOverrideFiles)
+    ? { ...activeTheme._soundOverrideFiles }
+    : {};
+  nextOverrideMap[soundName] = absPath;
+  activeTheme._soundOverrideFiles = nextOverrideMap;
 }
 
 function _buildAnimationOverrideData() {
@@ -1360,6 +1957,7 @@ function _buildAnimationOverrideData() {
     assets: _listAnimationOverrideAssets(activeTheme),
     sections,
     cards: sections.flatMap((section) => section.cards || []),
+    sounds: _buildSoundOverrideSlots(),
   };
 }
 
@@ -1377,6 +1975,30 @@ function _previewAnimationOverride(payload) {
   if (!_state || typeof _state.applyState !== "function" || typeof _state.resolveDisplayState !== "function") {
     return { status: "error", message: "previewAnimationOverride requires state runtime" };
   }
+  // When a preview is fired right after setAnimationOverride (the "Use this
+  // file" flow), activateTheme() is still mid-reload: the renderer is tearing
+  // down its webContents, so any IPC we send lands in a reloading window and
+  // is racey with syncRendererStateAfterLoad() that fires when reload ends.
+  // Defer until the reload is actually done — see _runPendingPostReloadTasks
+  // hooked into activateTheme()'s onReady.
+  if (themeReloadInProgress) {
+    _pendingPostReloadTasks.push(() => _runAnimationOverridePreview(stateKey, file, durationMs));
+    return { status: "ok", deferred: true };
+  }
+  return _runAnimationOverridePreview(stateKey, file, durationMs);
+}
+
+// Preview is a quick peek at the asset, not a full-length playback. Hard clamp
+// the hold duration:
+//   · some assets have extremely long cycleMs (a SMIL animation with dur="60s"
+//     or an indefinite loop that the cycle probe estimates high) — without a
+//     ceiling the pet would be stuck on the preview SVG for that full duration
+//   · the floor prevents sub-flash previews that finish before the renderer
+//     has even painted the new SVG
+const PREVIEW_HOLD_MIN_MS = 800;
+const PREVIEW_HOLD_MAX_MS = 3500;
+
+function _runAnimationOverridePreview(stateKey, file, durationMs) {
   if (animationOverridePreviewTimer) {
     clearTimeout(animationOverridePreviewTimer);
     animationOverridePreviewTimer = null;
@@ -1386,15 +2008,22 @@ function _previewAnimationOverride(payload) {
   } catch (err) {
     return { status: "error", message: `previewAnimationOverride: ${err && err.message}` };
   }
-  const fallbackMs = (activeTheme && activeTheme.timings && activeTheme.timings.autoReturn && activeTheme.timings.autoReturn[stateKey]) || 1800;
-  const holdMs = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 300)
+  const requested = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0)
     ? durationMs
-    : fallbackMs;
+    : PREVIEW_HOLD_MIN_MS;
+  const holdMs = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(PREVIEW_HOLD_MAX_MS, requested));
   animationOverridePreviewTimer = setTimeout(() => {
     animationOverridePreviewTimer = null;
     try {
-      const resolved = _state.resolveDisplayState();
-      _state.applyState(resolved, _state.getSvgOverride(resolved));
+      // Unconditionally release back to idle at the end of the preview. Rationale:
+      //   · continuous states (working/thinking/juggling) would otherwise stay
+      //     latched on the preview SVG until the live session stales out (5 min)
+      //   · oneshot states have their own autoReturn, but clamping to 3.5s means
+      //     we'll usually beat it — forcing idle here keeps the exit consistent
+      //   · if a hook event fires mid-preview and a live session is still active,
+      //     the next event will re-upgrade state naturally — a brief idle flash
+      //     is acceptable UX for a preview exit
+      _state.applyState("idle", _state.getSvgOverride("idle"));
     } catch {}
   }, holdMs);
   return { status: "ok" };
@@ -1404,11 +2033,38 @@ function _previewAnimationOverride(payload) {
 // Renderer-side callers (the future settings panel) use these. Menu/main code
 // in this process calls _settingsController directly — no IPC round-trip.
 ipcMain.handle("settings:get-snapshot", () => _settingsController.getSnapshot());
+ipcMain.handle("settings:getShortcutFailures", () =>
+  Object.fromEntries(shortcutRegistrationFailures)
+);
+ipcMain.handle("settings:enterShortcutRecording", (_event, actionId) =>
+  startShortcutRecording(actionId)
+);
+ipcMain.handle("settings:exitShortcutRecording", () => {
+  stopShortcutRecording();
+  return { status: "ok" };
+});
 ipcMain.handle("settings:update", (_event, payload) => {
   if (!payload || typeof payload !== "object") {
     return { status: "error", message: "settings:update payload must be { key, value }" };
   }
   return _settingsController.applyUpdate(payload.key, payload.value);
+});
+ipcMain.handle("settings:begin-size-preview", () => settingsSizePreviewSession.begin());
+ipcMain.handle("settings:preview-size", (_event, value) => {
+  if (!isValidSizePreviewKey(value)) {
+    return { status: "error", message: `invalid preview size "${value}"` };
+  }
+  return settingsSizePreviewSession.preview(value).then(() => ({ status: "ok" }));
+});
+ipcMain.handle("settings:end-size-preview", (_event, value) => {
+  if (value !== null && value !== undefined && !isValidSizePreviewKey(value)) {
+    return { status: "error", message: `invalid preview size "${value}"` };
+  }
+  return settingsSizePreviewSession.end(value || null);
+});
+ipcMain.handle("settings:get-preview-sound-url", () => {
+  try { return themeLoader.getPreviewSoundUrl(); }
+  catch { return null; }
 });
 ipcMain.handle("settings:command", async (_event, payload) => {
   if (!payload || typeof payload !== "object") {
@@ -1418,7 +2074,7 @@ ipcMain.handle("settings:command", async (_event, payload) => {
 });
 ipcMain.handle("settings:get-animation-overrides-data", () => _buildAnimationOverrideData());
 ipcMain.handle("settings:open-theme-assets-dir", async () => {
-  const dir = _resolveAnimationAssetsDir(activeTheme);
+  const dir = _resolveOpenableFsPath(_resolveAnimationAssetsDir(activeTheme));
   if (!dir || !fs.existsSync(dir)) {
     return { status: "error", message: "theme assets directory unavailable" };
   }
@@ -1427,6 +2083,283 @@ ipcMain.handle("settings:open-theme-assets-dir", async () => {
   return { status: "ok", path: dir };
 });
 ipcMain.handle("settings:preview-animation-override", (_event, payload) => _previewAnimationOverride(payload));
+
+// ── Sound override IPC ──
+// Audio extensions we accept for sound overrides. MIME decoding in the renderer
+// is ultimately whatever Chromium supports; we restrict the dialog filter here
+// to the common lossy + lossless formats a user is likely to bring in.
+const SOUND_OVERRIDE_ASSET_EXTS = new Set([".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"]);
+const SOUND_OVERRIDE_DIALOG_STRINGS = {
+  en: { title: "Choose a sound file", filterName: "Audio" },
+  zh: { title: "选择音效文件", filterName: "音频" },
+  ko: { title: "음향 파일 선택", filterName: "오디오" },
+};
+
+function _cleanupSiblingSoundOverrides(overridesDir, soundName, keepExt) {
+  // Replacing a sound with a different extension would otherwise leave the old
+  // file as orphaned junk in the overrides dir (not referenced from prefs, but
+  // still on disk). Strip siblings that share `soundName` but differ in ext so
+  // the folder stays tidy and `Open folder` shows only what's active.
+  let entries;
+  try { entries = fs.readdirSync(overridesDir); }
+  catch { return; }
+  for (const entry of entries) {
+    if (path.parse(entry).name !== soundName) continue;
+    if (path.extname(entry).toLowerCase() === keepExt) continue;
+    try { fs.unlinkSync(path.join(overridesDir, entry)); } catch {}
+  }
+}
+
+ipcMain.handle("settings:pick-sound-file", async (event, payload) => {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "pickSoundFile payload must be an object" };
+  }
+  const { soundName } = payload;
+  if (typeof soundName !== "string" || !soundName) {
+    return { status: "error", message: "pickSoundFile.soundName must be a non-empty string" };
+  }
+  // soundName becomes a filename stem under sound-overrides/<themeId>/ — a
+  // third-party theme could ship `sounds: { "../../foo": "x.mp3" }` and
+  // weaponise this IPC as a write-anywhere primitive. Restrict to chars that
+  // are unambiguously safe in a path segment on every supported OS.
+  if (!/^[a-zA-Z0-9_-]+$/.test(soundName)) {
+    return { status: "error", message: `pickSoundFile.soundName "${soundName}" contains invalid characters` };
+  }
+  if (!activeTheme) return { status: "error", message: "no active theme" };
+  const themeId = activeTheme._id;
+  // Only allow replacing sounds the theme actually publishes — overriding a
+  // name state.js never triggers produces a silent override with no effect.
+  if (!_isPlainObject(activeTheme.sounds) || !activeTheme.sounds[soundName]) {
+    return { status: "error", message: `sound "${soundName}" not declared by theme "${themeId}"` };
+  }
+  const overridesDir = themeLoader.getSoundOverridesDir(themeId);
+  if (!overridesDir) return { status: "error", message: "sound-overrides directory unavailable" };
+
+  const parent = _getSettingsDialogParent(event);
+  const s = SOUND_OVERRIDE_DIALOG_STRINGS[lang] || SOUND_OVERRIDE_DIALOG_STRINGS.en;
+  const extList = [...SOUND_OVERRIDE_ASSET_EXTS].map((e) => e.slice(1));
+
+  let result;
+  try {
+    result = await dialog.showOpenDialog(parent, {
+      title: s.title,
+      filters: [{ name: s.filterName, extensions: extList }],
+      properties: ["openFile"],
+    });
+  } catch (err) {
+    return { status: "error", message: `pick dialog failed: ${err && err.message}` };
+  }
+  if (result.canceled || !result.filePaths || !result.filePaths[0]) {
+    return { status: "cancel" };
+  }
+
+  const sourcePath = result.filePaths[0];
+  const ext = path.extname(sourcePath).toLowerCase();
+  if (!SOUND_OVERRIDE_ASSET_EXTS.has(ext)) {
+    return { status: "error", message: `unsupported audio extension: ${ext || "(none)"}` };
+  }
+
+  try { fs.mkdirSync(overridesDir, { recursive: true }); }
+  catch (err) { return { status: "error", message: `mkdir failed: ${err && err.message}` }; }
+
+  const destFilename = `${soundName}${ext}`;
+  const destPath = path.join(overridesDir, destFilename);
+  try {
+    fs.copyFileSync(sourcePath, destPath);
+  } catch (err) {
+    return { status: "error", message: `copy failed: ${err && err.message}` };
+  }
+  _cleanupSiblingSoundOverrides(overridesDir, soundName, ext);
+
+  const cmdResult = await _settingsController.applyCommand("setSoundOverride", {
+    themeId,
+    soundName,
+    file: destFilename,
+    originalName: path.basename(sourcePath),
+  });
+  if (!cmdResult || cmdResult.status !== "ok") {
+    return cmdResult || { status: "error", message: "setSoundOverride failed" };
+  }
+  // A missing override file may already exist in prefs from a prior run (for
+  // example, the user deleted it manually from "Open overrides folder"). If
+  // they re-pick the same basename/originalName pair, setSoundOverride() is a
+  // noop and activateTheme() does not rebuild activeTheme._soundOverrideFiles.
+  // Remember the freshly-copied file in the live theme so both UI and
+  // playback immediately reflect the restored override.
+  _rememberRuntimeSoundOverrideFile(themeId, soundName, destPath);
+  // Same-filename replacements short-circuit setSoundOverride as a noop, so
+  // activateTheme() never runs and the renderer's _audioCache keeps its old
+  // Audio object for this URL — the user would hear the previous file on
+  // every future trigger. Explicitly invalidate the cache entry for the
+  // current sound URL so the next playback reloads from disk. Harmless when
+  // activateTheme did run (renderer was reloaded, cache is already empty).
+  const newUrl = themeLoader.getSoundUrl(soundName);
+  if (newUrl) sendToRenderer("invalidate-sound-cache", newUrl);
+  return { status: "ok", file: destFilename };
+});
+
+ipcMain.handle("settings:preview-sound", (_event, payload) => {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "previewSound payload must be an object" };
+  }
+  const { soundName } = payload;
+  if (typeof soundName !== "string" || !soundName) {
+    return { status: "error", message: "previewSound.soundName must be a non-empty string" };
+  }
+  // Mirror playSound()'s guards: DND / muted users clicking Play in Settings
+  // would otherwise bypass the system they explicitly opted into (meetings,
+  // shared spaces). Return a skipped status so the UI can stay silent.
+  if (doNotDisturb) return { status: "skipped", reason: "dnd" };
+  if (soundMuted) return { status: "skipped", reason: "muted" };
+  const url = themeLoader.getSoundUrl(soundName);
+  if (!url) return { status: "error", message: "sound unavailable" };
+  // Cache-bust so the renderer's `_audioCache[url]` doesn't replay a stale
+  // Audio object after the user swapped the override file. playSound() doesn't
+  // need this because changing the override triggers activateTheme → renderer
+  // reload, which clears the cache naturally; preview runs without reload.
+  const bustedUrl = `${url}${url.includes("?") ? "&" : "?"}_t=${Date.now()}`;
+  sendToRenderer("play-sound", { url: bustedUrl, volume: soundVolume });
+  return { status: "ok" };
+});
+
+ipcMain.handle("settings:open-sound-overrides-dir", async () => {
+  if (!activeTheme) return { status: "error", message: "no active theme" };
+  const dir = themeLoader.getSoundOverridesDir(activeTheme._id);
+  if (!dir) return { status: "error", message: "sound-overrides directory unavailable" };
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const openResult = await shell.openPath(dir);
+  if (openResult) return { status: "error", message: openResult };
+  return { status: "ok", path: dir };
+});
+
+// Reaction preview goes through the renderer's click-reaction channel
+// (bypasses the state machine entirely — reactions are a renderer-owned
+// visual layer, not a logical state). Duration is clamped to the same
+// [800, 3500]ms window as state previews.
+ipcMain.handle("settings:preview-reaction", (_event, payload) => {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "previewReaction payload must be an object" };
+  }
+  const { file, durationMs } = payload;
+  if (typeof file !== "string" || !file) {
+    return { status: "error", message: "previewReaction.file must be a non-empty string" };
+  }
+  const requested = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0)
+    ? durationMs
+    : PREVIEW_HOLD_MIN_MS;
+  const clamped = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(PREVIEW_HOLD_MAX_MS, requested));
+  sendToRenderer("play-click-reaction", file, clamped);
+  return { status: "ok" };
+});
+
+const ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS = {
+  en: {
+    saveTitle: "Export Animation Overrides",
+    openTitle: "Import Animation Overrides",
+    defaultName: (ts) => `clawd-animation-overrides-${ts}.json`,
+    jsonFilter: "Clawd Animation Overrides",
+    nothingToExport: "No animation overrides to export. Override something first.",
+  },
+  zh: {
+    saveTitle: "导出动画覆盖",
+    openTitle: "导入动画覆盖",
+    defaultName: (ts) => `clawd-animation-overrides-${ts}.json`,
+    jsonFilter: "Clawd 动画覆盖",
+    nothingToExport: "没有可导出的动画覆盖。先自定义几个动画试试。",
+  },
+  ko: {
+    saveTitle: "애니메이션 덮어쓰기 내보내기",
+    openTitle: "애니메이션 덮어쓰기 가져오기",
+    defaultName: (ts) => `clawd-animation-overrides-${ts}.json`,
+    jsonFilter: "Clawd 애니메이션 덮어쓰기",
+    nothingToExport: "내보낼 애니메이션 덮어쓰기가 없습니다. 먼저 무언가를 덮어써 보세요.",
+  },
+};
+
+ipcMain.handle("settings:export-animation-overrides", async (event) => {
+  const s = ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS[lang] || ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS.en;
+  const snapshot = _settingsController.getSnapshot();
+  const overrides = (snapshot && snapshot.themeOverrides) || {};
+  const parent = _getSettingsDialogParent(event);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const defaultName = s.defaultName(stamp);
+  try {
+    const result = await dialog.showSaveDialog(parent, {
+      title: s.saveTitle,
+      defaultPath: defaultName,
+      filters: [{ name: s.jsonFilter, extensions: ["json"] }],
+    });
+    if (result.canceled || !result.filePath) {
+      return { status: "cancel" };
+    }
+    const payload = {
+      clawdAnimationOverrides: ANIMATION_OVERRIDES_EXPORT_VERSION,
+      version: ANIMATION_OVERRIDES_EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      clawdVersion: app.getVersion(),
+      themes: overrides,
+    };
+    fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), "utf8");
+    return {
+      status: "ok",
+      path: result.filePath,
+      themeCount: Object.keys(overrides).length,
+    };
+  } catch (err) {
+    console.warn("Clawd: export-animation-overrides failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || "export failed" };
+  }
+});
+
+ipcMain.handle("settings:import-animation-overrides", async (event) => {
+  const s = ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS[lang] || ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS.en;
+  const parent = _getSettingsDialogParent(event);
+  let filePath;
+  try {
+    const result = await dialog.showOpenDialog(parent, {
+      title: s.openTitle,
+      properties: ["openFile"],
+      filters: [{ name: s.jsonFilter, extensions: ["json"] }],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths.length) {
+      return { status: "cancel" };
+    }
+    filePath = result.filePaths[0];
+  } catch (err) {
+    console.warn("Clawd: import-animation-overrides dialog failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || "dialog failed" };
+  }
+
+  let parsed;
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    parsed = JSON.parse(text);
+  } catch (err) {
+    return { status: "error", message: `parse failed: ${err && err.message}` };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "error", message: "file is not a Clawd animation overrides export" };
+  }
+  const magic = parsed.clawdAnimationOverrides;
+  if (typeof magic !== "number") {
+    return { status: "error", message: "file is not a Clawd animation overrides export" };
+  }
+
+  const commandResult = await _settingsController.applyCommand("importAnimationOverrides", {
+    version: parsed.version || magic,
+    themes: parsed.themes,
+    mode: "merge",
+  });
+  if (commandResult && commandResult.status === "ok") {
+    return {
+      status: "ok",
+      path: filePath,
+      themeCount: commandResult.importedThemeCount || 0,
+    };
+  }
+  return commandResult || { status: "error", message: "import failed" };
+});
 
 // Static metadata for the Agents tab: name, eventSource, capabilities.
 // The renderer uses this (alongside the agents snapshot field) to render one
@@ -1596,6 +2529,49 @@ const _updaterCtx = {
 const _updater = require("./updater")(_updaterCtx);
 const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel } = _updater;
 
+// ── About tab IPC ──
+// Hero SVG is inlined (not file URL) because settings.html CSP is
+// `default-src 'none'` with no `object-src`/`frame-src` — <object>/<iframe>
+// loads are blocked. Inlining keeps CSP strict while letting the renderer
+// access #shake-slot to drive the click reaction.
+ipcMain.handle("settings:get-about-info", () => {
+  const heroSvgAbsPath = path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg");
+  let heroSvgContent = "";
+  try {
+    heroSvgContent = fs.readFileSync(heroSvgAbsPath, "utf8");
+  } catch (err) {
+    console.warn("Clawd: failed to read about hero SVG:", err && err.message);
+  }
+  return {
+    version: app.getVersion(),
+    repoUrl: "https://github.com/rullerzhou-afk/clawd-on-desk",
+    license: "MIT",
+    copyright: "\u00a9 2026 Ruller_Lulu",
+    authorName: "Ruller_Lulu / \u9e7f\u9e7f",
+    authorUrl: "https://github.com/rullerzhou-afk",
+    heroSvgContent,
+  };
+});
+ipcMain.handle("settings:check-for-updates", () => {
+  try {
+    checkForUpdates(true);
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", message: (err && err.message) || String(err) };
+  }
+});
+ipcMain.handle("settings:open-external", async (_event, url) => {
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+    return { status: "error", message: "Invalid URL" };
+  }
+  try {
+    await shell.openExternal(url);
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", message: (err && err.message) || String(err) };
+  }
+});
+
 // ── Settings panel window ──
 //
 // Single-instance, non-modal, system-titlebar BrowserWindow that hosts the
@@ -1603,22 +2579,193 @@ const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel
 // already wired up for the controller. The renderer subscribes to
 // settings-changed broadcasts so menu changes and panel changes stay in sync.
 let settingsWindow = null;
+let settingsShortcutRecording = null;
+const SIZE_PREVIEW_KEY_RE = /^P:\d+(?:\.\d+)?$/;
+
+function isValidSizePreviewKey(value) {
+  return typeof value === "string" && SIZE_PREVIEW_KEY_RE.test(value);
+}
+
+function beginSettingsSizePreviewProtection() {
+  settingsSizePreviewSyncFrozen = true;
+  if (!isWin) return;
+  if (
+    settingsWindow
+    && !settingsWindow.isDestroyed()
+    && typeof settingsWindow.setAlwaysOnTop === "function"
+  ) {
+    settingsWindow.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+    if (typeof settingsWindow.moveTop === "function") settingsWindow.moveTop();
+  }
+  if (
+    hitWin
+    && !hitWin.isDestroyed()
+    && typeof hitWin.setIgnoreMouseEvents === "function"
+  ) {
+    hitWin.setIgnoreMouseEvents(true);
+  }
+}
+
+function endSettingsSizePreviewProtection() {
+  settingsSizePreviewSyncFrozen = false;
+  if (!isWin) return;
+  if (
+    settingsWindow
+    && !settingsWindow.isDestroyed()
+    && typeof settingsWindow.setAlwaysOnTop === "function"
+  ) {
+    settingsWindow.setAlwaysOnTop(false);
+  }
+  if (
+    hitWin
+    && !hitWin.isDestroyed()
+    && typeof hitWin.setIgnoreMouseEvents === "function"
+  ) {
+    hitWin.setIgnoreMouseEvents(false);
+    hitWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+  }
+  reassertWinTopmost();
+  scheduleHwndRecovery();
+}
+
+const settingsSizePreviewSession = createSettingsSizePreviewSession({
+  beginProtection: async () => {
+    beginSettingsSizePreviewProtection();
+  },
+  endProtection: async () => {
+    endSettingsSizePreviewProtection();
+  },
+  applyPreview: async (sizeKey) => {
+    if (!isValidSizePreviewKey(sizeKey)) {
+      throw new Error(`invalid preview size "${sizeKey}"`);
+    }
+    if (_menu && typeof _menu.resizeWindow === "function") {
+      _menu.resizeWindow(sizeKey, { mode: "preview" });
+    }
+  },
+  commitFinal: async (sizeKey) => {
+    if (!isValidSizePreviewKey(sizeKey)) {
+      return { status: "error", message: `invalid preview size "${sizeKey}"` };
+    }
+    return _settingsController.applyCommand("resizePet", sizeKey);
+  },
+});
+
+function stopShortcutRecording() {
+  if (!settingsShortcutRecording) return;
+  if (
+    settingsWindow
+    && !settingsWindow.isDestroyed()
+    && settingsWindow.webContents
+    && !settingsWindow.webContents.isDestroyed()
+  ) {
+    try {
+      settingsWindow.webContents.removeListener(
+        "before-input-event",
+        settingsShortcutRecording.listener
+      );
+    } catch {}
+  }
+
+  // Restore the temporarily unregistered accelerator if prefs still hold the
+  // same value (i.e. the user cancelled or pressed the same combo again so
+  // the command was a noop). If prefs changed, applyPersistentShortcutChange
+  // has already registered the new value — don't double-register.
+  const { actionId, tempUnregisteredAccel } = settingsShortcutRecording;
+  if (tempUnregisteredAccel) {
+    const snapshot = _settingsController.getSnapshot();
+    const current = snapshot && snapshot.shortcuts && snapshot.shortcuts[actionId];
+    if (current === tempUnregisteredAccel) {
+      const handler = actionId === "togglePet" ? togglePetVisibility : null;
+      if (typeof handler === "function") {
+        try { globalShortcut.register(tempUnregisteredAccel, handler); } catch {}
+      }
+    }
+  }
+
+  settingsShortcutRecording = null;
+}
+
+function startShortcutRecording(actionId) {
+  if (!SHORTCUT_ACTIONS[actionId]) {
+    return { status: "error", message: "unknown shortcut action" };
+  }
+  if (
+    !settingsWindow
+    || settingsWindow.isDestroyed()
+    || !settingsWindow.webContents
+    || settingsWindow.webContents.isDestroyed()
+  ) {
+    return { status: "error", message: "settings window unavailable" };
+  }
+
+  stopShortcutRecording();
+
+  // Temporarily unregister this action's current persistent globalShortcut so
+  // the user pressing their old combo doesn't fire the real handler (e.g.
+  // hiding the pet) mid-recording. Contextual shortcuts (permission hotkeys)
+  // manage their own lifecycle via syncPermissionShortcuts, skip them.
+  let tempUnregisteredAccel = null;
+  const meta = SHORTCUT_ACTIONS[actionId];
+  if (meta && meta.persistent) {
+    const snapshot = _settingsController.getSnapshot();
+    const current = snapshot && snapshot.shortcuts && snapshot.shortcuts[actionId];
+    if (current) {
+      try {
+        if (globalShortcut.isRegistered(current)) {
+          globalShortcut.unregister(current);
+          tempUnregisteredAccel = current;
+        }
+      } catch {}
+    }
+  }
+
+  const listener = (event, input) => {
+    if (!input || input.type !== "keyDown") return;
+    event.preventDefault();
+    settingsWindow.webContents.send("shortcut-record-key", {
+      actionId,
+      key: input.key,
+      code: input.code,
+      altKey: !!input.alt,
+      ctrlKey: !!input.control,
+      metaKey: !!input.meta,
+      shiftKey: !!input.shift,
+    });
+  };
+  settingsWindow.webContents.on("before-input-event", listener);
+  settingsShortcutRecording = { actionId, listener, tempUnregisteredAccel };
+  return { status: "ok" };
+}
 
 function getSettingsWindowIcon() {
-  // Don't pass an icon on macOS — the system uses the .app bundle icon.
-  if (isMac) return undefined;
-  if (isWin) {
-    // Packaged build: extraResources puts icon.ico at process.resourcesPath.
-    // Dev: read it from assets/. The files[] glob in package.json doesn't
-    // include assets/icon.ico, so don't try to load it from __dirname/.. in
-    // a packaged build — that path doesn't exist inside app.asar.
-    return app.isPackaged
-      ? path.join(process.resourcesPath, "icon.ico")
-      : path.join(__dirname, "..", "assets", "icon.ico");
+  return getSettingsWindowIconPath({
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appDir: path.join(__dirname, ".."),
+    existsSync: fs.existsSync,
+  });
+}
+
+function getSettingsWindowTaskbarDetails() {
+  return getSettingsWindowTaskbarDetailsHelper({
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appDir: path.join(__dirname, ".."),
+    execPath: process.execPath,
+    appPath: app.getAppPath(),
+    existsSync: fs.existsSync,
+  });
+}
+
+function openSettingsWindowWhenReady() {
+  if (app.isReady()) {
+    openSettingsWindow();
+    return;
   }
-  // Linux: build config points at assets/icons/, but those aren't shipped in
-  // files[]. Skip the icon — the .desktop file (deb/AppImage) provides one.
-  return undefined;
+  app.once("ready", openSettingsWindow);
 }
 
 function openSettingsWindow() {
@@ -1642,7 +2789,7 @@ function openSettingsWindow() {
     maximizable: true,
     skipTaskbar: false,
     alwaysOnTop: false,
-    title: "Clawd Settings",
+    title: SETTINGS_WINDOW_TITLE,
     // Match settings.html's dark-mode palette to avoid a white flash before
     // CSS media query kicks in. Hex values must stay in sync with the
     // `--bg` CSS variable in settings.html for each theme.
@@ -1655,6 +2802,12 @@ function openSettingsWindow() {
   };
   if (iconPath) opts.icon = iconPath;
   settingsWindow = new BrowserWindow(opts);
+  if (isWin && typeof settingsWindow.setAppDetails === "function") {
+    const taskbarDetails = getSettingsWindowTaskbarDetails();
+    if (taskbarDetails && taskbarDetails.appIconPath) {
+      settingsWindow.setAppDetails(taskbarDetails);
+    }
+  }
   settingsWindow.setMenuBarVisibility(false);
   settingsWindow.loadFile(path.join(__dirname, "settings.html"));
   settingsWindow.once("ready-to-show", () => {
@@ -1662,6 +2815,8 @@ function openSettingsWindow() {
     settingsWindow.focus();
   });
   settingsWindow.on("closed", () => {
+    stopShortcutRecording();
+    void settingsSizePreviewSession.cleanup();
     settingsWindow = null;
   });
 }
@@ -1670,7 +2825,7 @@ function createWindow() {
   // Read everything from the settings controller. The mirror caches above
   // (lang/showTray/etc.) were already initialized at module-load time, so
   // here we just need the position/mini fields plus the legacy size migration.
-  const prefs = _settingsController.getSnapshot();
+  let prefs = _settingsController.getSnapshot();
   // Legacy S/M/L → P:N migration. Only kicks in for prefs files that haven't
   // been touched since v0; new files always store the proportional form.
   if (SIZES[prefs.size]) {
@@ -1679,6 +2834,7 @@ function createWindow() {
     const ratio = Math.round(px / wa.width * 100);
     const migrated = `P:${Math.max(1, Math.min(75, ratio))}`;
     _settingsController.applyUpdate("size", migrated); // subscriber updates currentSize mirror
+    prefs = _settingsController.getSnapshot();
   }
   // macOS: apply dock visibility (default visible — but persisted state wins).
   if (isMac) {
@@ -1689,33 +2845,79 @@ function createWindow() {
     getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA,
     getNearestWorkArea,
   );
-  const size = getCurrentPixelSize(launchSizingWorkArea);
+  // keepSizeAcrossDisplays preserves the last realized pixel size across restarts.
+  const proportionalSize = getCurrentPixelSize(launchSizingWorkArea);
+  const size = getLaunchPixelSize(prefs, proportionalSize);
 
   // Restore saved position, or default to bottom-right of primary display.
   // Prefs file always exists in the new architecture (defaults are hydrated
   // by prefs.load()), so the "no prefs" branch from the legacy code is gone —
   // a fresh install gets x=0, y=0 from defaults, and we treat that as "place
   // bottom-right" via the explicit zero check below.
-  let startX, startY;
+  let startBounds;
   if (prefs.miniMode) {
-    const miniPos = _mini.restoreFromPrefs(prefs, size);
-    startX = miniPos.x;
-    startY = miniPos.y;
+    startBounds = _mini.restoreFromPrefs(prefs, size);
   } else if (prefs.positionSaved) {
-    const clamped = clampToScreen(prefs.x, prefs.y, size.width, size.height);
-    startX = clamped.x;
-    startY = clamped.y;
+    startBounds = { x: prefs.x, y: prefs.y, width: size.width, height: size.height };
   } else {
     const workArea = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
-    startX = workArea.x + workArea.width - size.width - 20;
-    startY = workArea.y + workArea.height - size.height - 20;
+    startBounds = {
+      x: workArea.x + workArea.width - size.width - 20,
+      y: workArea.y + workArea.height - size.height - 20,
+      width: size.width,
+      height: size.height,
+    };
   }
+  // Display-snapshot gate: if the monitor the pet was last on is still here
+  // (same bounds or matching display.id), we trust the saved position even if
+  // a generic clamp would otherwise nudge it. Only when the monitor is gone
+  // — unplugged external display, RDP session ended, laptop closed with pet
+  // on the external, etc. — do we regularize to the current topology.
+  //
+  // Visibility backstop: even with a matching display, if the saved center
+  // landed outside every current workArea (manual prefs edits, exotic multi-
+  // monitor rearrangements where bounds matched but the pet's coordinates
+  // ended up in no-man's-land), fall back to regularize so the user isn't
+  // greeted by an invisible pet. Normal "pet partially off-screen" cases
+  // pass this check because the midpoint still lands inside a workArea.
+  //
+  // Legacy prefs (positionDisplay === null) fall through to the clamp-delta
+  // check, preserving v0.6.0 behavior for users who haven't re-saved yet.
+  const allDisplays = screen.getAllDisplays();
+  const savedDisplayStillAttached = !!findMatchingDisplay(
+    prefs.positionDisplay,
+    allDisplays
+  );
+  const savedCenterVisible = isPointInAnyWorkArea(
+    startBounds.x + startBounds.width / 2,
+    startBounds.y + startBounds.height / 2,
+    allDisplays
+  );
+  const startupNeedsRegularize = prefs.positionSaved
+    && !prefs.miniMode
+    && (
+      hasStoredPositionThemeMismatch(prefs)
+      || (
+        !(savedDisplayStillAttached && savedCenterVisible)
+        && needsFinalClampAdjustment(startBounds, size, clampToScreenVisual)
+      )
+    );
+  const startupRegularizedBounds = startupNeedsRegularize
+    ? computeFinalDragBounds(startBounds, size, clampToScreenVisual)
+    : null;
+  const initialVirtualBounds = startupRegularizedBounds || startBounds;
+  const initialWorkArea = getNearestWorkArea(
+    initialVirtualBounds.x + initialVirtualBounds.width / 2,
+    initialVirtualBounds.y + initialVirtualBounds.height / 2
+  );
+  const initialMaterialized = materializeVirtualBounds(initialVirtualBounds, initialWorkArea);
+  const initialWindowBounds = (initialMaterialized && initialMaterialized.bounds) || initialVirtualBounds;
 
   win = new BrowserWindow({
     width: size.width,
     height: size.height,
-    x: startX,
-    y: startY,
+    x: initialWindowBounds.x,
+    y: initialWindowBounds.y,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -1759,6 +2961,7 @@ function createWindow() {
     win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
   }
   win.loadFile(path.join(__dirname, "index.html"));
+  applyPetWindowBounds(initialVirtualBounds);
   win.showInactive();
   // Linux WMs may reset skipTaskbar after showInactive — re-apply explicitly
   if (isLinux) win.setSkipTaskbar(true);
@@ -1782,7 +2985,7 @@ function createWindow() {
 
   // ── Create input window (hitWin) — small rect over hitbox, receives all pointer events ──
   {
-    const initBounds = win.getBounds();
+    const initBounds = getPetWindowBounds();
     const initHit = getHitRectScreen(initBounds);
     const hx = Math.round(initHit.left), hy = Math.round(initHit.top);
     const hw = Math.round(initHit.right - initHit.left);
@@ -1827,9 +3030,9 @@ function createWindow() {
 
     // Event-level safety net for position sync
     const syncFloatingWindows = () => {
+      if (settingsSizePreviewSyncFrozen) return;
       syncHitWin();
-      if (bubbleFollowPet) repositionFloatingBubbles();
-      else repositionUpdateBubble();
+      repositionFloatingBubbles();
     };
     win.on("move", syncFloatingWindows);
     win.on("resize", syncFloatingWindows);
@@ -1850,18 +3053,7 @@ function createWindow() {
 
   ipcMain.on("show-context-menu", showPetContextMenu);
 
-  ipcMain.on("move-window-by", (event, dx, dy) => {
-    if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
-    const { x, y } = win.getBounds();
-    const size = getCurrentPixelSize();
-    // During drag: allow free movement across screens, only prevent
-    // the pet from going completely off-screen (keep 25% visible).
-    const newX = x + dx, newY = y + dy;
-    const looseClamped = looseClampToDisplays(newX, newY, size.width, size.height);
-    win.setBounds({ ...looseClamped, width: size.width, height: size.height });
-    syncHitWin();
-    if (bubbleFollowPet) repositionFloatingBubbles();
-  });
+  ipcMain.on("drag-move", () => moveWindowForDrag());
 
   ipcMain.on("pause-cursor-polling", () => { idlePaused = true; });
   ipcMain.on("resume-from-reaction", () => {
@@ -1872,7 +3064,13 @@ function createWindow() {
 
   ipcMain.on("drag-lock", (event, locked) => {
     dragLocked = !!locked;
-    if (locked) mouseOverPet = true;
+    if (locked) {
+      mouseOverPet = true;
+      beginDragSnapshot();
+    } else {
+      clearDragSnapshot();
+      syncHitWin();
+    }
   });
 
   // Reaction relay: hitWin → main → renderWin
@@ -1883,18 +3081,30 @@ function createWindow() {
   });
 
   ipcMain.on("drag-end", () => {
-    if (!_mini.getMiniMode() && !_mini.getMiniTransitioning()) {
-      checkMiniModeSnap();
-      // After drag, clamp to the nearest screen (loose clamp during drag allows cross-screen).
-      // In proportional mode, also recalculate size for the landing display.
-      if (win && !win.isDestroyed()) {
-        const size = getCurrentPixelSize();
-        const { x, y } = win.getBounds();
-        const clamped = clampToScreen(x, y, size.width, size.height);
-        win.setBounds({ ...clamped, width: size.width, height: size.height });
-        syncHitWin();
-        repositionUpdateBubble();
+    try {
+      if (!_mini.getMiniMode() && !_mini.getMiniTransitioning()) {
+        checkMiniModeSnap();
+        if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
+        // After drag, clamp to the nearest screen (loose clamp during drag allows cross-screen).
+        // In proportional mode, also recalculate size for the landing display —
+        // unless the user asked to keep the pixel size across displays, in which
+        // case we leave the current window size alone.
+        if (win && !win.isDestroyed()) {
+          const virtualBounds = getPetWindowBounds();
+          const size = keepSizeAcrossDisplaysCached
+            ? { width: virtualBounds.width, height: virtualBounds.height }
+            : getCurrentPixelSize();
+          const clamped = computeFinalDragBounds(virtualBounds, size, clampToScreenVisual);
+          if (clamped) applyPetWindowBounds(clamped);
+          reassertWinTopmost();
+          scheduleHwndRecovery();
+          syncHitWin();
+          repositionFloatingBubbles();
+        }
       }
+    } finally {
+      dragLocked = false;
+      clearDragSnapshot();
     }
   });
 
@@ -1935,6 +3145,7 @@ function createWindow() {
   // Also handles crash recovery (render-process-gone → reload)
   win.webContents.on("did-finish-load", () => {
     sendToRenderer("theme-config", themeLoader.getRendererConfig());
+    sendToRenderer("viewport-offset", viewportOffsetY);
     if (themeReloadInProgress) return;
     syncRendererStateAfterLoad();
   });
@@ -1952,40 +3163,49 @@ function createWindow() {
   startTopmostWatchdog();
 
   // ── Display change: re-clamp window to prevent off-screen ──
-  // In proportional mode, also recalculate size based on the new work area.
+  // In proportional mode, also recalculate size based on the new work area,
+  // unless keepSizeAcrossDisplays is on — then we preserve the current window
+  // size and only re-clamp the position.
   screen.on("display-metrics-changed", () => {
     reapplyMacVisibility();
     if (!win || win.isDestroyed()) return;
+    if (_mini.getMiniTransitioning()) return;
     if (_mini.getMiniMode()) {
       _mini.handleDisplayChange();
       return;
     }
-    const size = getCurrentPixelSize();
-    const { x, y } = win.getBounds();
-    const clamped = clampToScreen(x, y, size.width, size.height);
-    if (isProportionalMode() || clamped.x !== x || clamped.y !== y) {
-      win.setBounds({ ...clamped, width: size.width, height: size.height });
+    const current = getPetWindowBounds();
+    const size = keepSizeAcrossDisplaysCached
+      ? { width: current.width, height: current.height }
+      : getCurrentPixelSize();
+    const clamped = clampToScreenVisual(current.x, current.y, size.width, size.height);
+    const proportionalRecalc = isProportionalMode() && !keepSizeAcrossDisplaysCached;
+    if (proportionalRecalc || clamped.x !== current.x || clamped.y !== current.y) {
+      applyPetWindowBounds({ ...clamped, width: size.width, height: size.height });
       syncHitWin();
-      repositionUpdateBubble();
+      repositionFloatingBubbles();
     }
   });
   screen.on("display-removed", () => {
     reapplyMacVisibility();
     if (!win || win.isDestroyed()) return;
+    if (_mini.getMiniTransitioning()) return;
     if (_mini.getMiniMode()) {
       exitMiniMode();
       return;
     }
-    const size = getCurrentPixelSize();
-    const { x, y } = win.getBounds();
-    const clamped = clampToScreen(x, y, size.width, size.height);
-    win.setBounds({ ...clamped, width: size.width, height: size.height });
+    const current = getPetWindowBounds();
+    const size = keepSizeAcrossDisplaysCached
+      ? { width: current.width, height: current.height }
+      : getCurrentPixelSize();
+    const clamped = clampToScreenVisual(current.x, current.y, size.width, size.height);
+    applyPetWindowBounds({ ...clamped, width: size.width, height: size.height });
     syncHitWin();
-    repositionUpdateBubble();
+    repositionFloatingBubbles();
   });
   screen.on("display-added", () => {
     reapplyMacVisibility();
-    repositionUpdateBubble();
+    repositionFloatingBubbles();
   });
 }
 
@@ -2005,22 +3225,68 @@ function getNearestWorkArea(cx, cy) {
   return findNearestWorkArea(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), cx, cy);
 }
 
+function getNearestDisplayBottomInset(cx, cy) {
+  const point = { x: Math.round(cx), y: Math.round(cy) };
+  let display = null;
+  try {
+    display = screen.getDisplayNearestPoint(point);
+  } catch {}
+  if (!display || !display.bounds || !display.workArea) {
+    try {
+      display = screen.getPrimaryDisplay();
+    } catch {}
+  }
+  return getDisplayInsets(display).bottom;
+}
+
 // Loose clamp used during drag: union of all display work areas as the boundary,
 // so the pet can freely cross between screens. Only prevents going fully off-screen.
-function looseClampToDisplays(x, y, w, h) {
-  return computeLooseClamp(screen.getAllDisplays(), getPrimaryWorkAreaSafe(), x, y, w, h);
+function looseClampPetToDisplays(x, y, w, h) {
+  const margins = getVisibleContentMargins({ x, y, width: w, height: h });
+  const bottomInset = getNearestDisplayBottomInset(x + w / 2, y + h / 2);
+  return computeLooseClamp(
+    screen.getAllDisplays(),
+    getPrimaryWorkAreaSafe(),
+    x,
+    y,
+    w,
+    h,
+    getLooseDragMargins({
+      width: w,
+      height: h,
+      visibleMargins: margins,
+      allowEdgePinning: allowEdgePinningCached,
+      bottomInset,
+    })
+  );
+}
+
+function clampToScreenVisual(x, y, w, h, options = {}) {
+  const margins = getVisibleContentMargins(
+    { x, y, width: w, height: h },
+    options
+  );
+  const nearest = getNearestWorkArea(x + w / 2, y + h / 2);
+  const bottomInset = getNearestDisplayBottomInset(x + w / 2, y + h / 2);
+  const mLeft  = Math.round(w * 0.25);
+  const mRight = Math.round(w * 0.25);
+  const clampMargins = getRestClampMargins({
+    height: h,
+    visibleMargins: margins,
+    allowEdgePinning: allowEdgePinningCached,
+    bottomInset,
+  });
+  return {
+    x: Math.max(nearest.x - mLeft, Math.min(x, nearest.x + nearest.width - w + mRight)),
+    y: Math.max(
+      nearest.y - clampMargins.top,
+      Math.min(y, nearest.y + nearest.height - h + clampMargins.bottom)
+    ),
+  };
 }
 
 function clampToScreen(x, y, w, h) {
-  const nearest = getNearestWorkArea(x + w / 2, y + h / 2);
-  const mLeft  = Math.round(w * 0.25);
-  const mRight = Math.round(w * 0.25);
-  const mTop   = Math.round(h * 0.6);
-  const mBot   = Math.round(h * 0.04);
-  return {
-    x: Math.max(nearest.x - mLeft, Math.min(x, nearest.x + nearest.width - w + mRight)),
-    y: Math.max(nearest.y - mTop,  Math.min(y, nearest.y + nearest.height - h + mBot)),
-  };
+  return clampToScreenVisual(x, y, w, h);
 }
 
 // ── Mini Mode — initialized here after state module ──
@@ -2030,8 +3296,10 @@ const _miniCtx = {
   get currentSize() { return currentSize; },
   get doNotDisturb() { return doNotDisturb; },
   set doNotDisturb(v) { doNotDisturb = v; },
+  get currentState() { return _state.getCurrentState(); },
   SIZES,
   getCurrentPixelSize,
+  getEffectiveCurrentPixelSize,
   isProportionalMode,
   sendToRenderer,
   sendToHitWin,
@@ -2040,13 +3308,24 @@ const _miniCtx = {
   resolveDisplayState,
   getSvgOverride,
   stopWakePoll,
-  clampToScreen,
+  clampToScreenVisual,
   getNearestWorkArea,
+  getPetWindowBounds,
+  applyPetWindowBounds,
+  applyPetWindowPosition,
+  setViewportOffsetY,
   get bubbleFollowPet() { return bubbleFollowPet; },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionFloatingBubbles(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
+  getAnimationAssetCycleMs: (file) => {
+    if (!file) return null;
+    const probe = _buildAnimationAssetProbe(file);
+    return Number.isFinite(probe && probe.assetCycleMs) && probe.assetCycleMs > 0
+      ? probe.assetCycleMs
+      : null;
+  },
 };
 const _mini = require("./mini")(_miniCtx);
 const { enterMiniMode, exitMiniMode, enterMiniViaMenu, miniPeekIn, miniPeekOut,
@@ -2098,6 +3377,7 @@ function activateTheme(themeId, variantId) {
     clearTimeout(animationOverridePreviewTimer);
     animationOverridePreviewTimer = null;
   }
+  let preservedVirtualBounds = getPetWindowBounds();
 
   _state.cleanup();
   _tick.cleanup();
@@ -2107,6 +3387,7 @@ function activateTheme(themeId, variantId) {
   // ⚠️ Don't clear displayHint — semantic tokens resolve through new theme's map
 
   if (_mini.getMiniMode() && !newTheme.miniMode.supported) {
+    preservedVirtualBounds = null;
     _mini.exitMiniMode();
   }
 
@@ -2124,10 +3405,20 @@ function activateTheme(themeId, variantId) {
   const onReady = () => {
     if (++ready < 2) return;
     themeReloadInProgress = false;
+    if (preservedVirtualBounds && !_mini.getMiniTransitioning()) {
+      applyPetWindowBounds(preservedVirtualBounds);
+      const clamped = computeFinalDragBounds(
+        getPetWindowBounds(),
+        { width: preservedVirtualBounds.width, height: preservedVirtualBounds.height },
+        clampToScreenVisual
+      );
+      if (clamped) applyPetWindowBounds(clamped);
+    }
     syncHitStateAfterLoad();
     syncRendererStateAfterLoad({ includeStartupRecovery: false });
     syncHitWin();
     startMainTick();
+    _runPendingPostReloadTasks();
   };
   win.webContents.once("did-finish-load", onReady);
   hitWin.webContents.once("did-finish-load", onReady);
@@ -2224,7 +3515,7 @@ if (!gotTheLock) {
   // Another instance is already running — quit silently
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, commandLine) => {
     if (win) {
       win.showInactive();
       if (isLinux) win.setSkipTaskbar(true);
@@ -2232,6 +3523,9 @@ if (!gotTheLock) {
     if (hitWin && !hitWin.isDestroyed()) {
       hitWin.showInactive();
       if (isLinux) hitWin.setSkipTaskbar(true);
+    }
+    if (shouldOpenSettingsWindowFromArgv(commandLine)) {
+      openSettingsWindowWhenReady();
     }
     reapplyMacVisibility();
   });
@@ -2253,9 +3547,12 @@ if (!gotTheLock) {
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
     sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
     createWindow();
+    if (shouldOpenSettingsWindowFromArgv(process.argv)) {
+      openSettingsWindow();
+    }
 
-    // Register global shortcut for toggling pet visibility
-    registerToggleShortcut();
+    // Register persistent global shortcuts from the validated prefs snapshot.
+    registerPersistentShortcutsFromSettings();
 
     // Construct log monitors. We always instantiate them so toggling the
     // agent on/off later can call start()/stop() without paying the require
@@ -2267,7 +3564,11 @@ if (!gotTheLock) {
       const codexAgent = require("../agents/codex");
       _codexMonitor = new CodexLogMonitor(codexAgent, (sid, state, event, extra) => {
         if (state === "codex-permission") {
-          updateSession(sid, "notification", event, null, extra.cwd, null, null, null, "codex");
+          updateSession(sid, "notification", event, {
+            cwd: extra.cwd,
+            agentId: "codex",
+            sessionTitle: extra.sessionTitle,
+          });
           showCodexNotifyBubble({
             sessionId: sid,
             command: extra.permissionDetail?.command || "",
@@ -2275,7 +3576,11 @@ if (!gotTheLock) {
           return;
         }
         clearCodexNotifyBubbles(sid);
-        updateSession(sid, state, event, null, extra.cwd, null, null, null, "codex");
+        updateSession(sid, state, event, {
+          cwd: extra.cwd,
+          agentId: "codex",
+          sessionTitle: extra.sessionTitle,
+        });
       });
       if (_isAgentEnabled(_settingsController.getSnapshot(), "codex")) {
         _codexMonitor.start();
@@ -2288,7 +3593,10 @@ if (!gotTheLock) {
       const GeminiLogMonitor = require("../agents/gemini-log-monitor");
       const geminiAgent = require("../agents/gemini-cli");
       _geminiMonitor = new GeminiLogMonitor(geminiAgent, (sid, state, event, extra) => {
-        updateSession(sid, state, event, null, extra.cwd, null, null, null, "gemini-cli");
+        updateSession(sid, state, event, {
+          cwd: extra.cwd,
+          agentId: "gemini-cli",
+        });
       });
       if (_isAgentEnabled(_settingsController.getSnapshot(), "gemini-cli")) {
         _geminiMonitor.start();
@@ -2309,8 +3617,8 @@ if (!gotTheLock) {
   app.on("before-quit", () => {
     isQuitting = true;
     flushRuntimeStateToPrefs();
-    unregisterToggleShortcut();
     globalShortcut.unregisterAll();
+    void settingsSizePreviewSession.cleanup();
     _perm.cleanup();
     _server.cleanup();
     _updateBubble.cleanup();

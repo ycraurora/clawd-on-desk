@@ -24,13 +24,20 @@ function makeFixture(themes) {
   const userData = path.join(tmp, "userData");
   fs.mkdirSync(path.join(userData, "themes"), { recursive: true });
 
-  for (const { id, builtin, json } of themes) {
+  for (const { id, builtin, json, assets } of themes) {
     const base = builtin
       ? path.join(tmp, "themes", id)
       : path.join(userData, "themes", id);
     fs.mkdirSync(base, { recursive: true });
     if (json !== undefined) {
       fs.writeFileSync(path.join(base, "theme.json"), JSON.stringify(json), "utf8");
+    }
+    if (assets && typeof assets === "object") {
+      const assetsDir = path.join(base, "assets");
+      fs.mkdirSync(assetsDir, { recursive: true });
+      for (const [filename, content] of Object.entries(assets)) {
+        fs.writeFileSync(path.join(assetsDir, filename), content, "utf8");
+      }
     }
   }
   themeLoader.init(appDir, userData);
@@ -164,6 +171,76 @@ describe("theme-loader getThemeMetadata", () => {
   });
 });
 
+describe("theme-loader preview sound selection", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      { id: "clawd", builtin: true, json: validThemeJson({ name: "Clawd" }) },
+      {
+        id: "preview-theme",
+        builtin: false,
+        json: validThemeJson({
+          name: "Preview Theme",
+          sounds: {
+            confirm: "preview-confirm.mp3",
+          },
+        }),
+      },
+      {
+        id: "fallback-theme",
+        builtin: false,
+        json: validThemeJson({
+          name: "Fallback Theme",
+          sounds: {
+            confirm: null,
+          },
+        }),
+      },
+      {
+        id: "silent-theme",
+        builtin: false,
+        json: validThemeJson({
+          name: "Silent Theme",
+          sounds: {
+            confirm: null,
+            complete: null,
+          },
+        }),
+      },
+    ]);
+
+    fs.writeFileSync(path.join(fixture.tmp, "assets", "sounds", "complete.mp3"), "complete", "utf8");
+
+    for (const themeId of ["preview-theme", "fallback-theme", "silent-theme"]) {
+      fs.mkdirSync(path.join(fixture.tmp, "userData", "themes", themeId, "assets"), { recursive: true });
+    }
+
+    const previewSoundsDir = path.join(fixture.tmp, "userData", "themes", "preview-theme", "sounds");
+    fs.mkdirSync(previewSoundsDir, { recursive: true });
+    fs.writeFileSync(path.join(previewSoundsDir, "preview-confirm.mp3"), "confirm", "utf8");
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("prefers confirm for settings preview when available", () => {
+    themeLoader.loadTheme("preview-theme", { strict: true });
+    const previewUrl = themeLoader.getPreviewSoundUrl();
+    assert.ok(previewUrl, "preview URL expected");
+    assert.ok(previewUrl.includes("preview-confirm.mp3"));
+  });
+
+  it("falls back to complete when confirm is unavailable", () => {
+    themeLoader.loadTheme("fallback-theme", { strict: true });
+    const previewUrl = themeLoader.getPreviewSoundUrl();
+    assert.ok(previewUrl, "preview URL expected");
+    assert.ok(previewUrl.includes("complete.mp3"));
+  });
+
+  it("returns null when neither confirm nor complete is available", () => {
+    themeLoader.loadTheme("silent-theme", { strict: true });
+    assert.strictEqual(themeLoader.getPreviewSoundUrl(), null);
+  });
+});
+
 describe("theme-loader discovery", () => {
   let fixture;
   before(() => {
@@ -193,6 +270,55 @@ describe("theme-loader discovery", () => {
 
     const listed = themeLoader.listThemesWithMetadata().map((theme) => theme.id);
     assert.deepStrictEqual(listed.sort(), ["clawd", "user-cat"]);
+  });
+});
+
+describe("theme-loader external SVG sanitization", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      {
+        id: "clawd",
+        builtin: true,
+        json: validThemeJson({ name: "Clawd" }),
+      },
+      {
+        id: "unsafe-inline-style",
+        builtin: false,
+        json: validThemeJson({ name: "Unsafe Inline Style" }),
+        assets: {
+          "pattern.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+          "idle.svg": [
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">",
+            "  <rect",
+            "    style=\"fill:url(pattern.svg#grad);stroke:url(#allowed);filter:url(https://example.com/filter.svg#p)\"",
+            "    fill=\"url(pattern.svg#fill)\"",
+            "    mask=\"url(//bad.example/fill.svg#p)\"",
+            "    width=\"10\" height=\"10\"/>",
+            "  <use href=\"pattern.svg#shape\"/>",
+            "  <use href=\"//attacker.com/x.svg#p\"/>",
+            "  <image href=\"..%2F..%2Fetc%2Fpasswd\"/>",
+            "</svg>",
+          ].join(""),
+        },
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("strips unsafe href/url references while preserving safe local ones", () => {
+    themeLoader.loadTheme("unsafe-inline-style", { strict: true });
+    const sanitizedPath = themeLoader.getAssetPath("idle.svg");
+    const sanitized = fs.readFileSync(sanitizedPath, "utf8");
+
+    assert.ok(sanitized.includes("fill:url(pattern.svg#grad)"), "safe relative CSS url should survive");
+    assert.ok(sanitized.includes("stroke:url(#allowed)"), "internal fragment url should survive");
+    assert.ok(sanitized.includes("fill=\"url(pattern.svg#fill)\""), "safe relative presentation attr should survive");
+    assert.ok(sanitized.includes("href=\"pattern.svg#shape\""), "safe relative href should survive");
+    assert.ok(!sanitized.includes("https://example.com"), "inline style external url should be removed");
+    assert.ok(!sanitized.includes("//bad.example"), "protocol-relative presentation attr should be removed");
+    assert.ok(!sanitized.includes("//attacker.com"), "protocol-relative href should be removed");
+    assert.ok(!sanitized.includes("..%2F..%2Fetc%2Fpasswd"), "encoded traversal href should be removed");
   });
 });
 

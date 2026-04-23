@@ -77,12 +77,22 @@ describe("updateRegistry pure-data validators", () => {
   it("function-form boolean fields reject non-booleans", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
-      "soundMuted", "bubbleFollowPet", "hideBubbles",
+      "soundMuted", "bubbleFollowPet", "hideBubbles", "allowEdgePinning", "keepSizeAcrossDisplays",
       "showSessionId", "miniMode", "openAtLoginHydrated",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
       assert.strictEqual(updateRegistry[key]("yes", deps).status, "error", `${key}("yes")`);
+    }
+  });
+
+  it("saved pixel sizes require non-negative finite numbers", () => {
+    const deps = { snapshot: baseSnapshot };
+    for (const key of ["savedPixelWidth", "savedPixelHeight"]) {
+      assert.strictEqual(updateRegistry[key](0, deps).status, "ok", `${key}(0)`);
+      assert.strictEqual(updateRegistry[key](286, deps).status, "ok", `${key}(286)`);
+      assert.strictEqual(updateRegistry[key](-1, deps).status, "error", `${key}(-1)`);
+      assert.strictEqual(updateRegistry[key](Infinity, deps).status, "error", `${key}(Infinity)`);
     }
   });
 
@@ -169,6 +179,18 @@ describe("updateRegistry pure-data validators", () => {
     assert.strictEqual(updateRegistry.agents([], deps).status, "error");
     assert.strictEqual(updateRegistry.themeOverrides({}, deps).status, "ok");
     assert.strictEqual(updateRegistry.themeOverrides("nope", deps).status, "error");
+  });
+
+  it("shortcuts commit validator accepts only known keys with string/null values", () => {
+    const entry = updateRegistry.shortcuts;
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(typeof entry, "object");
+    assert.strictEqual(entry.validate({
+      togglePet: "CommandOrControl+Shift+Alt+C",
+      permissionAllow: null,
+    }, deps).status, "ok");
+    assert.strictEqual(entry.validate({ bogus: "Ctrl+K" }, deps).status, "error");
+    assert.strictEqual(entry.validate({ togglePet: 42 }, deps).status, "error");
   });
 });
 
@@ -332,6 +354,250 @@ describe("hook commands", () => {
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
+  });
+});
+
+describe("shortcut commands", () => {
+  function makeShortcutDeps(overrides = {}) {
+    const snapshot = overrides.snapshot || prefs.getDefaults();
+    const registered = new Set(overrides.registered || []);
+    const failures = new Map(Object.entries(overrides.failures || {}));
+    const calls = { register: [], unregister: [] };
+    const globalShortcut = {
+      register(accelerator, handler) {
+        calls.register.push({ accelerator, handler });
+        if (overrides.failRegister && overrides.failRegister.has(accelerator)) {
+          return false;
+        }
+        registered.add(accelerator);
+        return true;
+      },
+      unregister(accelerator) {
+        calls.unregister.push(accelerator);
+        if (overrides.throwOnUnregister === accelerator) {
+          throw new Error("unregister boom");
+        }
+        if (overrides.stubbornUnregister === accelerator) return;
+        registered.delete(accelerator);
+      },
+      isRegistered(accelerator) {
+        return registered.has(accelerator);
+      },
+    };
+    return {
+      deps: {
+        snapshot,
+        globalShortcut,
+        shortcutHandlers: {
+          togglePet: () => {},
+          permissionAllow: () => {},
+          permissionDeny: () => {},
+        },
+        getShortcutFailure: (actionId) => failures.get(actionId) || null,
+        clearShortcutFailure: (actionId) => failures.delete(actionId),
+      },
+      calls,
+      registered,
+      failures,
+    };
+  }
+
+  it("registerShortcut commits persistent shortcuts after register-new/unregister-old", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+      },
+    });
+    const { deps, calls, registered } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+    });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: "Ctrl+K",
+    }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.shortcuts, {
+      ...snapshot.shortcuts,
+      togglePet: "CommandOrControl+K",
+    });
+    assert.deepStrictEqual(calls.register.map((c) => c.accelerator), ["CommandOrControl+K"]);
+    assert.deepStrictEqual(calls.unregister, ["CommandOrControl+J"]);
+    assert.deepStrictEqual([...registered].sort(), ["CommandOrControl+K"]);
+  });
+
+  it("registerShortcut rejects internal conflicts before touching globalShortcut", () => {
+    const snapshot = prefs.getDefaults();
+    const { deps, calls } = makeShortcutDeps({ snapshot });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: snapshot.shortcuts.permissionAllow,
+    }, deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /already bound to permissionAllow/);
+    assert.deepStrictEqual(calls.register, []);
+    assert.deepStrictEqual(calls.unregister, []);
+  });
+
+  it("registerShortcut rejects invalid and dangerous accelerators", () => {
+    const { deps } = makeShortcutDeps();
+    const invalid = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: "bad-value",
+    }, deps);
+    assert.strictEqual(invalid.status, "error");
+    assert.match(invalid.message, /invalid accelerator format/);
+
+    const dangerous = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: "Ctrl+C",
+    }, deps);
+    assert.strictEqual(dangerous.status, "error");
+    assert.match(dangerous.message, /reserved accelerator/);
+  });
+
+  it("registerShortcut short-circuits idempotent writes", () => {
+    const snapshot = prefs.getDefaults();
+    const { deps, calls } = makeShortcutDeps({ snapshot });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: snapshot.shortcuts.togglePet,
+    }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+    assert.deepStrictEqual(calls.register, []);
+    assert.deepStrictEqual(calls.unregister, []);
+  });
+
+  it("registerShortcut retries same persistent value when a runtime failure exists", () => {
+    const snapshot = prefs.getDefaults();
+    const { deps, calls, failures, registered } = makeShortcutDeps({
+      snapshot,
+      failures: { togglePet: "system conflict" },
+    });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: snapshot.shortcuts.togglePet,
+    }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+    assert.deepStrictEqual(calls.register.map((c) => c.accelerator), [
+      snapshot.shortcuts.togglePet,
+    ]);
+    assert.strictEqual(failures.has("togglePet"), false);
+    assert.ok(registered.has(snapshot.shortcuts.togglePet));
+  });
+
+  it("registerShortcut keeps the old persistent binding when the new register fails", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+      },
+    });
+    const { deps, calls, registered } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+      failRegister: new Set(["CommandOrControl+K"]),
+    });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: "Ctrl+K",
+    }, deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /system conflict/);
+    assert.deepStrictEqual(calls.unregister, []);
+    assert.ok(registered.has(snapshot.shortcuts.togglePet));
+    assert.strictEqual(registered.has("CommandOrControl+K"), false);
+  });
+
+  it("registerShortcut rolls back the new persistent binding if old unregister verification fails", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+      },
+    });
+    const { deps, calls, registered } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+      stubbornUnregister: snapshot.shortcuts.togglePet,
+    });
+    const r = commandRegistry.registerShortcut({
+      actionId: "togglePet",
+      accelerator: "Ctrl+K",
+    }, deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /unregister of old accelerator failed/);
+    assert.deepStrictEqual(calls.unregister, ["CommandOrControl+J", "CommandOrControl+K"]);
+    assert.ok(registered.has(snapshot.shortcuts.togglePet));
+    assert.strictEqual(registered.has("CommandOrControl+K"), false);
+  });
+
+  it("registerShortcut skips globalShortcut work for contextual actions", () => {
+    const snapshot = prefs.getDefaults();
+    const { deps, calls } = makeShortcutDeps({ snapshot });
+    const r = commandRegistry.registerShortcut({
+      actionId: "permissionAllow",
+      accelerator: "Ctrl+K",
+    }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.shortcuts.permissionAllow, "CommandOrControl+K");
+    assert.deepStrictEqual(calls.register, []);
+    assert.deepStrictEqual(calls.unregister, []);
+  });
+
+  it("resetShortcut routes through registerShortcut with the default value", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+      },
+    });
+    const { deps } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+    });
+    const r = commandRegistry.resetShortcut({ actionId: "togglePet" }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.commit.shortcuts.togglePet, "CommandOrControl+Shift+Alt+C");
+  });
+
+  it("resetAllShortcuts commits the full default shortcut map atomically", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+        permissionAllow: "Ctrl+K",
+        permissionDeny: null,
+      },
+    });
+    const { deps, calls } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+    });
+    const r = commandRegistry.resetAllShortcuts(null, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.shortcuts, prefs.getDefaults().shortcuts);
+    assert.deepStrictEqual(calls.register.map((c) => c.accelerator), [
+      "CommandOrControl+Shift+Alt+C",
+    ]);
+    assert.deepStrictEqual(calls.unregister, ["CommandOrControl+J"]);
+  });
+
+  it("resetAllShortcuts leaves prefs untouched when the persistent default is unavailable", () => {
+    const snapshot = prefs.validate({
+      shortcuts: {
+        togglePet: "Ctrl+J",
+      },
+    });
+    const { deps, calls, registered } = makeShortcutDeps({
+      snapshot,
+      registered: [snapshot.shortcuts.togglePet],
+      failRegister: new Set(["CommandOrControl+Shift+Alt+C"]),
+    });
+    const r = commandRegistry.resetAllShortcuts(null, deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /system conflict on togglePet/);
+    assert.strictEqual(r.commit, undefined);
+    assert.deepStrictEqual(calls.unregister, []);
+    assert.ok(registered.has(snapshot.shortcuts.togglePet));
   });
 });
 
@@ -596,6 +862,509 @@ describe("setThemeSelection command", () => {
     const r = commandRegistry.setThemeSelection({ themeId: "clawd" }, { snapshot: baseSnapshot });
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /activateTheme/);
+  });
+});
+
+describe("setAnimationOverride reaction slot", () => {
+  const baseSnapshot = { theme: "clawd", themeOverrides: {} };
+  const noopDeps = { snapshot: baseSnapshot, activateTheme: () => {} };
+
+  it("rejects unknown reactionKey", () => {
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "explode",
+      file: "x.svg",
+    }, noopDeps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /reactionKey/);
+  });
+
+  it("accepts valid reactionKey and writes reactions.<key>.file", () => {
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      file: "my-poke.svg",
+    }, noopDeps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(
+      r.commit.themeOverrides.clawd.reactions.clickLeft,
+      { file: "my-poke.svg" }
+    );
+  });
+
+  it("rejects durationMs for drag reaction (drag plays until pointer-up)", () => {
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "drag",
+      durationMs: 2000,
+    }, noopDeps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /drag/);
+  });
+
+  it("accepts durationMs for clickLeft reaction", () => {
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      durationMs: 3000,
+    }, noopDeps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.commit.themeOverrides.clawd.reactions.clickLeft.durationMs, 3000);
+  });
+
+  it("rejects autoReturnMs for reaction slots", () => {
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      autoReturnMs: 3000,
+    }, noopDeps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /autoReturnMs/);
+  });
+
+  it("clears reaction override when file is set to null with no other fields", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: { reactions: { clickLeft: { file: "old.svg" } } },
+      },
+    };
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      file: null,
+    }, { snapshot, activateTheme: () => {} });
+    assert.strictEqual(r.status, "ok");
+    // With reactions.clickLeft emptied to {}, buildThemeOverrideMap should drop
+    // both `reactions` and the themeId if nothing else remains.
+    assert.strictEqual(r.commit.themeOverrides.clawd, undefined);
+  });
+
+  it("preserves existing hitbox overrides when editing a reaction slot", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: {
+          reactions: { clickLeft: { file: "old.svg" } },
+          hitbox: { wide: { "clawd-error.svg": true } },
+        },
+      },
+    };
+    const r = commandRegistry.setAnimationOverride({
+      themeId: "clawd",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      file: "new.svg",
+    }, { snapshot, activateTheme: () => {} });
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.hitbox, {
+      wide: { "clawd-error.svg": true },
+    });
+  });
+});
+
+describe("setSoundOverride command", () => {
+  const baseSnapshot = { theme: "clawd", themeOverrides: {} };
+  const noopDeps = { snapshot: baseSnapshot, activateTheme: () => {} };
+
+  it("rejects missing themeId / soundName", () => {
+    let r = commandRegistry.setSoundOverride({ soundName: "complete", file: "a.mp3" }, noopDeps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /themeId/);
+    r = commandRegistry.setSoundOverride({ themeId: "clawd", file: "a.mp3" }, noopDeps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /soundName/);
+  });
+
+  it("rejects file when it is not null and not a non-empty string", () => {
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "" },
+      noopDeps
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /file/);
+  });
+
+  it("writes { sounds: { complete: { file } } } on first override", () => {
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "my-complete.mp3" },
+      noopDeps
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.sounds, {
+      complete: { file: "my-complete.mp3" },
+    });
+  });
+
+  it("preserves originalName in the committed entry when provided", () => {
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "complete.mp3", originalName: "cat-demo.mp3" },
+      noopDeps
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.sounds, {
+      complete: { file: "complete.mp3", originalName: "cat-demo.mp3" },
+    });
+  });
+
+  it("null file clears the entry and removes the theme row when nothing else is overridden", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: { sounds: { complete: { file: "old.mp3" } } },
+      },
+    };
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: null },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.commit.themeOverrides.clawd, undefined);
+  });
+
+  it("preserves unrelated soundName entries when editing one", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: {
+          sounds: {
+            complete: { file: "c.mp3" },
+            confirm: { file: "x.wav" },
+          },
+        },
+      },
+    };
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "new-c.mp3" },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.sounds, {
+      complete: { file: "new-c.mp3" },
+      confirm: { file: "x.wav" },
+    });
+  });
+
+  it("preserves existing animation overrides when editing a sound slot", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: {
+          states: { attention: { file: "attn.svg" } },
+          hitbox: { wide: { "clawd-error.svg": true } },
+          sounds: { confirm: { file: "c.wav" } },
+        },
+      },
+    };
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "done.mp3" },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    const nextClawd = r.commit.themeOverrides.clawd;
+    assert.deepStrictEqual(nextClawd.states, { attention: { file: "attn.svg" } });
+    assert.deepStrictEqual(nextClawd.hitbox, { wide: { "clawd-error.svg": true } });
+    assert.deepStrictEqual(nextClawd.sounds, {
+      confirm: { file: "c.wav" },
+      complete: { file: "done.mp3" },
+    });
+  });
+
+  it("same value is a noop (no commit)", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: { sounds: { complete: { file: "same.mp3" } } },
+      },
+    };
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "same.mp3" },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+  });
+
+  it("when active theme changes, calls activateTheme with the new override map", () => {
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const calls = [];
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "a.mp3" },
+      {
+        snapshot,
+        activateTheme: (themeId, variantId, overrideMap) => calls.push({ themeId, variantId, overrideMap }),
+      }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(calls.length, 1);
+    assert.deepStrictEqual(calls[0].overrideMap.sounds, { complete: { file: "a.mp3" } });
+  });
+
+  it("active theme edit without activateTheme dep returns error", () => {
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "clawd", soundName: "complete", file: "a.mp3" },
+      { snapshot: { theme: "clawd", themeOverrides: {} } }
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /activateTheme/);
+  });
+
+  it("non-active theme skips activateTheme but still commits", () => {
+    const calls = [];
+    const r = commandRegistry.setSoundOverride(
+      { themeId: "other", soundName: "complete", file: "a.mp3" },
+      {
+        snapshot: { theme: "clawd", themeOverrides: {} },
+        activateTheme: () => calls.push("boom"),
+      }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(calls.length, 0);
+    assert.ok(r.commit.themeOverrides.other.sounds);
+  });
+});
+
+describe("setWideHitboxOverride command", () => {
+  it("rejects missing file / themeId", () => {
+    const r = commandRegistry.setWideHitboxOverride({ themeId: "clawd", enabled: true }, { snapshot: {} });
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /file/);
+  });
+
+  it("rejects non-boolean / non-null enabled", () => {
+    const r = commandRegistry.setWideHitboxOverride({
+      themeId: "clawd", file: "x.svg", enabled: "yes",
+    }, { snapshot: {} });
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /boolean or null/);
+  });
+
+  it("writes hitbox.wide[file] = true when enabled", () => {
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const r = commandRegistry.setWideHitboxOverride(
+      { themeId: "clawd", file: "clawd-error.svg", enabled: true },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(
+      r.commit.themeOverrides.clawd.hitbox.wide,
+      { "clawd-error.svg": true }
+    );
+  });
+
+  it("clears the entry when enabled=null (fall back to theme default)", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: { hitbox: { wide: { "clawd-error.svg": true } } },
+      },
+    };
+    const r = commandRegistry.setWideHitboxOverride(
+      { themeId: "clawd", file: "clawd-error.svg", enabled: null },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    // Entire hitbox + themeId entry drops when last toggle is cleared.
+    assert.strictEqual(r.commit.themeOverrides.clawd, undefined);
+  });
+
+  it("noop when setting same value", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: { hitbox: { wide: { "clawd-error.svg": true } } },
+      },
+    };
+    const r = commandRegistry.setWideHitboxOverride(
+      { themeId: "clawd", file: "clawd-error.svg", enabled: true },
+      { snapshot }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+  });
+
+  it("triggers activateTheme with next override map when active theme changes", () => {
+    let activatedWith = null;
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const r = commandRegistry.setWideHitboxOverride(
+      { themeId: "clawd", file: "foo.svg", enabled: true },
+      {
+        snapshot,
+        activateTheme: (id, variantId, overrideMap) => { activatedWith = { id, overrideMap }; },
+      }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(activatedWith.id, "clawd");
+    assert.deepStrictEqual(activatedWith.overrideMap, {
+      hitbox: { wide: { "foo.svg": true } },
+    });
+  });
+});
+
+describe("theme override subtree preservation", () => {
+  it("setThemeOverrideDisabled keeps existing reactions and hitbox overrides", () => {
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: {
+          states: { attention: { file: "attention.svg" } },
+          reactions: { clickLeft: { file: "click.svg" } },
+          hitbox: { wide: { "clawd-error.svg": true } },
+        },
+      },
+    };
+    const r = commandRegistry.setThemeOverrideDisabled(
+      { themeId: "clawd", stateKey: "attention", disabled: true },
+      { snapshot }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.reactions, {
+      clickLeft: { file: "click.svg" },
+    });
+    assert.deepStrictEqual(r.commit.themeOverrides.clawd.hitbox, {
+      wide: { "clawd-error.svg": true },
+    });
+  });
+});
+
+describe("importAnimationOverrides command", () => {
+  const validPayload = {
+    version: 1,
+    themes: {
+      clawd: {
+        states: {
+          error: { file: "clawd-error.svg" },
+          attention: { disabled: true },
+        },
+      },
+    },
+  };
+
+  it("rejects non-object payloads", () => {
+    const r = commandRegistry.importAnimationOverrides(null, { snapshot: {} });
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /must be an object/);
+  });
+
+  it("rejects payloads missing themes map", () => {
+    const r = commandRegistry.importAnimationOverrides({ version: 1 }, { snapshot: {} });
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /themes/);
+  });
+
+  it("rejects payloads whose version is newer than supported", () => {
+    const r = commandRegistry.importAnimationOverrides(
+      { version: 999, themes: { clawd: {} } },
+      { snapshot: {} }
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /newer than supported/);
+  });
+
+  it("rejects when normalized payload has no valid entries", () => {
+    const r = commandRegistry.importAnimationOverrides(
+      { version: 1, themes: { clawd: { not_a_real_field: 1 } } },
+      { snapshot: {} }
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /no valid/);
+  });
+
+  it("merges by theme id into existing overrides by default", () => {
+    const snapshot = {
+      theme: "calico",
+      themeOverrides: {
+        calico: { states: { attention: { file: "cat-attention.svg" } } },
+      },
+    };
+    const r = commandRegistry.importAnimationOverrides(validPayload, { snapshot });
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.mode, "merge");
+    assert.ok(r.commit.themeOverrides.calico, "calico overrides preserved on merge");
+    assert.ok(r.commit.themeOverrides.clawd, "clawd overrides added on merge");
+    assert.strictEqual(r.importedThemeCount, 1);
+  });
+
+  it("replaces the entire map when mode=replace", () => {
+    const snapshot = {
+      theme: "calico",
+      themeOverrides: {
+        calico: { states: { attention: { file: "cat-attention.svg" } } },
+      },
+    };
+    const r = commandRegistry.importAnimationOverrides(
+      { ...validPayload, mode: "replace" },
+      { snapshot, activateTheme: () => {} }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.mode, "replace");
+    assert.strictEqual(r.commit.themeOverrides.calico, undefined);
+    assert.ok(r.commit.themeOverrides.clawd);
+  });
+
+  it("calls activateTheme with the new override map for the active theme", () => {
+    // Regression: the effect runs BEFORE controller._commit, so activateTheme
+    // must receive the new override map explicitly — reading themeOverrides
+    // from the store would see the stale pre-import value and the imported
+    // slots would never take effect.
+    const calls = [];
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const r = commandRegistry.importAnimationOverrides(validPayload, {
+      snapshot,
+      activateTheme: (id, variantId, overrideMap) => {
+        calls.push({ id, variantId, overrideMap });
+      },
+    });
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].id, "clawd");
+    assert.ok(calls[0].overrideMap, "overrideMap must not be null");
+    assert.deepStrictEqual(
+      calls[0].overrideMap,
+      r.commit.themeOverrides.clawd,
+      "activateTheme must receive the same normalized override map that gets committed"
+    );
+  });
+
+  it("skips activateTheme when active theme overrides are unchanged", () => {
+    let activated = null;
+    const snapshot = {
+      theme: "clawd",
+      themeOverrides: {
+        clawd: {
+          states: {
+            error: { file: "clawd-error.svg" },
+            attention: { disabled: true },
+          },
+        },
+      },
+    };
+    const r = commandRegistry.importAnimationOverrides(validPayload, {
+      snapshot,
+      activateTheme: (id) => { activated = id; },
+    });
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(activated, null, "activateTheme should not fire when data unchanged");
+  });
+
+  it("errors when activateTheme dep is missing and active theme needs reload", () => {
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const r = commandRegistry.importAnimationOverrides(validPayload, { snapshot });
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /activateTheme/);
+  });
+
+  it("does not require activateTheme when import only touches non-active themes", () => {
+    const snapshot = { theme: "calico", themeOverrides: {} };
+    const r = commandRegistry.importAnimationOverrides(validPayload, { snapshot });
+    assert.strictEqual(r.status, "ok");
+    assert.ok(r.commit.themeOverrides.clawd);
   });
 });
 

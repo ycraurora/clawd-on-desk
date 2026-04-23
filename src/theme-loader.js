@@ -79,7 +79,7 @@ const VISUAL_FALLBACK_STATES = new Set([
 
 // ── Variant support (Phase 3b-swap) ──
 // Allow-list of fields a variant may override. Anything else → ignored + warned
-// (see docs/plan-settings-panel-3b-swap.md §6.4 Validator Spec rule 1).
+// (see docs/plans/plan-settings-panel-3b-swap.md §6.4 Validator Spec rule 1).
 const VARIANT_ALLOWED_KEYS = new Set([
   // Metadata (not merged into runtime theme)
   "name", "description", "preview",
@@ -105,9 +105,23 @@ const DANGEROUS_TAGS = new Set([
 ]);
 const DANGEROUS_ATTR_RE = /^on/i;
 const DANGEROUS_HREF_RE = /^\s*javascript\s*:/i;
-const EXTERNAL_RESOURCE_RE = /^\s*(https?|data|file|ftp)\s*:/i;
+const EXTERNAL_RESOURCE_RE = /^\s*(?:\/\/|(https?|data|file|ftp)\s*:)/i;
 const PATH_TRAVERSAL_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
 const HREF_ATTRS = new Set(["href", "xlink:href", "src", "action", "formaction"]);
+const SVG_URL_ATTRS = new Set([
+  "style",
+  "fill",
+  "stroke",
+  "filter",
+  "clip-path",
+  "mask",
+  "marker-start",
+  "marker-mid",
+  "marker-end",
+  "cursor",
+]);
+const WINDOWS_ABSOLUTE_PATH_RE = /^[a-zA-Z]:[\\/]/;
+const ROOT_ABSOLUTE_PATH_RE = /^[\\/](?![\\/])/;
 
 // ── State ──
 
@@ -118,6 +132,7 @@ let assetsSoundsDir = null;    // assets/sounds/ for built-in theme
 let userDataDir = null;        // app.getPath("userData") — set by init()
 let userThemesDir = null;      // {userData}/themes/
 let themeCacheDir = null;      // {userData}/theme-cache/
+let soundOverridesRoot = null; // {userData}/sound-overrides/ — per-theme copied audio
 
 // ── Public API ──
 
@@ -134,7 +149,16 @@ function init(appDir, userData) {
     userDataDir = userData;
     userThemesDir = path.join(userData, "themes");
     themeCacheDir = path.join(userData, "theme-cache");
+    soundOverridesRoot = path.join(userData, "sound-overrides");
   }
+}
+
+// Directory where sound-override files for `themeId` live. main.js creates /
+// reads files here when the user picks a custom audio file. Returns null when
+// userData hasn't been wired up yet (test harnesses that call init() without it).
+function getSoundOverridesDir(themeId) {
+  if (!soundOverridesRoot || typeof themeId !== "string" || !themeId) return null;
+  return path.join(soundOverridesRoot, themeId);
 }
 
 /**
@@ -237,8 +261,32 @@ function loadTheme(themeId, opts = {}) {
     theme._assetsFileUrl = null; // built-in uses relative path
   }
 
+  theme._soundOverrideFiles = _resolveSoundOverrideFiles(themeId, userOverrides);
+
   activeTheme = theme;
   return theme;
+}
+
+// Turn prefs.themeOverrides[themeId].sounds into an absolute-path map. Missing
+// files are dropped silently so playback falls back to the theme's default
+// without spamming the console every time a user deletes an override file by
+// hand. main.js is responsible for copying picked audio into this directory.
+function _resolveSoundOverrideFiles(themeId, userOverrides) {
+  if (!_isPlainObject(userOverrides)) return null;
+  const soundMap = _isPlainObject(userOverrides.sounds) ? userOverrides.sounds : null;
+  if (!soundMap) return null;
+  const dir = getSoundOverridesDir(themeId);
+  if (!dir) return null;
+  const out = {};
+  for (const [soundName, entry] of Object.entries(soundMap)) {
+    if (!_isPlainObject(entry)) continue;
+    const filename = typeof entry.file === "string" ? _basenameOnly(entry.file) : null;
+    if (!filename) continue;
+    const absPath = path.join(dir, filename);
+    if (!fs.existsSync(absPath)) continue;
+    out[soundName] = absPath;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 /**
@@ -368,6 +416,66 @@ function sanitizeSvg(svgContent) {
   return render.default(doc, { xmlMode: true });
 }
 
+function _unwrapCssUrlTarget(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  const trimmed = rawValue.trim();
+  const singleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'");
+  const doubleQuoted = trimmed.startsWith("\"") && trimmed.endsWith("\"");
+  if ((singleQuoted || doubleQuoted) && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function _decodeResourceTarget(target) {
+  if (typeof target !== "string" || !target) return target || "";
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return target;
+  }
+}
+
+function _hasUnsafeResourcePattern(target) {
+  if (!target) return false;
+  return DANGEROUS_HREF_RE.test(target)
+    || EXTERNAL_RESOURCE_RE.test(target)
+    || PATH_TRAVERSAL_RE.test(target)
+    || WINDOWS_ABSOLUTE_PATH_RE.test(target)
+    || ROOT_ABSOLUTE_PATH_RE.test(target);
+}
+
+function _isUnsafeHrefTarget(rawValue) {
+  const target = _unwrapCssUrlTarget(rawValue);
+  if (!target || target.startsWith("#")) return false;
+  const decoded = _decodeResourceTarget(target);
+  return _hasUnsafeResourcePattern(target) || _hasUnsafeResourcePattern(decoded);
+}
+
+function _isUnsafeCssUrlTarget(rawValue) {
+  const target = _unwrapCssUrlTarget(rawValue);
+  if (!target || target.startsWith("#")) return false;
+  return _isUnsafeHrefTarget(target);
+}
+
+function _sanitizeCssUrls(cssText) {
+  if (typeof cssText !== "string" || !cssText) return cssText;
+  return cssText
+    .replace(/@import\b[^;]*/gi, "/* sanitized */")
+    .replace(/url\s*\(\s*([^)]*?)\s*\)/gi, (match, rawTarget) => (
+      _isUnsafeCssUrlTarget(rawTarget) ? "url()" : match
+    ));
+}
+
+function _containsUnsafeCssUrl(cssText) {
+  if (typeof cssText !== "string" || !cssText) return false;
+  const matches = cssText.matchAll(/url\s*\(\s*([^)]*?)\s*\)/gi);
+  for (const match of matches) {
+    if (_isUnsafeCssUrlTarget(match[1])) return true;
+  }
+  return false;
+}
+
 /**
  * Recursively walk DOM tree and remove dangerous nodes/attributes.
  */
@@ -393,9 +501,7 @@ function _sanitizeNode(node) {
       if (child.children) {
         for (const textNode of child.children) {
           if (textNode.type === "text" && textNode.data) {
-            textNode.data = textNode.data
-              .replace(/@import\b[^;]*/gi, "/* sanitized */")
-              .replace(/url\s*\(\s*(?!['"]?#)[^)]*\)/gi, "url()");
+            textNode.data = _sanitizeCssUrls(textNode.data);
           }
         }
       }
@@ -413,7 +519,18 @@ function _sanitizeNode(node) {
         // Remove javascript: URLs, external protocols, and path traversal
         if (HREF_ATTRS.has(key.toLowerCase())) {
           const val = child.attribs[key];
-          if (DANGEROUS_HREF_RE.test(val) || EXTERNAL_RESOURCE_RE.test(val) || PATH_TRAVERSAL_RE.test(val)) {
+          if (_isUnsafeHrefTarget(val)) {
+            delete child.attribs[key];
+            continue;
+          }
+        }
+        if (SVG_URL_ATTRS.has(key.toLowerCase())) {
+          const val = child.attribs[key];
+          if (key.toLowerCase() === "style") {
+            const sanitized = _sanitizeCssUrls(val);
+            if (!sanitized || !sanitized.trim()) delete child.attribs[key];
+            else child.attribs[key] = sanitized;
+          } else if (_containsUnsafeCssUrl(val)) {
             delete child.attribs[key];
           }
         }
@@ -458,11 +575,9 @@ function getAssetPath(filename) {
   if (!activeTheme) return path.join(assetsSvgDir, filename);
 
   if (activeTheme._builtin) {
-    // Built-in theme with own assets dir (e.g., calico with APNGs)
-    if (!filename.endsWith(".svg")) {
-      const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
-      if (fs.existsSync(themeAsset)) return themeAsset;
-    }
+    // Built-in theme with own assets dir (e.g., calico with APNGs + SVGs)
+    const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
+    if (fs.existsSync(themeAsset)) return themeAsset;
     return path.join(assetsSvgDir, filename);
   }
 
@@ -1018,6 +1133,55 @@ function _applyUserOverridesPatch(raw, overrides) {
     patched.timings = nextTimings;
   }
 
+  // Per-file wide-hitbox opt-in/opt-out. Only touches the file list the theme
+  // publishes — doesn't regenerate HIT_BOXES. state.js rebuilds WIDE_SVGS from
+  // theme.wideHitboxFiles on refreshTheme, so the merged list flows through.
+  const hitboxOverrides = _isPlainObject(overrides.hitbox) ? overrides.hitbox : null;
+  const wideOverrides = hitboxOverrides && _isPlainObject(hitboxOverrides.wide) ? hitboxOverrides.wide : null;
+  if (wideOverrides && Object.keys(wideOverrides).length > 0) {
+    const currentSet = new Set(
+      (Array.isArray(patched.wideHitboxFiles) ? patched.wideHitboxFiles : []).map(_basenameOnly)
+    );
+    for (const [file, enabled] of Object.entries(wideOverrides)) {
+      const bn = _basenameOnly(file);
+      if (!bn) continue;
+      if (enabled) currentSet.add(bn);
+      else currentSet.delete(bn);
+    }
+    patched.wideHitboxFiles = [...currentSet];
+  }
+
+  const reactionOverrides = _isPlainObject(overrides.reactions) ? overrides.reactions : null;
+  if (reactionOverrides && _isPlainObject(raw.reactions)) {
+    const nextReactions = { ...raw.reactions };
+    for (const [reactionKey, entry] of Object.entries(reactionOverrides)) {
+      if (!_isPlainObject(entry)) continue;
+      const rawReaction = nextReactions[reactionKey];
+      if (!_isPlainObject(rawReaction)) continue;
+      const nextReaction = { ...rawReaction };
+      const hasNewFile = typeof entry.file === "string" && entry.file;
+      if (hasNewFile) {
+        // `double` reaction stores a files array (random pool). The MVP exposes
+        // only files[0] to users, so overriding replaces the first entry while
+        // keeping the rest of the pool intact.
+        if (Array.isArray(nextReaction.files) && nextReaction.files.length > 0) {
+          nextReaction.files = [entry.file, ...nextReaction.files.slice(1)];
+        } else {
+          nextReaction.file = entry.file;
+        }
+      }
+      if (Number.isFinite(entry.durationMs)) {
+        nextReaction.duration = entry.durationMs;
+      }
+      nextReactions[reactionKey] = nextReaction;
+      const transitionTarget = hasNewFile
+        ? entry.file
+        : (nextReaction.file || (Array.isArray(nextReaction.files) ? nextReaction.files[0] : null));
+      if (transitionTarget) _applyTransitionOverride(patched, transitionTarget, entry.transition);
+    }
+    patched.reactions = nextReactions;
+  }
+
   const idleAnimationOverrides = _isPlainObject(overrides.idleAnimations) ? overrides.idleAnimations : null;
   if (idleAnimationOverrides && Array.isArray(raw.idleAnimations)) {
     const nextIdleAnimations = raw.idleAnimations.map((entry) => (_isPlainObject(entry) ? { ...entry } : entry));
@@ -1268,6 +1432,15 @@ function mergeDefaults(raw, themeId, isBuiltin) {
  */
 function getSoundUrl(soundName) {
   if (!activeTheme || !activeTheme.sounds) return null;
+
+  const overrideMap = activeTheme._soundOverrideFiles;
+  if (overrideMap && Object.prototype.hasOwnProperty.call(overrideMap, soundName)) {
+    const overridePath = overrideMap[soundName];
+    if (overridePath && fs.existsSync(overridePath)) {
+      return pathToFileURL(overridePath).href;
+    }
+  }
+
   const filename = activeTheme.sounds[soundName];
   if (!filename) return null;
 
@@ -1284,6 +1457,10 @@ function getSoundUrl(soundName) {
   }
 
   return null;
+}
+
+function getPreviewSoundUrl() {
+  return getSoundUrl("confirm") || getSoundUrl("complete") || null;
 }
 
 // basename() strips any path segments in theme.json so a malicious
@@ -1411,6 +1588,8 @@ module.exports = {
   getHitRendererConfig,
   ensureUserThemesDir,
   getSoundUrl,
+  getPreviewSoundUrl,
+  getSoundOverridesDir,
   // Schema constants + helpers — shared with scripts/validate-theme.js to
   // keep validator and runtime loader from drifting on the same invariants.
   REQUIRED_STATES,

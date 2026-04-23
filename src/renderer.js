@@ -47,8 +47,8 @@ function initWithConfig(cfg) {
   _transitions = tc.transitions || {};
   _miniFlipAssets = !!tc.miniFlipAssets;
 
-  applyObjectScaleStyle(clawdEl);
-  applyObjectScaleStyle(pendingNext);
+  applyObjectScaleStyle(clawdEl, getObjectSvgName(clawdEl));
+  applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext));
 }
 
 function applyObjectScaleStyle(el, file) {
@@ -68,13 +68,13 @@ function applyObjectScaleStyle(el, file) {
     el.style.height = "auto";
     el.style.left = `calc(${_objectScaleCSS.imgLeft} + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${_objectScaleCSS.imgBottom || "5%"} + ${oy}px)`;
+    el.style.bottom = `calc(${_objectScaleCSS.imgBottom || "5%"} + ${oy + _viewportOffsetY}px)`;
   } else {
     el.style.width = _objectScaleCSS.width;
     el.style.height = _objectScaleCSS.height;
     el.style.left = `calc(${_objectScaleCSS.left} + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy}px)`;
+    el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy + _viewportOffsetY}px)`;
   }
 }
 
@@ -106,13 +106,13 @@ function applyNormalizedLayoutStyle(el, file) {
     el.style.height = "auto";
     el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy + _viewportOffsetY}px)`;
   } else {
     el.style.width = `${widthRatio * 100}%`;
     el.style.height = `${heightRatio * 100}%`;
     el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy + _viewportOffsetY}px)`;
   }
 }
 
@@ -134,6 +134,17 @@ let _fileOffsets = {};
 let _transitions = {};  // per-file fade config: { "file.apng": { in: 400, out: 400 } }
 let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
 let _inMiniMode = false;
+let _viewportOffsetY = 0;
+
+function setViewportOffset(offsetY) {
+  const next = Number.isFinite(offsetY) ? Math.max(0, Math.round(offsetY)) : 0;
+  if (next === _viewportOffsetY) return;
+  _viewportOffsetY = next;
+  applyObjectScaleStyle(clawdEl, currentDisplayedSvg);
+  if (pendingNext) {
+    applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext));
+  }
+}
 
 function applyMiniFlip(el) {
   if (!el || el.tagName !== "IMG") return;
@@ -159,6 +170,10 @@ window.electronAPI.onThemeConfig((newConfig) => {
   initWithConfig(newConfig);
 });
 
+window.electronAPI.onViewportOffset((offsetY) => {
+  setViewportOffset(offsetY);
+});
+
 // Release an <object> SVG element: navigate away to unload the SVG document
 // (stops CSS animations and frees the internal frame), then remove from DOM.
 function releaseObject(el) {
@@ -179,6 +194,7 @@ let isReacting = false;
 let isDragReacting = false;
 let reactTimer = null;
 let currentIdleSvg = null;    // tracks which SVG is currently showing
+let currentState = null;      // last state name received from main (for re-pulse)
 let dndEnabled = false;
 let miniLeftFlip = false;
 
@@ -432,7 +448,16 @@ function swapToFile(file, state, useObjectChannel) {
     };
 
     next.addEventListener("load", swap, { once: true });
-    next.src = url;
+    // Cache-bust query param: Chromium reuses the SVG document (and its CSS
+    // animation timeline) across <img> elements pointing at the same URL, so
+    // one-shot animations (`animation: foo 3.2s 1 forwards`) that already ran
+    // once would reappear stuck on their last frame on subsequent loads —
+    // the user sees a static pet instead of the entry animation. Appending
+    // a timestamp forces a fresh SVG document & fresh animation start each
+    // swap. Infinite animations are unaffected (they look identical either
+    // way). Load time stays ~0ms since the file itself is still in the HTTP
+    // cache; only the in-memory SVG document is rebuilt.
+    next.src = `${url}${url.includes("?") ? "&" : "?"}_t=${Date.now()}`;
     container.appendChild(next);
     pendingNext = next;
     // Timeout fallback for images that fail to load
@@ -447,6 +472,9 @@ function swapToFile(file, state, useObjectChannel) {
 window.electronAPI.onStateChange((state, svg) => {
   // Main process state change → cancel any active click reaction
   cancelReaction();
+  // Track the latest state name so the Kimi permission pulse can re-trigger
+  // swapToFile() with the matching state for eye-tracking decisions.
+  currentState = state;
 
   // Dedup: same file already displayed OR currently loading → don't re-swap
   const alreadyDisplayed = clawdEl && clawdEl.isConnected && currentDisplayedSvg === svg;
@@ -475,6 +503,14 @@ window.electronAPI.onStateChange((state, svg) => {
 
   swapToFile(svg, state);
   currentIdleSvg = svg;
+});
+
+// Kimi CLI permission hold: re-trigger the current animation so it loops
+// while the user is reviewing the permission prompt.
+window.electronAPI.onKimiPermissionPulse(() => {
+  if (clawdEl && clawdEl.isConnected && currentDisplayedSvg) {
+    swapToFile(currentDisplayedSvg, currentState);
+  }
 });
 
 // --- Eye tracking (idle state only) ---
@@ -754,16 +790,33 @@ window.electronAPI.onEyeMove((dx, dy) => {
   applyEyeMove(effectiveDx, dy);
 });
 
-// --- Sound playback (IPC from main, receives file:// URL from theme) ---
+// --- Sound playback (IPC from main, receives { url, volume } from theme) ---
 const _audioCache = {};
-window.electronAPI.onPlaySound((url) => {
-  let audio = _audioCache[url];
+window.electronAPI.onPlaySound((payload) => {
+  const url = typeof payload === "string" ? payload : payload && payload.url;
+  const volume = typeof payload === "object" && payload && typeof payload.volume === "number"
+    ? Math.max(0, Math.min(1, payload.volume))
+    : 1;
+  if (!url) return;
+  // Preview URLs carry a `_t=` cache-buster so every click is a fresh URL;
+  // caching them would grow the map unboundedly (one entry per preview click)
+  // for no benefit since the URL will never be requested again. Only cache
+  // real playback URLs.
+  const isPreview = url.includes("_t=");
+  let audio = !isPreview ? _audioCache[url] : null;
   if (!audio) {
     audio = new Audio(url);
-    _audioCache[url] = audio;
+    if (!isPreview) _audioCache[url] = audio;
   }
+  audio.volume = volume;
   audio.currentTime = 0;
   audio.play().catch(() => {});
+});
+// Same-extension override replacement overwrites the file on disk without
+// changing the URL, so the cached Audio object keeps its old buffered data.
+// Main sends this after a successful pick so the next playback re-loads.
+window.electronAPI.onInvalidateSoundCache((url) => {
+  if (typeof url === "string" && url) delete _audioCache[url];
 });
 
 // --- Wake from doze (smooth eye opening) ---

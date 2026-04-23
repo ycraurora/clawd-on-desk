@@ -10,9 +10,19 @@
 
 **VS Code Codex in devcontainers/Docker** — Clawd uses a split bridge design: the bundled local `clawd-terminal-focus` extension runs on your desktop VS Code and forwards events into the local app, while a separate `workspace` helper extension must run inside the remote container/VS Code Server to read `~/.codex/sessions`. The helper is not auto-installed yet; install it manually in the remote environment before testing this path.
 
-**Copilot CLI** — requires manual hook setup. See [copilot-setup.md](copilot-setup.md) for instructions.
+**Copilot CLI** — the one supported agent that still requires manual hook setup. See [copilot-setup.md](copilot-setup.md) for instructions.
 
-**Kiro CLI** — run `npm run install:kiro-hooks` if you want hooks registered before launching Clawd. Kiro's built-in `kiro_default` agent is not backed by an editable JSON file, so Clawd creates a custom `clawd` agent and re-syncs it from the latest `kiro_default` each time Clawd starts, then appends hooks. Use `kiro-cli --agent clawd` for a new chat, or `/agent swap clawd` inside an existing Kiro session, when you want hooks enabled. On macOS, state-driven animations have been verified; native terminal permission prompts such as `t / y / n` still need to be answered in the terminal.
+**Gemini CLI** — hooks live in `~/.gemini/settings.json`. Clawd auto-registers them on launch when Gemini is installed, or you can run `npm run install:gemini-hooks` manually.
+
+**Cursor Agent** — hooks live in `~/.cursor/hooks.json`. Clawd auto-registers them on launch when Cursor is installed, or you can run `npm run install:cursor-hooks` manually.
+
+**CodeBuddy** — uses Claude Code-compatible hooks in `~/.codebuddy/settings.json`. Clawd auto-registers them on launch when CodeBuddy is installed, or you can run `node hooks/codebuddy-install.js` manually.
+
+**Kiro CLI** — run `npm run install:kiro-hooks` if you want hooks registered before launching Clawd. Kiro's built-in `kiro_default` agent is not backed by an editable JSON file, so Clawd creates a custom `clawd` agent and re-syncs it from the latest `kiro_default` each time Clawd starts, then appends hooks. Use `kiro-cli --agent clawd` for a new chat, or `/agent swap clawd` inside an existing Kiro session, when you want hooks enabled. On macOS and Windows, state-driven animations have been verified; native terminal permission prompts such as `t / y / n` still need to be answered in the terminal.
+
+**Kimi Code** — hooks live in `~/.kimi/config.toml` (`[[hooks]]` entries). Clawd auto-registers them on launch when Kimi is installed, or you can run `npm run install:kimi-hooks` manually. Kimi is hook-only in Clawd: state updates and permission notifications come from hook events, not log polling. To make a permission-classification choice persist across restarts, set `CLAWD_KIMI_PERMISSION_MODE=explicit` (default) or `CLAWD_KIMI_PERMISSION_MODE=suspect` before running the installer — the value gets written into the `command` field for every Kimi hook so subsequent Clawd auto-syncs preserve it. Heads up: the auto-sync also rewrites the `command` field in-place if it diverges from the expected line, so manual edits to that field will be silently restored on the next launch.
+
+**opencode** — uses a plugin entry in `~/.config/opencode/opencode.json`. Clawd auto-registers it on launch when opencode is installed, or you can run `node hooks/opencode-install.js` manually.
 
 ## Remote SSH (Claude Code & Codex CLI)
 
@@ -48,6 +58,8 @@ Remote hooks run in `CLAWD_REMOTE` mode which skips PID collection (remote PIDs 
 > Thanks to [@Magic-Bytes](https://github.com/Magic-Bytes) for the original SSH tunneling idea ([#9](https://github.com/rullerzhou-afk/clawd-on-desk/issues/9)).
 
 ## WSL (Windows Subsystem for Linux)
+
+> This section mainly covers Claude Code and other hook-based agents inside WSL. For the official `Codex CLI + WSL` status, the current Windows hooks status, and why Clawd does not auto-detect Codex logs under WSL's Linux home by default, see: [codex-wsl-clarification.md](codex-wsl-clarification.md)
 
 If you run Claude Code inside WSL while Clawd runs on the Windows host, hooks can POST directly to `127.0.0.1:23333` — no SSH tunnel needed, because WSL2 shares localhost with Windows by default.
 
@@ -102,11 +114,17 @@ node hooks/install.js
 # and auto-creates a clawd agent
 node hooks/kiro-install.js
 
+# Kimi Code
+node hooks/kimi-install.js
+
 # Cursor Agent
 node hooks/cursor-install.js
 
 # Gemini CLI
 node hooks/gemini-install.js
+
+# CodeBuddy
+node hooks/codebuddy-install.js
 
 # opencode
 node hooks/opencode-install.js

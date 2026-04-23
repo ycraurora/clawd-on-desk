@@ -48,7 +48,18 @@
 // prefs without writing them right back. Object-form entries must therefore
 // keep validate side-effect-free.
 
-const { CURRENT_VERSION, AGENT_FLAGS } = require("./prefs");
+const { CURRENT_VERSION, AGENT_FLAGS, normalizeThemeOverrides } = require("./prefs");
+const { isValidDisplaySnapshot } = require("./work-area");
+const {
+  SHORTCUT_ACTIONS,
+  SHORTCUT_ACTION_IDS,
+  getDefaultShortcuts,
+  parseAccelerator,
+  isDangerousAccelerator,
+  validateShortcutMapShape,
+} = require("./shortcut-actions");
+
+const ANIMATION_OVERRIDES_EXPORT_VERSION = 1;
 const { isPlainObject } = require("./theme-loader");
 
 // ── Validator helpers ──
@@ -66,6 +77,24 @@ function requireFiniteNumber(key) {
   return function (value) {
     if (typeof value !== "number" || !Number.isFinite(value)) {
       return { status: "error", message: `${key} must be a finite number` };
+    }
+    return { status: "ok" };
+  };
+}
+
+function requireNonNegativeFiniteNumber(key) {
+  return function (value) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      return { status: "error", message: `${key} must be a non-negative finite number` };
+    }
+    return { status: "ok" };
+  };
+}
+
+function requireNumberInRange(key, min, max) {
+  return function (value) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+      return { status: "error", message: `${key} must be a finite number between ${min} and ${max}` };
     }
     return { status: "ok" };
   };
@@ -101,8 +130,9 @@ function requirePlainObject(key) {
   };
 }
 
-const THEME_OVERRIDE_RESERVED_KEYS = new Set(["states", "tiers", "timings", "idleAnimations"]);
+const THEME_OVERRIDE_RESERVED_KEYS = new Set(["states", "tiers", "timings", "idleAnimations", "reactions", "hitbox", "sounds"]);
 const TIER_OVERRIDE_GROUPS = new Set(["workingTiers", "jugglingTiers"]);
+const REACTION_KEYS = new Set(["drag", "clickLeft", "clickRight", "annoyed", "double"]);
 
 function cloneStateOverrides(themeMap) {
   const out = {};
@@ -149,7 +179,34 @@ function cloneIdleAnimationOverrides(themeMap) {
   return cloneFileKeyedMap(themeMap.idleAnimations);
 }
 
-function buildThemeOverrideMap({ states, workingTiers, jugglingTiers, autoReturn, idleAnimations }) {
+function cloneReactionOverrides(themeMap) {
+  const out = {};
+  if (!isPlainObject(themeMap) || !isPlainObject(themeMap.reactions)) return out;
+  for (const [reactionKey, entry] of Object.entries(themeMap.reactions)) {
+    if (isPlainObject(entry)) out[reactionKey] = { ...entry };
+  }
+  return out;
+}
+
+function cloneHitboxOverrides(themeMap) {
+  const out = {};
+  if (!isPlainObject(themeMap) || !isPlainObject(themeMap.hitbox)) return out;
+  for (const [groupKey, entry] of Object.entries(themeMap.hitbox)) {
+    if (isPlainObject(entry)) out[groupKey] = { ...entry };
+  }
+  return out;
+}
+
+function cloneSoundOverrides(themeMap) {
+  const out = {};
+  if (!isPlainObject(themeMap) || !isPlainObject(themeMap.sounds)) return out;
+  for (const [soundName, entry] of Object.entries(themeMap.sounds)) {
+    if (isPlainObject(entry)) out[soundName] = { ...entry };
+  }
+  return out;
+}
+
+function buildThemeOverrideMap({ states, workingTiers, jugglingTiers, autoReturn, idleAnimations, reactions, hitbox, sounds }) {
   const out = {};
   if (states && Object.keys(states).length > 0) out.states = states;
   const tiers = {};
@@ -158,6 +215,9 @@ function buildThemeOverrideMap({ states, workingTiers, jugglingTiers, autoReturn
   if (Object.keys(tiers).length > 0) out.tiers = tiers;
   if (autoReturn && Object.keys(autoReturn).length > 0) out.timings = { autoReturn };
   if (idleAnimations && Object.keys(idleAnimations).length > 0) out.idleAnimations = idleAnimations;
+  if (reactions && Object.keys(reactions).length > 0) out.reactions = reactions;
+  if (hitbox && Object.keys(hitbox).length > 0) out.hitbox = hitbox;
+  if (sounds && Object.keys(sounds).length > 0) out.sounds = sounds;
   return out;
 }
 
@@ -194,13 +254,27 @@ const updateRegistry = {
   preMiniX: requireFiniteNumber("preMiniX"),
   preMiniY: requireFiniteNumber("preMiniY"),
   positionSaved: requireBoolean("positionSaved"),
+  positionThemeId: requireString("positionThemeId", { allowEmpty: true }),
+  positionVariantId: requireString("positionVariantId", { allowEmpty: true }),
+  // Written only by flushRuntimeStateToPrefs() with a snapshot Electron just
+  // handed us; null marks "no snapshot yet" (legacy prefs, headless CI, the
+  // rare startup race where screen.* is still coming up).
+  positionDisplay: (value) => {
+    if (value === null || isValidDisplaySnapshot(value)) return { status: "ok" };
+    return { status: "error", message: "positionDisplay must be null or a valid display snapshot" };
+  },
+  savedPixelWidth: requireNonNegativeFiniteNumber("savedPixelWidth"),
+  savedPixelHeight: requireNonNegativeFiniteNumber("savedPixelHeight"),
 
   // ── Pure data prefs (function-form: validator only) ──
   lang: requireEnum("lang", ["en", "zh", "ko"]),
   soundMuted: requireBoolean("soundMuted"),
+  soundVolume: requireNumberInRange("soundVolume", 0, 1),
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
   hideBubbles: requireBoolean("hideBubbles"),
   showSessionId: requireBoolean("showSessionId"),
+  allowEdgePinning: requireBoolean("allowEdgePinning"),
+  keepSizeAcrossDisplays: requireBoolean("keepSizeAcrossDisplays"),
 
   // ── System-backed prefs (object-form: validate + effect pre-commit gate) ──
   //
@@ -358,6 +432,12 @@ const updateRegistry = {
   // updates `theme` and `themeVariant` separately.
   themeVariant: requirePlainObject("themeVariant"),
 
+  shortcuts: {
+    validate(value) {
+      return validateShortcutMapShape(value);
+    },
+  },
+
   // ── Internal — version is owned by prefs.js / migrate(), shouldn't normally
   //    be set via applyUpdate, but we accept it so programmatic upgrades work. ──
   version(value) {
@@ -384,6 +464,300 @@ function notImplemented(name) {
       message: `${name}: not implemented yet (Phase 0 stub)`,
     };
   };
+}
+
+function getShortcutSnapshot(snapshot) {
+  const defaults = getDefaultShortcuts();
+  if (!snapshot || !snapshot.shortcuts || typeof snapshot.shortcuts !== "object") {
+    return defaults;
+  }
+  return { ...defaults, ...snapshot.shortcuts };
+}
+
+function getPersistentShortcutHandler(actionId, deps) {
+  const handlers = deps && deps.shortcutHandlers;
+  const handler = handlers && handlers[actionId];
+  if (typeof handler !== "function") return null;
+  return handler;
+}
+
+function tryRegisterGlobalShortcut(globalShortcutModule, accelerator, handler) {
+  if (!globalShortcutModule || typeof globalShortcutModule.register !== "function") return false;
+  try {
+    return !!globalShortcutModule.register(accelerator, handler);
+  } catch {
+    return false;
+  }
+}
+
+function tryUnregisterGlobalShortcut(globalShortcutModule, accelerator) {
+  if (!globalShortcutModule || typeof globalShortcutModule.unregister !== "function") {
+    return { ok: false };
+  }
+  try {
+    globalShortcutModule.unregister(accelerator);
+  } catch {
+    return { ok: false };
+  }
+  if (typeof globalShortcutModule.isRegistered === "function") {
+    try {
+      if (globalShortcutModule.isRegistered(accelerator)) {
+        return { ok: false };
+      }
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true };
+}
+
+function getShortcutFailure(actionId, deps) {
+  if (!deps || typeof deps.getShortcutFailure !== "function") return null;
+  return deps.getShortcutFailure(actionId) || null;
+}
+
+function clearShortcutFailure(actionId, deps) {
+  if (deps && typeof deps.clearShortcutFailure === "function") {
+    try { deps.clearShortcutFailure(actionId); } catch {}
+  }
+}
+
+function validateShortcutBinding(actionId, accelerator, deps) {
+  const meta = SHORTCUT_ACTIONS[actionId];
+  if (!meta) {
+    return { status: "error", message: "unknown shortcut action" };
+  }
+
+  if (accelerator === null) {
+    return { status: "ok", accelerator: null };
+  }
+  if (typeof accelerator !== "string") {
+    return { status: "error", message: "invalid accelerator format" };
+  }
+
+  const parsed = parseAccelerator(accelerator);
+  if (!parsed) {
+    return { status: "error", message: "invalid accelerator format" };
+  }
+  if (isDangerousAccelerator(parsed.accelerator)) {
+    return { status: "error", message: "reserved accelerator" };
+  }
+
+  const shortcuts = getShortcutSnapshot(deps && deps.snapshot);
+  for (const otherActionId of SHORTCUT_ACTION_IDS) {
+    if (otherActionId === actionId) continue;
+    if (shortcuts[otherActionId] === parsed.accelerator) {
+      return {
+        status: "error",
+        message: `conflict: already bound to ${otherActionId}`,
+      };
+    }
+  }
+
+  return { status: "ok", accelerator: parsed.accelerator };
+}
+
+function applyPersistentShortcutChange(actionId, oldAccelerator, newAccelerator, deps, { allowRetrySame = false } = {}) {
+  const globalShortcutModule = deps && deps.globalShortcut;
+  const handler = getPersistentShortcutHandler(actionId, deps);
+  if (!globalShortcutModule || typeof globalShortcutModule.register !== "function") {
+    return {
+      status: "error",
+      message: "registerShortcut requires globalShortcut dep",
+    };
+  }
+  if (!handler) {
+    return {
+      status: "error",
+      message: `registerShortcut missing handler for ${actionId}`,
+    };
+  }
+
+  if (oldAccelerator === newAccelerator) {
+    if (!allowRetrySame || !newAccelerator) {
+      clearShortcutFailure(actionId, deps);
+      return { status: "ok", noop: true };
+    }
+    let alreadyRegistered = false;
+    if (typeof globalShortcutModule.isRegistered === "function") {
+      try {
+        alreadyRegistered = !!globalShortcutModule.isRegistered(newAccelerator);
+      } catch {
+        alreadyRegistered = false;
+      }
+    }
+    if (alreadyRegistered) {
+      clearShortcutFailure(actionId, deps);
+      return { status: "ok", noop: true };
+    }
+    const retryOk = tryRegisterGlobalShortcut(globalShortcutModule, newAccelerator, handler);
+    if (!retryOk) {
+      return { status: "error", message: "system conflict: accelerator is in use" };
+    }
+    clearShortcutFailure(actionId, deps);
+    return { status: "ok", noop: true };
+  }
+
+  if (newAccelerator !== null) {
+    const ok = tryRegisterGlobalShortcut(globalShortcutModule, newAccelerator, handler);
+    if (!ok) {
+      return { status: "error", message: "system conflict: accelerator is in use" };
+    }
+  }
+
+  if (oldAccelerator !== null) {
+    const unregistered = tryUnregisterGlobalShortcut(globalShortcutModule, oldAccelerator);
+    if (!unregistered.ok) {
+      if (newAccelerator !== null) {
+        try { globalShortcutModule.unregister(newAccelerator); } catch {}
+      }
+      return {
+        status: "error",
+        message: "unregister of old accelerator failed, rolled back",
+      };
+    }
+  }
+
+  clearShortcutFailure(actionId, deps);
+  return { status: "ok" };
+}
+
+function registerShortcut(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "registerShortcut payload must be an object" };
+  }
+  const { actionId } = payload;
+  if (typeof actionId !== "string" || !SHORTCUT_ACTIONS[actionId]) {
+    return { status: "error", message: "unknown shortcut action" };
+  }
+
+  const accelerator = Object.prototype.hasOwnProperty.call(payload, "accelerator")
+    ? payload.accelerator
+    : undefined;
+  const validated = validateShortcutBinding(actionId, accelerator, deps);
+  if (validated.status !== "ok") return validated;
+
+  const shortcuts = getShortcutSnapshot(deps && deps.snapshot);
+  const currentAccelerator = shortcuts[actionId] ?? null;
+  const nextAccelerator = validated.accelerator;
+  const currentFailure = getShortcutFailure(actionId, deps);
+
+  if (currentAccelerator === nextAccelerator) {
+    if (SHORTCUT_ACTIONS[actionId].persistent && currentFailure) {
+      return applyPersistentShortcutChange(
+        actionId,
+        currentAccelerator,
+        nextAccelerator,
+        deps,
+        { allowRetrySame: true }
+      );
+    }
+    return { status: "ok", noop: true };
+  }
+
+  if (SHORTCUT_ACTIONS[actionId].persistent) {
+    const result = applyPersistentShortcutChange(
+      actionId,
+      currentAccelerator,
+      nextAccelerator,
+      deps
+    );
+    if (result.status !== "ok") return result;
+  }
+
+  return {
+    status: "ok",
+    commit: {
+      shortcuts: { ...shortcuts, [actionId]: nextAccelerator },
+    },
+  };
+}
+
+function resetShortcut(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "resetShortcut payload must be an object" };
+  }
+  const { actionId } = payload;
+  if (typeof actionId !== "string" || !SHORTCUT_ACTIONS[actionId]) {
+    return { status: "error", message: "unknown shortcut action" };
+  }
+  return registerShortcut({
+    actionId,
+    accelerator: SHORTCUT_ACTIONS[actionId].defaultAccelerator,
+  }, deps);
+}
+
+function rollbackAppliedShortcutChanges(appliedChanges, deps) {
+  const globalShortcutModule = deps && deps.globalShortcut;
+  if (!globalShortcutModule) return;
+  // Unwind in reverse order for symmetry: new-first applied (register new →
+  // unregister old), so rollback is (unregister new → re-register old).
+  for (let i = appliedChanges.length - 1; i >= 0; i--) {
+    const change = appliedChanges[i];
+    const handler = getPersistentShortcutHandler(change.actionId, deps);
+    if (change.newAccelerator !== null) {
+      try { globalShortcutModule.unregister(change.newAccelerator); } catch {}
+    }
+    if (change.oldAccelerator !== null && handler) {
+      try { globalShortcutModule.register(change.oldAccelerator, handler); } catch {}
+    }
+  }
+}
+
+function resetAllShortcuts(_payload, deps) {
+  const currentShortcuts = getShortcutSnapshot(deps && deps.snapshot);
+  const targetShortcuts = getDefaultShortcuts();
+
+  const seen = new Set();
+  for (const actionId of SHORTCUT_ACTION_IDS) {
+    const validated = validateShortcutBinding(actionId, targetShortcuts[actionId], {
+      ...deps,
+      snapshot: { ...(deps && deps.snapshot), shortcuts: {} },
+    });
+    if (validated.status !== "ok") return validated;
+    if (validated.accelerator !== null) {
+      if (seen.has(validated.accelerator)) {
+        return { status: "error", message: `conflict: already bound to ${actionId}` };
+      }
+      seen.add(validated.accelerator);
+    }
+  }
+
+  // Track successfully applied persistent changes so we can roll back on
+  // mid-loop failure. Today only `togglePet` is persistent so the loop runs
+  // at most once and rollback is a no-op — but this future-proofs the plan
+  // v3 §4.2 all-or-nothing contract for when additional persistent actions
+  // get added.
+  const appliedChanges = [];
+  for (const actionId of SHORTCUT_ACTION_IDS) {
+    const meta = SHORTCUT_ACTIONS[actionId];
+    if (!meta.persistent) continue;
+    const oldAccelerator = currentShortcuts[actionId] ?? null;
+    const newAccelerator = targetShortcuts[actionId] ?? null;
+    const currentFailure = getShortcutFailure(actionId, deps);
+    const result = applyPersistentShortcutChange(
+      actionId,
+      oldAccelerator,
+      newAccelerator,
+      deps,
+      { allowRetrySame: !!currentFailure }
+    );
+    if (result.status !== "ok") {
+      rollbackAppliedShortcutChanges(appliedChanges, deps);
+      return {
+        status: "error",
+        message: `system conflict on ${actionId}: accelerator in use`,
+      };
+    }
+    if (!result.noop) {
+      appliedChanges.push({ actionId, oldAccelerator, newAccelerator });
+    }
+  }
+
+  if (JSON.stringify(currentShortcuts) === JSON.stringify(targetShortcuts)) {
+    return { status: "ok", noop: true };
+  }
+  return { status: "ok", commit: { shortcuts: targetShortcuts } };
 }
 
 // setAgentFlag — atomic single-agent, single-flag toggle.
@@ -513,7 +887,7 @@ async function removeTheme(payload, deps) {
 // variant user had selected" scenario leaves `themeVariant[themeId]` pointing
 // at a dead variantId. Fix: call activateTheme which lenient-fallbacks unknown
 // variants, read back the actually-resolved variantId, and commit both fields.
-// See docs/plan-settings-panel-3b-swap.md §6.2 "Runtime 切换路径".
+// See docs/plans/plan-settings-panel-3b-swap.md §6.2 "Runtime 切换路径".
 const _validateSetThemeSelectionThemeId = requireString("setThemeSelection.themeId");
 function setThemeSelection(payload, deps) {
   const themeId = typeof payload === "string" ? payload : (payload && payload.themeId);
@@ -605,6 +979,9 @@ function setThemeOverrideDisabled(payload, deps) {
     jugglingTiers: cloneTierOverrides(currentThemeMap, "jugglingTiers"),
     autoReturn: cloneAutoReturnOverrides(currentThemeMap),
     idleAnimations: cloneIdleAnimationOverrides(currentThemeMap),
+    reactions: cloneReactionOverrides(currentThemeMap),
+    hitbox: cloneHitboxOverrides(currentThemeMap),
+    sounds: cloneSoundOverrides(currentThemeMap),
   });
   const nextOverrides = { ...currentOverrides };
   if (Object.keys(nextThemeMap).length > 0) {
@@ -623,8 +1000,8 @@ function setAnimationOverride(payload, deps) {
   const { themeId, slotType } = payload;
   const idCheck = _validateAnimationOverrideThemeId(themeId);
   if (idCheck.status !== "ok") return idCheck;
-  if (slotType !== "state" && slotType !== "tier" && slotType !== "idleAnimation") {
-    return { status: "error", message: "setAnimationOverride.slotType must be 'state', 'tier', or 'idleAnimation'" };
+  if (slotType !== "state" && slotType !== "tier" && slotType !== "idleAnimation" && slotType !== "reaction") {
+    return { status: "error", message: "setAnimationOverride.slotType must be 'state', 'tier', 'idleAnimation', or 'reaction'" };
   }
 
   const touchesFile = Object.prototype.hasOwnProperty.call(payload, "file");
@@ -666,6 +1043,9 @@ function setAnimationOverride(payload, deps) {
   const nextJugglingTiers = cloneTierOverrides(currentThemeMap, "jugglingTiers");
   const nextAutoReturn = cloneAutoReturnOverrides(currentThemeMap);
   const nextIdleAnimations = cloneIdleAnimationOverrides(currentThemeMap);
+  const nextReactions = cloneReactionOverrides(currentThemeMap);
+  const nextHitbox = cloneHitboxOverrides(currentThemeMap);
+  const nextSounds = cloneSoundOverrides(currentThemeMap);
 
   if (slotType === "state") {
     if (typeof payload.stateKey !== "string" || !payload.stateKey) {
@@ -725,7 +1105,7 @@ function setAnimationOverride(payload, deps) {
     }
     if (Object.keys(nextEntry).length > 0) tierMap[originalFile] = nextEntry;
     else delete tierMap[originalFile];
-  } else {
+  } else if (slotType === "idleAnimation") {
     const { originalFile } = payload;
     if (typeof originalFile !== "string" || !originalFile) {
       return { status: "error", message: "setAnimationOverride.originalFile must be a non-empty string for idleAnimation slots" };
@@ -752,6 +1132,39 @@ function setAnimationOverride(payload, deps) {
     }
     if (Object.keys(nextEntry).length > 0) nextIdleAnimations[originalFile] = nextEntry;
     else delete nextIdleAnimations[originalFile];
+  } else {
+    // slotType === "reaction"
+    const { reactionKey } = payload;
+    if (!REACTION_KEYS.has(reactionKey)) {
+      return { status: "error", message: "setAnimationOverride.reactionKey must be one of: drag, clickLeft, clickRight, annoyed, double" };
+    }
+    if (touchesAutoReturn) {
+      return { status: "error", message: "setAnimationOverride.autoReturnMs is not supported for reaction slots" };
+    }
+    // drag plays until pointer-up — no duration semantics. Other reactions use
+    // durationMs to control how long the oneshot stays on screen.
+    if (touchesDuration && reactionKey === "drag") {
+      return { status: "error", message: "setAnimationOverride.durationMs is not supported for reaction 'drag' (plays until pointer-up)" };
+    }
+    const nextEntry = { ...(nextReactions[reactionKey] || {}) };
+    if (touchesFile) {
+      if (payload.file === null) {
+        delete nextEntry.file;
+        delete nextEntry.sourceThemeId;
+      } else {
+        nextEntry.file = payload.file;
+      }
+    }
+    if (touchesTransition) {
+      if (payload.transition === null) delete nextEntry.transition;
+      else nextEntry.transition = normalizeTransitionPayload(payload.transition);
+    }
+    if (touchesDuration) {
+      if (payload.durationMs === null) delete nextEntry.durationMs;
+      else nextEntry.durationMs = payload.durationMs;
+    }
+    if (Object.keys(nextEntry).length > 0) nextReactions[reactionKey] = nextEntry;
+    else delete nextReactions[reactionKey];
   }
 
   const nextThemeMap = buildThemeOverrideMap({
@@ -760,6 +1173,9 @@ function setAnimationOverride(payload, deps) {
     jugglingTiers: nextJugglingTiers,
     autoReturn: nextAutoReturn,
     idleAnimations: nextIdleAnimations,
+    reactions: nextReactions,
+    hitbox: nextHitbox,
+    sounds: nextSounds,
   });
   const nextOverrides = { ...currentOverrides };
   if (Object.keys(nextThemeMap).length > 0) nextOverrides[themeId] = nextThemeMap;
@@ -782,6 +1198,197 @@ function setAnimationOverride(payload, deps) {
   }
 
   return { status: "ok", commit: { themeOverrides: nextOverrides } };
+}
+
+// Per-sound-name audio replacement. `file` is a basename only; main.js's IPC
+// layer handles copying the user-picked audio into the sound-overrides directory
+// before calling this command, so the action layer stays transport-agnostic.
+// Passing `file: null` clears the override for that sound name.
+function setSoundOverride(payload, deps) {
+  if (!isPlainObject(payload)) {
+    return { status: "error", message: "setSoundOverride: payload must be an object" };
+  }
+  const { themeId, soundName, file, originalName } = payload;
+  if (typeof themeId !== "string" || !themeId) {
+    return { status: "error", message: "setSoundOverride.themeId must be a non-empty string" };
+  }
+  if (typeof soundName !== "string" || !soundName) {
+    return { status: "error", message: "setSoundOverride.soundName must be a non-empty string" };
+  }
+  if (file !== null && (typeof file !== "string" || !file)) {
+    return { status: "error", message: "setSoundOverride.file must be null or a non-empty string" };
+  }
+
+  const snapshot = (deps && deps.snapshot) || {};
+  const currentOverrides = snapshot.themeOverrides || {};
+  const currentThemeMap = currentOverrides[themeId] || {};
+  const nextSounds = cloneSoundOverrides(currentThemeMap);
+
+  if (file === null) {
+    delete nextSounds[soundName];
+  } else {
+    const entry = { file };
+    if (typeof originalName === "string" && originalName) entry.originalName = originalName;
+    nextSounds[soundName] = entry;
+  }
+
+  const nextThemeMap = buildThemeOverrideMap({
+    states: cloneStateOverrides(currentThemeMap),
+    workingTiers: cloneTierOverrides(currentThemeMap, "workingTiers"),
+    jugglingTiers: cloneTierOverrides(currentThemeMap, "jugglingTiers"),
+    autoReturn: cloneAutoReturnOverrides(currentThemeMap),
+    idleAnimations: cloneIdleAnimationOverrides(currentThemeMap),
+    reactions: cloneReactionOverrides(currentThemeMap),
+    hitbox: cloneHitboxOverrides(currentThemeMap),
+    sounds: nextSounds,
+  });
+  const nextOverrides = { ...currentOverrides };
+  if (Object.keys(nextThemeMap).length > 0) nextOverrides[themeId] = nextThemeMap;
+  else delete nextOverrides[themeId];
+
+  if (JSON.stringify(nextOverrides) === JSON.stringify(currentOverrides)) {
+    return { status: "ok", noop: true };
+  }
+
+  const activeThemeId = snapshot.theme;
+  if (themeId === activeThemeId) {
+    if (!deps || typeof deps.activateTheme !== "function") {
+      return { status: "error", message: "setSoundOverride effect requires activateTheme dep for the active theme" };
+    }
+    try {
+      deps.activateTheme(themeId, null, nextThemeMap);
+    } catch (err) {
+      return { status: "error", message: `setSoundOverride: ${err && err.message}` };
+    }
+  }
+
+  return { status: "ok", commit: { themeOverrides: nextOverrides } };
+}
+
+// Per-file toggle: force a file INTO or OUT of the wide-hitbox set, overriding
+// the theme author's declaration. Passing `enabled: null` clears the override
+// for that file (fall back to whatever the theme declares).
+function setWideHitboxOverride(payload, deps) {
+  if (!isPlainObject(payload)) {
+    return { status: "error", message: "setWideHitboxOverride: payload must be an object" };
+  }
+  const { themeId, file, enabled } = payload;
+  if (typeof themeId !== "string" || !themeId) {
+    return { status: "error", message: "setWideHitboxOverride.themeId must be a non-empty string" };
+  }
+  if (typeof file !== "string" || !file) {
+    return { status: "error", message: "setWideHitboxOverride.file must be a non-empty string" };
+  }
+  if (enabled !== null && typeof enabled !== "boolean") {
+    return { status: "error", message: "setWideHitboxOverride.enabled must be boolean or null" };
+  }
+
+  const snapshot = (deps && deps.snapshot) || {};
+  const currentOverrides = snapshot.themeOverrides || {};
+  const currentThemeMap = currentOverrides[themeId] || {};
+  const currentHitbox = isPlainObject(currentThemeMap.hitbox) ? currentThemeMap.hitbox : {};
+  const currentWide = isPlainObject(currentHitbox.wide) ? { ...currentHitbox.wide } : {};
+
+  if (enabled === null) {
+    delete currentWide[file];
+  } else {
+    currentWide[file] = enabled;
+  }
+
+  const nextHitbox = { ...currentHitbox };
+  if (Object.keys(currentWide).length > 0) {
+    nextHitbox.wide = currentWide;
+  } else {
+    delete nextHitbox.wide;
+  }
+
+  const nextThemeMap = { ...currentThemeMap };
+  if (Object.keys(nextHitbox).length > 0) {
+    nextThemeMap.hitbox = nextHitbox;
+  } else {
+    delete nextThemeMap.hitbox;
+  }
+
+  const nextOverrides = { ...currentOverrides };
+  if (Object.keys(nextThemeMap).length > 0) nextOverrides[themeId] = nextThemeMap;
+  else delete nextOverrides[themeId];
+
+  if (JSON.stringify(nextOverrides) === JSON.stringify(currentOverrides)) {
+    return { status: "ok", noop: true };
+  }
+
+  const activeThemeId = snapshot.theme;
+  if (themeId === activeThemeId) {
+    if (!deps || typeof deps.activateTheme !== "function") {
+      return { status: "error", message: "setWideHitboxOverride effect requires activateTheme dep" };
+    }
+    try {
+      deps.activateTheme(themeId, null, nextThemeMap);
+    } catch (err) {
+      return { status: "error", message: `setWideHitboxOverride: ${err && err.message}` };
+    }
+  }
+
+  return { status: "ok", commit: { themeOverrides: nextOverrides } };
+}
+
+function importAnimationOverrides(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "importAnimationOverrides payload must be an object" };
+  }
+  const mode = payload.mode === "replace" ? "replace" : "merge";
+
+  const incomingVersion = payload.version;
+  if (typeof incomingVersion === "number" && incomingVersion > ANIMATION_OVERRIDES_EXPORT_VERSION) {
+    return {
+      status: "error",
+      message: `importAnimationOverrides: file version ${incomingVersion} newer than supported (${ANIMATION_OVERRIDES_EXPORT_VERSION})`,
+    };
+  }
+
+  const themesPayload = payload.themes;
+  if (!themesPayload || typeof themesPayload !== "object" || Array.isArray(themesPayload)) {
+    return { status: "error", message: "importAnimationOverrides: payload.themes must be an object" };
+  }
+
+  const normalizedIncoming = normalizeThemeOverrides(themesPayload, {});
+  if (!normalizedIncoming || Object.keys(normalizedIncoming).length === 0) {
+    return { status: "error", message: "importAnimationOverrides: no valid override entries found" };
+  }
+
+  const snapshot = (deps && deps.snapshot) || {};
+  const currentOverrides = snapshot.themeOverrides || {};
+  const nextOverrides = mode === "replace"
+    ? normalizedIncoming
+    : { ...currentOverrides, ...normalizedIncoming };
+
+  const activeThemeId = snapshot.theme;
+  const activeChanged = activeThemeId
+    && JSON.stringify(nextOverrides[activeThemeId] || null)
+       !== JSON.stringify(currentOverrides[activeThemeId] || null);
+
+  if (activeChanged) {
+    if (!deps || typeof deps.activateTheme !== "function") {
+      return { status: "error", message: "importAnimationOverrides effect requires activateTheme dep" };
+    }
+    try {
+      // Must pass nextOverrides[activeThemeId] — the effect runs BEFORE
+      // controller._commit(), so activateTheme reading themeOverrides from the
+      // store would still see the old map. Passing nextOverrideMap explicitly
+      // is what makes the newly-imported slots actually take effect.
+      deps.activateTheme(activeThemeId, null, nextOverrides[activeThemeId] || null);
+    } catch (err) {
+      return { status: "error", message: `importAnimationOverrides: ${err && err.message}` };
+    }
+  }
+
+  const importedThemeCount = Object.keys(normalizedIncoming).length;
+  return {
+    status: "ok",
+    commit: { themeOverrides: nextOverrides },
+    importedThemeCount,
+    mode,
+  };
 }
 
 const _validateResetOverridesThemeId = requireString("resetThemeOverrides.themeId");
@@ -853,15 +1460,41 @@ function uninstallHooks(_payload, deps) {
   }
 }
 
+function resizePet(payload, deps) {
+  // Settings panel slider entry point. Routes to menu.resizeWindow via
+  // deps.resizePet so it picks up the full side-effect chain (actual window
+  // resize, hitWin sync, bubble reposition, runtime flush) that a raw
+  // applyUpdate("size", ...) would miss. menu.resizeWindow itself writes
+  // prefs.size through the controller, so this command returns no commit.
+  if (typeof payload !== "string" || !/^P:\d+(?:\.\d+)?$/.test(payload)) {
+    return { status: "error", message: `resizePet: invalid size "${payload}"` };
+  }
+  if (!deps || typeof deps.resizePet !== "function") {
+    return { status: "error", message: "resizePet requires deps.resizePet" };
+  }
+  try {
+    deps.resizePet(payload);
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", message: `resizePet: ${err && err.message}` };
+  }
+}
+
 const commandRegistry = {
   removeTheme,
   installHooks,
   uninstallHooks,
-  registerShortcut: notImplemented("registerShortcut"),
+  resizePet,
+  registerShortcut,
+  resetShortcut,
+  resetAllShortcuts,
   setAgentFlag,
   setAnimationOverride,
+  setSoundOverride,
   setThemeOverrideDisabled,
   resetThemeOverrides,
+  importAnimationOverrides,
+  setWideHitboxOverride,
   setThemeSelection,
 };
 
@@ -869,6 +1502,7 @@ module.exports = {
   updateRegistry,
   commandRegistry,
   ONESHOT_OVERRIDE_STATES,
+  ANIMATION_OVERRIDES_EXPORT_VERSION,
   // Exposed for tests
   requireBoolean,
   requireFiniteNumber,

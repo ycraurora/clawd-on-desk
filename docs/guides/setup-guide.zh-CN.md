@@ -10,9 +10,19 @@
 
 **Docker / devcontainer 里的 VS Code Codex** — Clawd 采用双端 bridge：随应用自动安装的本地 `clawd-terminal-focus` 扩展负责把事件转发到本机 Clawd，而真正读取容器内 `~/.codex/sessions` 的是另一个跑在 remote/workspace 侧的 helper 扩展。这个 helper 目前还不会自动装进容器里的 VS Code Server，测试这条链路时需要先手动安装一次。
 
-**Copilot CLI** — 需要手动配置 hooks。请参考 [copilot-setup.md](copilot-setup.md)。
+**Copilot CLI** — 目前唯一仍需手动配置 hooks 的受支持 Agent。请参考 [copilot-setup.md](copilot-setup.md)。
 
-**Kiro CLI** — 如果你想在启动 Clawd 前先注册 hooks，可先执行 `npm run install:kiro-hooks`。Kiro 内置的 `kiro_default` 不是一个可编辑的 JSON agent，所以 Clawd 会维护一个自定义 `clawd` agent，并在每次启动时先同步最新的 `kiro_default` 配置，再追加 hooks。需要 hooks 时，请用 `kiro-cli --agent clawd` 新开会话，或者在现有会话里执行 `/agent swap clawd`。目前在 macOS 上，状态类动效已验证可用；但涉及终端里 `t / y / n` 的原生权限确认，仍然只能在终端处理。
+**Gemini CLI** — hooks 配置在 `~/.gemini/settings.json`。如果本机已安装 Gemini，Clawd 启动时会自动注册；也可以手动执行 `npm run install:gemini-hooks`。
+
+**Cursor Agent** — hooks 配置在 `~/.cursor/hooks.json`。如果本机已安装 Cursor，Clawd 启动时会自动注册；也可以手动执行 `npm run install:cursor-hooks`。
+
+**CodeBuddy** — 使用与 Claude Code 兼容的 hooks，配置写入 `~/.codebuddy/settings.json`。如果本机已安装 CodeBuddy，Clawd 启动时会自动注册；也可以手动执行 `node hooks/codebuddy-install.js`。
+
+**Kiro CLI** — 如果你想在启动 Clawd 前先注册 hooks，可先执行 `npm run install:kiro-hooks`。Kiro 内置的 `kiro_default` 不是一个可编辑的 JSON agent，所以 Clawd 会维护一个自定义 `clawd` agent，并在每次启动时先同步最新的 `kiro_default` 配置，再追加 hooks。需要 hooks 时，请用 `kiro-cli --agent clawd` 新开会话，或者在现有会话里执行 `/agent swap clawd`。目前在 macOS 与 Windows 上，状态类动效已验证可用；但涉及终端里 `t / y / n` 的原生权限确认，仍然只能在终端处理。
+
+**Kimi Code** — hooks 配置在 `~/.kimi/config.toml`（`[[hooks]]` 条目）。如果本机已安装 Kimi，Clawd 启动时会自动注册；也可以手动执行 `npm run install:kimi-hooks`。在 Clawd 中 Kimi 采用 hook-only 集成：状态和权限提示都来自 hook 事件，不再依赖日志轮询。如果想让权限分类策略在重启后仍然生效，请在执行安装命令之前设置环境变量 `CLAWD_KIMI_PERMISSION_MODE=explicit`（默认）或 `CLAWD_KIMI_PERMISSION_MODE=suspect`，安装脚本会把这个值写进 `~/.kimi/config.toml` 中每条 Kimi hook 的 `command` 字段，后续 Clawd 自动同步也会保留它。注意：自动同步会按预期行重写 `command` 字段，所以你对该字段的手工修改会在下次启动时被静默还原。
+
+**opencode** — 使用 `~/.config/opencode/opencode.json` 里的 plugin 配置。如果本机已安装 opencode，Clawd 启动时会自动注册；也可以手动执行 `node hooks/opencode-install.js`。
 
 ## 远程 SSH 模式（Claude Code & Codex CLI）
 
@@ -50,6 +60,8 @@ Host my-server
 > 树莓派实战详细教程见 [guide-remote-ssh.md](guide-remote-ssh.md)。
 
 ## WSL（Windows Subsystem for Linux）
+
+> 本节的主线是 Claude Code / 其他 hook 型 agent 的 WSL 配置。关于 `Codex CLI + WSL` 的官方支持现状、Windows hooks 状态、以及 Clawd 当前为什么默认扫不到 WSL Linux home 下的 Codex 日志，见：[codex-wsl-clarification.zh-CN.md](codex-wsl-clarification.zh-CN.md)
 
 如果你在 WSL 里跑 Claude Code，而 Clawd 跑在 Windows 宿主上，hook 可以直接 POST 到 `127.0.0.1:23333` —— 不需要 SSH 隧道，因为 WSL2 默认与 Windows 共享 localhost。
 
@@ -104,11 +116,17 @@ node hooks/install.js
 # 并自动创建一个 clawd agent
 node hooks/kiro-install.js
 
+# Kimi Code
+node hooks/kimi-install.js
+
 # Cursor Agent
 node hooks/cursor-install.js
 
 # Gemini CLI
 node hooks/gemini-install.js
+
+# CodeBuddy
+node hooks/codebuddy-install.js
 
 # opencode
 node hooks/opencode-install.js

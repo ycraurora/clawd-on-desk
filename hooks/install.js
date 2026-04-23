@@ -23,8 +23,13 @@ const CORE_HOOKS = [
   "Notification",
   // PermissionRequest: handled by HTTP_HOOKS (blocking), not command hook
   "Elicitation",
-  "WorktreeCreate",
 ];
+
+// Events we used to register but shouldn't anymore. WorktreeCreate is a
+// work-performing hook (must print the new worktree path to stdout) — our
+// notification-only handler broke `claude -w` with "no successful output".
+// Reported by @IsuminI in issue #127.
+const DEPRECATED_CORE_HOOKS = ["WorktreeCreate"];
 
 // Hooks that require a minimum Claude Code version
 const VERSIONED_HOOKS = [
@@ -289,32 +294,69 @@ function extractNodeBinFromSettings(settings, marker) {
   return null;
 }
 
+function buildCommandHookSpec(nodeBin, scriptPath, args = "", options = {}) {
+  const platform = options.platform || process.platform;
+  const argSuffix = args ? ` ${args}` : "";
+  const quotedCommand = `"${nodeBin}" "${scriptPath}"${argSuffix}`;
+
+  // Remote hook deployment targets POSIX shells over SSH and relies on bash-style
+  // env-prefix syntax (`CLAWD_REMOTE=1 cmd`). Keep that legacy form even if tests
+  // force win32 here; Windows + remote is not a supported deployment target.
+  if (options.remote) {
+    return {
+      type: "command",
+      command: `CLAWD_REMOTE=1 ${quotedCommand}`,
+    };
+  }
+
+  if (platform === "win32") {
+    return {
+      type: "command",
+      shell: "powershell",
+      command: `& ${quotedCommand}`,
+    };
+  }
+
+  return {
+    type: "command",
+    command: quotedCommand,
+  };
+}
+
 function forEachCommandHook(entries, visitor) {
   if (!Array.isArray(entries)) return;
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
     if (typeof entry.command === "string") {
-      visitor(entry.command, (next) => { entry.command = next; });
+      visitor(entry);
     }
     if (Array.isArray(entry.hooks)) {
       for (const hook of entry.hooks) {
         if (!hook || typeof hook !== "object" || typeof hook.command !== "string") continue;
-        visitor(hook.command, (next) => { hook.command = next; });
+        visitor(hook);
       }
     }
   }
 }
 
-function syncCommandHook(entries, marker, expectedCommand) {
+function syncCommandHook(entries, marker, expectedHook) {
   let found = false;
   let changed = false;
-  forEachCommandHook(entries, (command, update) => {
-    if (!command.includes(marker)) return;
+  const expectedShell = typeof expectedHook.shell === "string" ? expectedHook.shell : undefined;
+
+  forEachCommandHook(entries, (hook) => {
+    if (!hook.command.includes(marker)) return;
     found = true;
-    if (command !== expectedCommand) {
-      update(expectedCommand);
+    if (hook.command !== expectedHook.command) {
+      hook.command = expectedHook.command;
       changed = true;
     }
+
+    const currentShell = typeof hook.shell === "string" ? hook.shell : undefined;
+    if (currentShell === expectedShell) return;
+    if (expectedShell === undefined) delete hook.shell;
+    else hook.shell = expectedShell;
+    changed = true;
   });
   return { found, changed };
 }
@@ -543,6 +585,7 @@ function registerHooks(options = {}) {
   const settingsPath = options.settingsPath || path.join(os.homedir(), ".claude", "settings.json");
   const hookPort = getHookServerPort(options.port);
   const hookScript = asarUnpackedPath(path.resolve(__dirname, "clawd-hook.js").replace(/\\/g, "/"));
+  const platform = options.platform || process.platform;
 
   // Read existing settings
   let settings = {};
@@ -583,6 +626,21 @@ function registerHooks(options = {}) {
   removed += reconcileResult.removed;
   changed = changed || reconcileResult.changed;
 
+  // Remove deprecated hooks we used to register. Match by MARKER so user-authored
+  // hooks for the same event are preserved untouched. See issue #127.
+  for (const event of DEPRECATED_CORE_HOOKS) {
+    if (!Array.isArray(settings.hooks[event])) continue;
+    const result = removeMatchingCommandHooks(
+      settings.hooks[event],
+      (command) => command.includes(MARKER)
+    );
+    if (!result.changed) continue;
+    removed += result.removed;
+    changed = true;
+    if (result.entries.length > 0) settings.hooks[event] = result.entries;
+    else delete settings.hooks[event];
+  }
+
   // Build the full hook list: core + version-compatible hooks
   const hookEvents = [...CORE_HOOKS];
   for (const { event } of supportedVersionedHooks) {
@@ -597,12 +655,14 @@ function registerHooks(options = {}) {
       changed = true;  // format was normalized, need to persist
     }
 
-    // Check if our hook is already registered (search nested hooks arrays too)
-    // Remote mode: prepend CLAWD_REMOTE=1 so the hook skips PID collection
-    const desiredCommand = options.remote
-      ? `CLAWD_REMOTE=1 "${nodeBin}" "${hookScript}" ${event}`
-      : `"${nodeBin}" "${hookScript}" ${event}`;
-    const commandSync = syncCommandHook(settings.hooks[event], MARKER, desiredCommand);
+    // Local Windows hooks must use explicit PowerShell invocation because Claude
+    // Code defaults command hooks to bash on Windows. Remote hooks stay on the
+    // legacy POSIX/bash-compatible form; see buildCommandHookSpec().
+    const desiredHook = buildCommandHookSpec(nodeBin, hookScript, event, {
+      platform,
+      remote: options.remote,
+    });
+    const commandSync = syncCommandHook(settings.hooks[event], MARKER, desiredHook);
     if (commandSync.found) {
       if (commandSync.changed) {
         updated++;
@@ -616,12 +676,7 @@ function registerHooks(options = {}) {
     // Use nested format to match Claude Code's expected structure
     settings.hooks[event].push({
       matcher: "",
-      hooks: [
-        {
-          type: "command",
-          command: desiredCommand,
-        },
-      ],
+      hooks: [desiredHook],
     });
     added++;
   }
@@ -635,13 +690,13 @@ function registerHooks(options = {}) {
       changed = true;
     }
 
-    const autoStartCommand = `"${nodeBin}" "${autoStartScript}"`;
-    const autoStartSync = syncCommandHook(settings.hooks.SessionStart, AUTO_START_MARKER, autoStartCommand);
+    const autoStartHook = buildCommandHookSpec(nodeBin, autoStartScript, "", { platform });
+    const autoStartSync = syncCommandHook(settings.hooks.SessionStart, AUTO_START_MARKER, autoStartHook);
     if (!autoStartSync.found) {
       // Insert at index 0 — must run BEFORE clawd-hook.js so the app is starting
       settings.hooks.SessionStart.unshift({
         matcher: "",
-        hooks: [{ type: "command", command: autoStartCommand }],
+        hooks: [autoStartHook],
       });
       added++;
     } else if (autoStartSync.changed) {
@@ -876,6 +931,7 @@ module.exports = {
     removeMatchingCommandHooks,
     reconcileVersionedHooks,
     shouldReconcileVersionedHooks,
+    buildCommandHookSpec,
   },
 };
 
