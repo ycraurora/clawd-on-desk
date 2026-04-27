@@ -2,6 +2,7 @@
 
 const { app, BrowserWindow, screen, Menu, Tray, nativeImage } = require("electron");
 const path = require("path");
+const { keepOutOfTaskbar } = require("./taskbar");
 
 const isMac = process.platform === "darwin";
 const isWin = process.platform === "win32";
@@ -119,12 +120,6 @@ module.exports = function initMenu(ctx) {
         checked: !ctx.soundMuted,
         click: (menuItem) => { ctx.soundMuted = !menuItem.checked; },
       },
-      {
-        label: t("showSessionId"),
-        type: "checkbox",
-        checked: ctx.showSessionId,
-        click: (menuItem) => { ctx.showSessionId = menuItem.checked; },
-      },
       { type: "separator" },
       {
         label: t("startOnLogin"),
@@ -162,6 +157,12 @@ module.exports = function initMenu(ctx) {
       {
         label: t("settings"),
         click: () => ctx.openSettingsWindow(),
+      },
+      {
+        label: t("openDashboard"),
+        click: () => {
+          if (typeof ctx.openDashboard === "function") ctx.openDashboard();
+        },
       },
       buildBringToPrimaryDisplayMenuItem(),
       { type: "separator" },
@@ -239,6 +240,7 @@ module.exports = function initMenu(ctx) {
     const cursor = screen.getCursorScreenPoint();
     owner.setBounds({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
     owner.show();
+    keepOutOfTaskbar(owner);
     owner.focus();
 
     ctx.menuOpen = true;
@@ -249,6 +251,7 @@ module.exports = function initMenu(ctx) {
         if (owner && !owner.isDestroyed()) owner.hide();
         if (ctx.win && !ctx.win.isDestroyed()) {
           ctx.win.showInactive();
+          keepOutOfTaskbar(ctx.win);
           if (isMac) {
             ctx.reapplyMacVisibility();
           } else if (isWin) {
@@ -308,8 +311,10 @@ module.exports = function initMenu(ctx) {
       },
       { type: "separator" },
       {
-        label: `${t("sessions")} (${ctx.sessions.size})`,
-        submenu: ctx.buildSessionSubmenu(),
+        label: t("openDashboard"),
+        click: () => {
+          if (typeof ctx.openDashboard === "function") ctx.openDashboard();
+        },
       },
     ];
     // sendToDisplay is a multi-display-only tail entry. Push dynamically

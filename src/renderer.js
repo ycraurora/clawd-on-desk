@@ -5,6 +5,13 @@
 const container = document.getElementById("pet-container");
 let clawdEl = document.getElementById("clawd");
 let pendingNext = null;
+const LOW_POWER_IDLE_PAUSE_MS = 5000;
+const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
+const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
+const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
+let lowPowerIdleMode = false;
+let lowPowerIdlePauseTimer = null;
+let lowPowerSvgPaused = false;
 
 // ── Theme config (injected via preload.js additionalArguments) ──
 let tc = window.themeConfig || {};
@@ -75,6 +82,154 @@ function applyObjectScaleStyle(el, file) {
     el.style.left = `calc(${_objectScaleCSS.left} + ${ox}px)`;
     el.style.top = "auto";
     el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy + _viewportOffsetY}px)`;
+  }
+}
+
+function getCurrentSvgRoot() {
+  if (!clawdEl || clawdEl.tagName !== "OBJECT") return null;
+  try {
+    const svgDoc = clawdEl.contentDocument;
+    return svgDoc ? svgDoc.documentElement : null;
+  } catch {
+    return null;
+  }
+}
+
+function shouldPauseForLowPower() {
+  if (isReacting || isDragReacting) return false;
+  return lowPowerIdleMode && LOW_POWER_PAUSE_STATES.has(currentState);
+}
+
+function getLowPowerAnimationBoundaryDelayMs(root) {
+  if (!root || typeof root.getAnimations !== "function") return 0;
+  let animations = [];
+  try {
+    animations = root.getAnimations({ subtree: true });
+  } catch {
+    return 0;
+  }
+
+  let delayMs = 0;
+  for (const animation of animations) {
+    if (!animation || animation.playState === "paused" || animation.playState === "finished") continue;
+    const effect = animation.effect;
+    if (!effect || typeof effect.getComputedTiming !== "function") continue;
+
+    let timing = null;
+    try {
+      timing = effect.getComputedTiming();
+    } catch {
+      continue;
+    }
+    if (!timing) continue;
+
+    const localTime = Number.isFinite(timing.localTime)
+      ? timing.localTime
+      : (Number.isFinite(animation.currentTime) ? animation.currentTime : null);
+    if (!Number.isFinite(localTime) || localTime < 0) continue;
+
+    const activeDuration = Number.isFinite(timing.activeDuration)
+      ? timing.activeDuration
+      : (Number.isFinite(timing.endTime) ? timing.endTime : null);
+    if (Number.isFinite(activeDuration) && activeDuration > localTime) {
+      delayMs = Math.max(delayMs, activeDuration - localTime);
+      continue;
+    }
+
+    const duration = Number.isFinite(timing.duration) ? timing.duration : null;
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+
+    let direction = timing.direction || "";
+    try {
+      const rawTiming = typeof effect.getTiming === "function" ? effect.getTiming() : null;
+      if (rawTiming && rawTiming.direction) direction = rawTiming.direction;
+    } catch {}
+    const loopDuration = duration * ((direction === "alternate" || direction === "alternate-reverse") ? 2 : 1);
+    const progress = localTime % loopDuration;
+    const remaining = progress <= LOW_POWER_BOUNDARY_EPSILON_MS ? 0 : loopDuration - progress;
+    delayMs = Math.max(delayMs, remaining);
+  }
+  return delayMs > LOW_POWER_BOUNDARY_EPSILON_MS ? Math.ceil(delayMs) : 0;
+}
+
+function pauseCurrentSvgForLowPower({ waitForBoundary = false } = {}) {
+  if (!shouldPauseForLowPower()) return;
+  const root = getCurrentSvgRoot();
+  if (!root) return;
+  if (waitForBoundary) {
+    const delayMs = getLowPowerAnimationBoundaryDelayMs(root);
+    if (delayMs > 0) {
+      lowPowerIdlePauseTimer = setTimeout(() => {
+        lowPowerIdlePauseTimer = null;
+        pauseCurrentSvgForLowPower();
+      }, delayMs);
+      return;
+    }
+  }
+  const svgDoc = root.ownerDocument;
+  if (svgDoc && !svgDoc.getElementById(LOW_POWER_PAUSE_STYLE_ID)) {
+    const style = svgDoc.createElementNS("http://www.w3.org/2000/svg", "style");
+    style.id = LOW_POWER_PAUSE_STYLE_ID;
+    style.textContent = `
+      *, *::before, *::after {
+        animation-play-state: paused !important;
+        transition-property: none !important;
+      }
+    `;
+    root.appendChild(style);
+  }
+  try {
+    if (typeof root.pauseAnimations === "function") root.pauseAnimations();
+  } catch {}
+  lowPowerSvgPaused = true;
+}
+
+function resumeCurrentSvgForLowPower() {
+  if (lowPowerIdlePauseTimer) {
+    clearTimeout(lowPowerIdlePauseTimer);
+    lowPowerIdlePauseTimer = null;
+  }
+  const root = getCurrentSvgRoot();
+  if (root) {
+    try {
+      const svgDoc = root.ownerDocument;
+      const style = svgDoc && svgDoc.getElementById(LOW_POWER_PAUSE_STYLE_ID);
+      if (style) style.remove();
+      if (typeof root.unpauseAnimations === "function") root.unpauseAnimations();
+    } catch {}
+  }
+  lowPowerSvgPaused = false;
+}
+
+function scheduleLowPowerIdlePause() {
+  if (lowPowerIdlePauseTimer) {
+    clearTimeout(lowPowerIdlePauseTimer);
+    lowPowerIdlePauseTimer = null;
+  }
+  if (!shouldPauseForLowPower()) {
+    resumeCurrentSvgForLowPower();
+    return;
+  }
+  lowPowerIdlePauseTimer = setTimeout(() => {
+    lowPowerIdlePauseTimer = null;
+    pauseCurrentSvgForLowPower({ waitForBoundary: true });
+  }, LOW_POWER_IDLE_PAUSE_MS);
+}
+
+function noteLowPowerActivity() {
+  if (!lowPowerIdleMode && !lowPowerSvgPaused) return;
+  if (lowPowerSvgPaused) {
+    resumeCurrentSvgForLowPower();
+  }
+  scheduleLowPowerIdlePause();
+}
+
+function setLowPowerIdleMode(enabled) {
+  lowPowerIdleMode = !!enabled;
+  if (lowPowerIdleMode) {
+    scheduleLowPowerIdlePause();
+  } else {
+    resumeCurrentSvgForLowPower();
   }
 }
 
@@ -160,6 +315,7 @@ let _layerTargetDx = 0;           // raw dx from tick.js (scaled to _themeMaxOff
 let _layerTargetDy = 0;           // raw dy from tick.js
 let _layerAnimFrame = null;        // requestAnimationFrame handle
 let _layeredTrackingObj = null;    // the <object> element currently tracked (guard against re-init)
+const LAYER_SETTLE_EPSILON = 0.02;
 
 initWithConfig(tc);
 
@@ -197,6 +353,10 @@ let currentIdleSvg = null;    // tracks which SVG is currently showing
 let currentState = null;      // last state name received from main (for re-pulse)
 let dndEnabled = false;
 let miniLeftFlip = false;
+
+if (window.electronAPI && typeof window.electronAPI.onLowPowerIdleModeChange === "function") {
+  window.electronAPI.onLowPowerIdleModeChange(setLowPowerIdleMode);
+}
 
 window.electronAPI.onDndChange((enabled) => { dndEnabled = enabled; });
 
@@ -284,6 +444,7 @@ window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, dura
 function playReaction(svgFile, durationMs) {
   isReacting = true;
   detachEyeTracking();
+  resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
 
   // Reactions always use <img> channel (no eye tracking needed)
@@ -322,6 +483,7 @@ function startDragReaction() {
 
   isDragReacting = true;
   detachEyeTracking();
+  resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
   swapToFile(_dragSvg, null, false);
 }
@@ -401,6 +563,7 @@ function swapToFile(file, state, useObjectChannel) {
         attachEyeTracking(next);
       }
       if (miniLeftFlip) applyGlyphFlipCompensation(next);
+      scheduleLowPowerIdlePause();
     };
 
     next.addEventListener("load", swap, { once: true });
@@ -445,6 +608,7 @@ function swapToFile(file, state, useObjectChannel) {
       pendingSvgFile = null;
       clawdEl = next;
       currentDisplayedSvg = file;
+      scheduleLowPowerIdlePause();
     };
 
     next.addEventListener("load", swap, { once: true });
@@ -475,6 +639,7 @@ window.electronAPI.onStateChange((state, svg) => {
   // Track the latest state name so the Kimi permission pulse can re-trigger
   // swapToFile() with the matching state for eye-tracking decisions.
   currentState = state;
+  noteLowPowerActivity();
 
   // Dedup: same file already displayed OR currently loading → don't re-swap
   const alreadyDisplayed = clawdEl && clawdEl.isConnected && currentDisplayedSvg === svg;
@@ -487,6 +652,7 @@ window.electronAPI.onStateChange((state, svg) => {
       } else if (!needsObjectChannel(state, svg)) {
         detachEyeTracking();
       }
+      scheduleLowPowerIdlePause();
     }
     currentIdleSvg = svg;
     return;
@@ -591,6 +757,17 @@ function _calcLayerOffset(dx, dy, maxOffset) {
   return [(dx / dist) * clamp, (dy / dist) * clamp];
 }
 
+function _getLayerTarget(layer, rawDx, rawDy) {
+  const scale = layer.maxOffset / (_themeMaxOffset || 20);
+  return [rawDx * scale, rawDy * scale];
+}
+
+function _layerNeedsAnimation(layer, rawDx, rawDy) {
+  const [tx, ty] = _getLayerTarget(layer, rawDx, rawDy);
+  return Math.abs(layer.x - tx) >= LAYER_SETTLE_EPSILON
+    || Math.abs(layer.y - ty) >= LAYER_SETTLE_EPSILON;
+}
+
 /**
  * Initialize layered tracking for a loaded SVG document.
  * Creates <g> wrappers for each element listed in trackingLayers config.
@@ -632,8 +809,11 @@ function _initLayeredTracking(svgDoc) {
     };
   }
 
-  // Start the easing animation loop
-  _startLayerAnimLoop();
+  _layerTargetDx = lastEyeDx;
+  _layerTargetDy = lastEyeDy;
+  if (Object.values(_trackingLayers).some(layer => _layerNeedsAnimation(layer, _layerTargetDx, _layerTargetDy))) {
+    _startLayerAnimLoop();
+  }
 }
 
 /**
@@ -647,23 +827,27 @@ function _startLayerAnimLoop() {
 
     const rawDx = _layerTargetDx;
     const rawDy = _layerTargetDy;
+    let allSettled = true;
 
     for (const layer of Object.values(_trackingLayers)) {
       // Scale the pre-calculated offset (from tick.js, already in [-maxOffset, maxOffset])
       // to this layer's range. No second normalization — tick.js already did it.
-      const scale = layer.maxOffset / (_themeMaxOffset || 20);
-      const tx = rawDx * scale;
-      const ty = rawDy * scale;
+      const [tx, ty] = _getLayerTarget(layer, rawDx, rawDy);
 
       // Lerp towards target
       layer.x += (tx - layer.x) * layer.ease;
       layer.y += (ty - layer.y) * layer.ease;
+
+      if (Math.abs(layer.x - tx) < LAYER_SETTLE_EPSILON) layer.x = tx;
+      if (Math.abs(layer.y - ty) < LAYER_SETTLE_EPSILON) layer.y = ty;
 
       // Snap to zero when very close (avoid sub-pixel jitter)
       if (Math.abs(layer.x) < 0.01 && Math.abs(layer.y) < 0.01 && tx === 0 && ty === 0) {
         layer.x = 0;
         layer.y = 0;
       }
+
+      if (layer.x !== tx || layer.y !== ty) allSettled = false;
 
       // Quantize to quarter-pixel grid for smooth rendering
       const qx = Math.round(layer.x * 4) / 4;
@@ -673,6 +857,11 @@ function _startLayerAnimLoop() {
       for (const w of layer.wrappers) {
         w.setAttribute("transform", `translate(${qx},${qy})`);
       }
+    }
+
+    if (allSettled) {
+      _layerAnimFrame = null;
+      return;
     }
 
     _layerAnimFrame = requestAnimationFrame(tick);
@@ -767,6 +956,7 @@ function detachEyeTracking() {
 }
 
 window.electronAPI.onEyeMove((dx, dy) => {
+  noteLowPowerActivity();
   const effectiveDx = miniLeftFlip ? -dx : dx;
   lastEyeDx = effectiveDx;
   lastEyeDy = dy;
@@ -775,6 +965,7 @@ window.electronAPI.onEyeMove((dx, dy) => {
     // Layered tracking: store targets, RAF loop handles easing
     _layerTargetDx = effectiveDx;
     _layerTargetDy = dy;
+    _startLayerAnimLoop();
     return;
   }
 

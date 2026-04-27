@@ -77,12 +77,26 @@ describe("updateRegistry pure-data validators", () => {
   it("function-form boolean fields reject non-booleans", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
-      "soundMuted", "bubbleFollowPet", "hideBubbles", "allowEdgePinning", "keepSizeAcrossDisplays",
-      "showSessionId", "miniMode", "openAtLoginHydrated",
+      "sessionHudEnabled", "miniMode", "openAtLoginHydrated",
+      "soundMuted", "bubbleFollowPet", "sessionHudEnabled", "hideBubbles", "permissionBubblesEnabled",
+      "lowPowerIdleMode", "allowEdgePinning", "keepSizeAcrossDisplays", "miniMode", "openAtLoginHydrated",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
       assert.strictEqual(updateRegistry[key]("yes", deps).status, "error", `${key}("yes")`);
+    }
+  });
+
+  it("bubble auto-close seconds require integers in range", () => {
+    const deps = { snapshot: baseSnapshot };
+    for (const key of ["notificationBubbleAutoCloseSeconds", "updateBubbleAutoCloseSeconds"]) {
+      assert.strictEqual(updateRegistry[key](0, deps).status, "ok", `${key}(0)`);
+      assert.strictEqual(updateRegistry[key](30, deps).status, "ok", `${key}(30)`);
+      assert.strictEqual(updateRegistry[key](3600, deps).status, "ok", `${key}(3600)`);
+      assert.strictEqual(updateRegistry[key](-1, deps).status, "error", `${key}(-1)`);
+      assert.strictEqual(updateRegistry[key](1.5, deps).status, "error", `${key}(1.5)`);
+      assert.strictEqual(updateRegistry[key](3601, deps).status, "error", `${key}(3601)`);
+      assert.strictEqual(updateRegistry[key]("30", deps).status, "error", `${key}("30")`);
     }
   });
 
@@ -179,6 +193,20 @@ describe("updateRegistry pure-data validators", () => {
     assert.strictEqual(updateRegistry.agents([], deps).status, "error");
     assert.strictEqual(updateRegistry.themeOverrides({}, deps).status, "ok");
     assert.strictEqual(updateRegistry.themeOverrides("nope", deps).status, "error");
+  });
+
+  it("sessionAliases requires a plain object of valid alias entries", () => {
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(
+      updateRegistry.sessionAliases({ "local|codex|s1": { title: "Codex", updatedAt: 100 } }, deps).status,
+      "ok"
+    );
+    assert.strictEqual(updateRegistry.sessionAliases({}, deps).status, "ok");
+    assert.strictEqual(updateRegistry.sessionAliases([], deps).status, "error");
+    assert.strictEqual(
+      updateRegistry.sessionAliases({ "local|codex|s1": { title: "", updatedAt: 100 } }, deps).status,
+      "error"
+    );
   });
 
   it("shortcuts commit validator accepts only known keys with string/null values", () => {
@@ -314,6 +342,80 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
   });
 });
 
+describe("bubble policy commands", () => {
+  it("setBubbleCategoryEnabled toggles notification and update defaults", async () => {
+    const snapshot = prefs.getDefaults();
+    const offNotify = await commandRegistry.setBubbleCategoryEnabled(
+      { category: "notification", enabled: false },
+      { snapshot }
+    );
+    assert.strictEqual(offNotify.status, "ok");
+    assert.strictEqual(offNotify.commit.notificationBubbleAutoCloseSeconds, 0);
+    assert.strictEqual(offNotify.commit.hideBubbles, false);
+
+    const onUpdate = await commandRegistry.setBubbleCategoryEnabled(
+      { category: "update", enabled: true },
+      { snapshot: { ...snapshot, updateBubbleAutoCloseSeconds: 0 } }
+    );
+    assert.strictEqual(onUpdate.status, "ok");
+    assert.strictEqual(onUpdate.commit.updateBubbleAutoCloseSeconds, 9);
+  });
+
+  it("setBubbleCategoryEnabled toggles permission without auto-close", async () => {
+    const snapshot = {
+      ...prefs.getDefaults(),
+      permissionBubblesEnabled: true,
+      notificationBubbleAutoCloseSeconds: 0,
+      updateBubbleAutoCloseSeconds: 0,
+    };
+    const result = await commandRegistry.setBubbleCategoryEnabled(
+      { category: "permission", enabled: false },
+      { snapshot }
+    );
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.commit.permissionBubblesEnabled, false);
+    assert.strictEqual(result.commit.hideBubbles, true);
+  });
+
+  it("setAllBubblesHidden preserves category durations while acting as an aggregate override", async () => {
+    const snapshot = {
+      ...prefs.getDefaults(),
+      notificationBubbleAutoCloseSeconds: 12,
+      updateBubbleAutoCloseSeconds: 8,
+    };
+    const hidden = await commandRegistry.setAllBubblesHidden({ hidden: true }, { snapshot });
+    assert.strictEqual(hidden.status, "ok");
+    assert.deepStrictEqual(hidden.commit, {
+      hideBubbles: true,
+    });
+
+    const shown = await commandRegistry.setAllBubblesHidden({ hidden: false }, { snapshot: { ...snapshot, hideBubbles: true } });
+    assert.strictEqual(shown.status, "ok");
+    assert.deepStrictEqual(shown.commit, {
+      hideBubbles: false,
+    });
+  });
+
+  it("setAllBubblesHidden restores defaults when every category is already off", async () => {
+    const shown = await commandRegistry.setAllBubblesHidden({ hidden: false }, {
+      snapshot: {
+        ...prefs.getDefaults(),
+        hideBubbles: true,
+        permissionBubblesEnabled: false,
+        notificationBubbleAutoCloseSeconds: 0,
+        updateBubbleAutoCloseSeconds: 0,
+      },
+    });
+    assert.strictEqual(shown.status, "ok");
+    assert.deepStrictEqual(shown.commit, {
+      hideBubbles: false,
+      permissionBubblesEnabled: true,
+      notificationBubbleAutoCloseSeconds: 3,
+      updateBubbleAutoCloseSeconds: 9,
+    });
+  });
+});
+
 describe("hook commands", () => {
   it("installHooks triggers a one-shot Claude sync without changing prefs", async () => {
     let syncCalls = 0;
@@ -354,6 +456,95 @@ describe("hook commands", () => {
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
+  });
+});
+
+describe("setSessionAlias command", () => {
+  it("stores a sanitized alias under the normalized session key", () => {
+    const snapshot = { ...prefs.getDefaults(), sessionAliases: {} };
+    const r = commandRegistry.setSessionAlias(
+      { host: null, agentId: "codex", sessionId: "s1", alias: "  Codex\nmain  " },
+      { snapshot, now: 1000, getActiveSessionAliasKeys: () => new Set(["local|codex|s1"]) }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.sessionAliases, {
+      "local|codex|s1": { title: "Codex main", updatedAt: 1000 },
+    });
+  });
+
+  it("stores Kiro default-session aliases under a cwd-scoped key", () => {
+    const snapshot = { ...prefs.getDefaults(), sessionAliases: {} };
+    const r = commandRegistry.setSessionAlias(
+      { host: null, agentId: "kiro-cli", sessionId: "default", cwd: "/repo/a", alias: "Kiro A" },
+      { snapshot, now: 1000, getActiveSessionAliasKeys: () => new Set(["local|kiro-cli|default|cwd:%2Frepo%2Fa"]) }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.sessionAliases, {
+      "local|kiro-cli|default|cwd:%2Frepo%2Fa": { title: "Kiro A", updatedAt: 1000 },
+    });
+  });
+
+  it("clears an existing alias when alias is empty", () => {
+    const snapshot = {
+      ...prefs.getDefaults(),
+      sessionAliases: { "local|codex|s1": { title: "Codex main", updatedAt: 1000 } },
+    };
+    const r = commandRegistry.setSessionAlias(
+      { host: "local", agentId: "codex", sessionId: "s1", alias: "   " },
+      { snapshot, now: 2000, getActiveSessionAliasKeys: () => new Set(["local|codex|s1"]) }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.sessionAliases, {});
+  });
+
+  it("returns noop when the alias value is unchanged", () => {
+    const snapshot = {
+      ...prefs.getDefaults(),
+      sessionAliases: { "local|codex|s1": { title: "Codex main", updatedAt: 1000 } },
+    };
+    const r = commandRegistry.setSessionAlias(
+      { host: null, agentId: "codex", sessionId: "s1", alias: "Codex main" },
+      { snapshot, now: 2000, getActiveSessionAliasKeys: () => new Set(["local|codex|s1"]) }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+  });
+
+  it("prunes expired inactive aliases even when the requested alias is unchanged", () => {
+    const old = 1000;
+    const now = old + 8 * 24 * 60 * 60 * 1000;
+    const snapshot = {
+      ...prefs.getDefaults(),
+      sessionAliases: {
+        "local|codex|s1": { title: "Codex main", updatedAt: old },
+        "local|codex|stale": { title: "Stale", updatedAt: old },
+      },
+    };
+    const r = commandRegistry.setSessionAlias(
+      { host: null, agentId: "codex", sessionId: "s1", alias: "Codex main" },
+      { snapshot, now, getActiveSessionAliasKeys: () => new Set(["local|codex|s1"]) }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.sessionAliases, {
+      "local|codex|s1": { title: "Codex main", updatedAt: old },
+    });
+  });
+
+  it("rejects missing sessionId or non-string alias", () => {
+    const deps = { snapshot: prefs.getDefaults() };
+    assert.strictEqual(
+      commandRegistry.setSessionAlias({ host: null, agentId: "codex", sessionId: "", alias: "x" }, deps).status,
+      "error"
+    );
+    assert.strictEqual(
+      commandRegistry.setSessionAlias({ host: null, agentId: "codex", sessionId: "s1", alias: 42 }, deps).status,
+      "error"
+    );
   });
 });
 

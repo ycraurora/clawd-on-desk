@@ -20,7 +20,8 @@
   const i18nApi = root.ClawdSettingsI18n || {};
   const STRINGS = i18nApi.STRINGS;
   const CONTRIBUTORS = i18nApi.CONTRIBUTORS;
-  if (!STRINGS || !CONTRIBUTORS) {
+  const MAINTAINERS = i18nApi.MAINTAINERS;
+  if (!STRINGS || !CONTRIBUTORS || !MAINTAINERS) {
     throw new Error("settings-i18n.js failed to load before settings-ui-core.js");
   }
 
@@ -36,6 +37,7 @@
 
   // startsWith("Mac") not /\bMac\b/ — "MacIntel" has \w after "c", fails \b (regression #135).
   const IS_MAC = (navigator.platform || "").startsWith("Mac");
+  const COLLAPSED_GROUPS_STORAGE_KEY = "clawd.settings.collapsedGroups.v1";
 
   const state = {
     snapshot: null,
@@ -52,7 +54,9 @@
     },
     mountedControls: {
       generalSwitches: new Map(),
+      bubblePolicyControls: new Map(),
       agentSwitches: new Map(),
+      bubblePolicySummary: null,
       size: null,
       soundVolume: null,
     },
@@ -202,6 +206,7 @@
     invoke,
   }) {
     const run = () => {
+      if (sw.classList.contains("disabled") || sw.getAttribute("aria-disabled") === "true") return;
       if (sw.classList.contains("pending")) return;
       const currentVisual = getCommittedVisual();
       const nextVisual = !currentVisual;
@@ -255,6 +260,182 @@
     for (const row of rows) wrap.appendChild(row);
     section.appendChild(wrap);
     return section;
+  }
+
+  function readCollapsedGroupState() {
+    try {
+      const raw = localStorage.getItem(COLLAPSED_GROUPS_STORAGE_KEY);
+      const parsed = JSON.parse(raw || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function writeCollapsedGroupState(value) {
+    try {
+      localStorage.setItem(COLLAPSED_GROUPS_STORAGE_KEY, JSON.stringify(value || {}));
+    } catch (_) {}
+  }
+
+  function buildCollapsibleGroup({
+    id,
+    title = "",
+    desc = "",
+    summary = null,
+    headerContent = null,
+    children = [],
+    defaultCollapsed = false,
+    className = "",
+  }) {
+    const storedState = readCollapsedGroupState();
+    let collapsed = Object.prototype.hasOwnProperty.call(storedState, id)
+      ? storedState[id] === true
+      : !!defaultCollapsed;
+
+    const group = document.createElement("div");
+    group.className = `row collapsible-group${className ? ` ${className}` : ""}`;
+    group.dataset.groupId = id;
+
+    const header = document.createElement("div");
+    header.className = "collapsible-group-header";
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+
+    const chevron = document.createElement("span");
+    chevron.className = "collapsible-group-chevron";
+    chevron.textContent = "\u25B8";
+    chevron.setAttribute("aria-hidden", "true");
+    header.appendChild(chevron);
+
+    if (headerContent) {
+      const headerWrap = document.createElement("div");
+      headerWrap.className = "collapsible-group-header-content";
+      headerWrap.appendChild(headerContent);
+      header.appendChild(headerWrap);
+    } else {
+      const text = document.createElement("div");
+      text.className = "collapsible-group-text";
+      const label = document.createElement("span");
+      label.className = "row-label";
+      label.textContent = title;
+      text.appendChild(label);
+      if (desc) {
+        const description = document.createElement("span");
+        description.className = "row-desc";
+        description.textContent = desc;
+        text.appendChild(description);
+      }
+      header.appendChild(text);
+    }
+
+    if (summary) {
+      const summaryWrap = document.createElement("div");
+      summaryWrap.className = "collapsibleSummary collapsible-group-summary";
+      if (typeof summary === "string") summaryWrap.textContent = summary;
+      else summaryWrap.appendChild(summary);
+      header.appendChild(summaryWrap);
+    }
+
+    const body = document.createElement("div");
+    body.className = "collapsible-group-body";
+    for (const child of children) body.appendChild(child);
+
+    function measureCollapsibleBodyHeight() {
+      return `${body.scrollHeight}px`;
+    }
+
+    function setExpandedBodyHeight() {
+      body.style.setProperty("--collapsible-body-height", measureCollapsibleBodyHeight());
+    }
+
+    function setBodyInteractivity(isCollapsed) {
+      body.setAttribute("aria-hidden", isCollapsed ? "true" : "false");
+      if ("inert" in body) {
+        body.inert = isCollapsed;
+      } else if (isCollapsed) {
+        body.setAttribute("inert", "");
+      } else {
+        body.removeAttribute("inert");
+      }
+    }
+
+    function preserveScrollAnchor(invoke) {
+      const scroller = document.getElementById("content");
+      if (!scroller || !document.body.contains(header)) {
+        invoke();
+        return;
+      }
+      const beforeTop = header.getBoundingClientRect().top;
+      const beforeScrollTop = scroller.scrollTop;
+      invoke();
+      requestAnimationFrame(() => {
+        if (!document.body.contains(header)) return;
+        const afterTop = header.getBoundingClientRect().top;
+        const delta = afterTop - beforeTop;
+        if (delta !== 0) scroller.scrollTop = beforeScrollTop + delta;
+      });
+    }
+
+    function applyCollapsedState({ animate = false } = {}) {
+      header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      header.setAttribute("aria-label", collapsed ? t("collapsibleExpand") : t("collapsibleCollapse"));
+      group.classList.remove("expanding", "collapsing");
+      if (!animate) {
+        group.classList.toggle("collapsed", collapsed);
+        setBodyInteractivity(collapsed);
+        body.style.setProperty("--collapsible-body-height", collapsed ? "0px" : measureCollapsibleBodyHeight());
+        return;
+      }
+
+      if (collapsed) {
+        group.classList.add("collapsing");
+        setBodyInteractivity(true);
+        setExpandedBodyHeight();
+        requestAnimationFrame(() => {
+          group.classList.add("collapsed");
+          body.style.setProperty("--collapsible-body-height", "0px");
+        });
+        return;
+      }
+
+      group.classList.add("expanding", "collapsed");
+      setBodyInteractivity(false);
+      body.style.setProperty("--collapsible-body-height", "0px");
+      requestAnimationFrame(() => {
+        group.classList.remove("collapsed");
+        setExpandedBodyHeight();
+      });
+    }
+
+    function toggleCollapsed() {
+      collapsed = !collapsed;
+      const nextState = readCollapsedGroupState();
+      nextState[id] = collapsed;
+      writeCollapsedGroupState(nextState);
+      preserveScrollAnchor(() => applyCollapsedState({ animate: true }));
+    }
+
+    header.addEventListener("click", toggleCollapsed);
+    header.addEventListener("keydown", (ev) => {
+      if (ev.key === " " || ev.key === "Enter") {
+        ev.preventDefault();
+        toggleCollapsed();
+      }
+    });
+
+    group.appendChild(header);
+    group.appendChild(body);
+    body.addEventListener("transitionend", (ev) => {
+      if (ev.target !== body || ev.propertyName !== "max-height") return;
+      group.classList.remove("expanding", "collapsing");
+      if (!collapsed) setExpandedBodyHeight();
+    });
+    applyCollapsedState();
+    requestAnimationFrame(() => {
+      if (!collapsed) setExpandedBodyHeight();
+    });
+    return group;
   }
 
   function attachActivation(el, invoke) {
@@ -387,7 +568,9 @@
       state.mountedControls.soundVolume.dispose();
     }
     state.mountedControls.generalSwitches.clear();
+    state.mountedControls.bubblePolicyControls.clear();
     state.mountedControls.agentSwitches.clear();
+    state.mountedControls.bubblePolicySummary = null;
     state.mountedControls.size = null;
     state.mountedControls.soundVolume = null;
   }
@@ -669,6 +852,7 @@
     attachAnimatedSwitch,
     buildSwitchRow,
     buildSection,
+    buildCollapsibleGroup,
     attachActivation,
     buildShortcutButton,
     openExternalSafe,
@@ -683,6 +867,7 @@
 
   core.i18n = {
     STRINGS,
+    MAINTAINERS,
     CONTRIBUTORS,
     IS_MAC,
     SHORTCUT_ACTIONS,

@@ -744,6 +744,34 @@ function validateTheme(cfg) {
     }
   }
 
+  if (cfg.updateVisuals !== undefined) {
+    if (!_isPlainObject(cfg.updateVisuals)) {
+      errors.push("updateVisuals must be an object when present");
+    } else if (
+      cfg.updateVisuals.checking !== undefined
+      && (typeof cfg.updateVisuals.checking !== "string" || !cfg.updateVisuals.checking)
+    ) {
+      errors.push("updateVisuals.checking must be a non-empty string when present");
+    }
+  }
+
+  if (cfg.updateBubbleAnchorBox !== undefined) {
+    const box = cfg.updateBubbleAnchorBox;
+    if (
+      !_isPlainObject(box)
+      || box.x == null
+      || box.y == null
+      || box.width == null
+      || box.height == null
+      || !Number.isFinite(box.x)
+      || !Number.isFinite(box.y)
+      || !Number.isFinite(box.width)
+      || !Number.isFinite(box.height)
+    ) {
+      errors.push("updateBubbleAnchorBox must include finite x, y, width, height");
+    }
+  }
+
   const fallbackStateKeys = Object.keys(normalizedStates);
   for (const stateKey of fallbackStateKeys) {
     const entry = normalizedStates[stateKey];
@@ -1379,6 +1407,12 @@ function mergeDefaults(raw, themeId, isBuiltin) {
   // idleAnimations
   theme.idleAnimations = raw.idleAnimations || [];
 
+  // updater-specific visual bindings
+  theme.updateVisuals = _isPlainObject(raw.updateVisuals) ? { ...raw.updateVisuals } : {};
+  theme.updateBubbleAnchorBox = _isPlainObject(raw.updateBubbleAnchorBox)
+    ? { ...raw.updateBubbleAnchorBox }
+    : null;
+
   // ── Filename sanitization: basename all file references to prevent path traversal ──
   const bn = _basenameOnly;
   const normalizedStates = _normalizeStateBindings(raw.states);
@@ -1417,6 +1451,13 @@ function mergeDefaults(raw, themeId, isBuiltin) {
   }
   if (Array.isArray(theme.idleAnimations)) {
     for (const a of theme.idleAnimations) { if (a && a.file) a.file = bn(a.file); }
+  }
+  if (theme.updateVisuals) {
+    if (typeof theme.updateVisuals.checking === "string" && theme.updateVisuals.checking) {
+      theme.updateVisuals.checking = bn(theme.updateVisuals.checking);
+    } else {
+      delete theme.updateVisuals.checking;
+    }
   }
   if (Array.isArray(theme.wideHitboxFiles)) theme.wideHitboxFiles = theme.wideHitboxFiles.map(bn);
   if (Array.isArray(theme.sleepingHitboxFiles)) theme.sleepingHitboxFiles = theme.sleepingHitboxFiles.map(bn);

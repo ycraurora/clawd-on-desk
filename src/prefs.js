@@ -21,6 +21,12 @@ const path = require("path");
 const { isPlainObject } = require("./theme-loader");
 const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions");
 const { isValidDisplaySnapshot } = require("./work-area");
+const {
+  NOTIFICATION_DEFAULT_SECONDS,
+  UPDATE_DEFAULT_SECONDS,
+  MAX_AUTO_CLOSE_SECONDS,
+} = require("./bubble-policy");
+const { normalizeSessionAliases } = require("./session-alias");
 
 const CURRENT_VERSION = 1;
 
@@ -79,14 +85,26 @@ const SCHEMA = {
   openAtLogin: { type: "boolean", default: false },
   openAtLoginHydrated: { type: "boolean", default: false },
   bubbleFollowPet: { type: "boolean", default: false },
+  sessionHudEnabled: { type: "boolean", default: true },
   hideBubbles: { type: "boolean", default: false },
-  showSessionId: { type: "boolean", default: false },
+  permissionBubblesEnabled: { type: "boolean", default: true },
+  notificationBubbleAutoCloseSeconds: {
+    type: "number",
+    default: NOTIFICATION_DEFAULT_SECONDS,
+    validate: (v) => Number.isInteger(v) && v >= 0 && v <= MAX_AUTO_CLOSE_SECONDS,
+  },
+  updateBubbleAutoCloseSeconds: {
+    type: "number",
+    default: UPDATE_DEFAULT_SECONDS,
+    validate: (v) => Number.isInteger(v) && v >= 0 && v <= MAX_AUTO_CLOSE_SECONDS,
+  },
   soundMuted: { type: "boolean", default: false },
   soundVolume: {
     type: "number",
     default: 1,
     validate: (v) => Number.isFinite(v) && v >= 0 && v <= 1,
   },
+  lowPowerIdleMode: { type: "boolean", default: false },
   allowEdgePinning: { type: "boolean", default: false },
   // When true, moving the pet between displays does not trigger a
   // proportional pixel-size recomputation. The pet keeps its current
@@ -103,14 +121,14 @@ const SCHEMA = {
   agents: {
     type: "object",
     defaultFactory: () => ({
-      "claude-code": { enabled: true, permissionsEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true },
-      "copilot-cli": { enabled: true, permissionsEnabled: true },
-      "cursor-agent": { enabled: true, permissionsEnabled: true },
-      "gemini-cli": { enabled: true, permissionsEnabled: true },
-      "codebuddy": { enabled: true, permissionsEnabled: true },
-      "kiro-cli": { enabled: true, permissionsEnabled: true },
-      "opencode": { enabled: true, permissionsEnabled: true },
+      "claude-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
@@ -126,6 +144,11 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => ({}),
     normalize: normalizeThemeVariant,
+  },
+  sessionAliases: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeSessionAliases,
   },
 };
 
@@ -202,11 +225,24 @@ function migrate(raw) {
       (typeof out.x === "number" && out.x !== 0) ||
       (typeof out.y === "number" && out.y !== 0);
   }
+  // Backfill the split bubble settings from the old aggregate switch. This is
+  // intentionally field-level so users who already have the new keys keep them.
+  if (typeof out.hideBubbles === "boolean") {
+    if (out.permissionBubblesEnabled === undefined) {
+      out.permissionBubblesEnabled = !out.hideBubbles;
+    }
+    if (out.notificationBubbleAutoCloseSeconds === undefined) {
+      out.notificationBubbleAutoCloseSeconds = out.hideBubbles ? 0 : NOTIFICATION_DEFAULT_SECONDS;
+    }
+    if (out.updateBubbleAutoCloseSeconds === undefined) {
+      out.updateBubbleAutoCloseSeconds = out.hideBubbles ? 0 : UPDATE_DEFAULT_SECONDS;
+    }
+  }
   // Future migrations slot in here as `if (out.version < N) { ... out.version = N }`.
   return out;
 }
 
-const AGENT_FLAGS = ["enabled", "permissionsEnabled"];
+const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled"];
 
 function normalizePositionDisplay(value) {
   if (!isValidDisplaySnapshot(value)) return null;
@@ -233,7 +269,8 @@ function normalizeAgents(value, defaultsValue) {
   for (const id of Object.keys(value)) {
     const entry = value[id];
     if (!entry || typeof entry !== "object") continue;
-    const base = (defaultsValue && defaultsValue[id]) || { enabled: true, permissionsEnabled: true };
+    const base = (defaultsValue && defaultsValue[id])
+      || { enabled: true, permissionsEnabled: true, notificationHookEnabled: true };
     const merged = { ...base };
     let touched = false;
     for (const flag of AGENT_FLAGS) {

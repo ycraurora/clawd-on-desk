@@ -3,6 +3,7 @@
 
 const { BrowserWindow, globalShortcut } = require("electron");
 const { getDefaultShortcuts } = require("./shortcut-actions");
+const { keepOutOfTaskbar } = require("./taskbar");
 const path = require("path");
 const http = require("http");
 const {
@@ -35,6 +36,21 @@ const RESTORE_FOCUS_DELAY_MS = 300;
 const MAC_FLOATING_TOPMOST_DELAY_MS = 120;
 const WIN_TOPMOST_LEVEL = "pop-up-menu";
 const LINUX_WINDOW_TYPE = "toolbar";
+// 24px matches the 8px stack margin on both edges plus a small buffer, so a
+// single tall bubble never hugs or exceeds the visible work area.
+const BUBBLE_HEIGHT_RESERVE = 24;
+
+function clampBubbleHeight(naturalHeight, workAreaHeight, reserve = BUBBLE_HEIGHT_RESERVE) {
+  const roundedHeight = Math.ceil(Number(naturalHeight));
+  if (!Number.isFinite(roundedHeight) || roundedHeight <= 0) return 0;
+
+  const areaHeight = Math.floor(Number(workAreaHeight));
+  if (!Number.isFinite(areaHeight) || areaHeight <= 0) return roundedHeight;
+
+  const edgeReserve = Math.max(0, Math.floor(Number(reserve) || 0));
+  const maxHeight = Math.max(1, areaHeight - edgeReserve);
+  return Math.min(roundedHeight, maxHeight);
+}
 
 function deferMacFloatingVisibility(ctx, win) {
   if (!isMac || !win || win.isDestroyed()) return;
@@ -49,20 +65,74 @@ function deferMacFloatingVisibility(ctx, win) {
   }, MAC_FLOATING_TOPMOST_DELAY_MS);
 }
 
-// Codex doesn't come through /permission, so its sub-gate is checked at
-// the bubble-creation callsite instead of at the route entrance.
+// Legacy Codex JSONL notifications have no /permission connection, so their
+// sub-gate is checked at the bubble-creation callsite instead of route entry.
 function shouldSuppressCodexNotifyBubble(ctx) {
   const codexBubblesEnabled =
     typeof ctx.isAgentPermissionsEnabled !== "function" ||
     ctx.isAgentPermissionsEnabled("codex");
-  return !!(ctx.doNotDisturb || ctx.hideBubbles || !codexBubblesEnabled);
+  const policy = getPolicy(ctx, "notification");
+  return !!(ctx.doNotDisturb || !policy.enabled || !codexBubblesEnabled);
 }
 
 function shouldSuppressKimiNotifyBubble(ctx) {
   const kimiBubblesEnabled =
     typeof ctx.isAgentPermissionsEnabled !== "function" ||
     ctx.isAgentPermissionsEnabled("kimi-cli");
-  return !!(ctx.doNotDisturb || ctx.hideBubbles || !kimiBubblesEnabled);
+  const policy = getPolicy(ctx, "notification");
+  return !!(ctx.doNotDisturb || !policy.enabled || !kimiBubblesEnabled);
+}
+
+function getPolicy(ctx, kind) {
+  if (typeof ctx.getBubblePolicy === "function") {
+    try {
+      const policy = ctx.getBubblePolicy(kind);
+      if (policy && typeof policy.enabled === "boolean") return policy;
+    } catch {}
+  }
+  if (kind === "permission") return { enabled: !ctx.hideBubbles, autoCloseMs: null };
+  if (kind === "notification") return { enabled: !ctx.hideBubbles, autoCloseMs: 30000 };
+  return { enabled: !ctx.hideBubbles, autoCloseMs: 0 };
+}
+
+function sanitizeCodexPermissionDecision(decisionOrBehavior, message) {
+  const source = typeof decisionOrBehavior === "string"
+    ? { behavior: decisionOrBehavior, message }
+    : (decisionOrBehavior && typeof decisionOrBehavior === "object" ? decisionOrBehavior : null);
+  if (!source) return null;
+
+  const behavior = source.behavior === "deny" ? "deny"
+    : (source.behavior === "allow" ? "allow" : null);
+  if (!behavior) return null;
+
+  const decision = { behavior };
+  if (behavior === "deny" && typeof source.message === "string" && source.message) {
+    decision.message = source.message;
+  }
+  return decision;
+}
+
+function buildCodexPermissionResponseBody(decisionOrBehavior, message) {
+  const decision = sanitizeCodexPermissionDecision(decisionOrBehavior, message);
+  if (!decision) return "{}";
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision,
+    },
+  });
+}
+
+function isPassiveNotifyEntry(permEntry) {
+  return !!(permEntry && (permEntry.isCodexNotify || permEntry.isKimiNotify));
+}
+
+function computePassiveNotifyRemainingMs(createdAt, autoCloseMs, now = Date.now()) {
+  const totalMs = Number(autoCloseMs);
+  if (!Number.isFinite(totalMs) || totalMs <= 0) return 0;
+  const startedAt = Number(createdAt);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return totalMs;
+  return Math.max(0, totalMs - Math.max(0, now - startedAt));
 }
 
 // Pure layout calculator for the permission bubble stack. Extracted out of
@@ -102,6 +172,7 @@ function computeBubbleStackLayout({
   gap,
   workArea: wa,
   hitRect,
+  hudReservedOffset = 0,
 }) {
   const N = bubbleHeights.length;
   const bounds = new Array(N);
@@ -128,9 +199,10 @@ function computeBubbleStackLayout({
     // 1. Below pet — enough vertical room to hang the stack from the hitbox.
     //    Iterate oldest→newest growing downward so the visual order matches
     //    the side/corner branches' upward-stacking loop below.
-    if (wa.y + wa.height - hitBottom >= totalH) {
+    const reserve = Math.max(0, Number(hudReservedOffset) || 0);
+    if (wa.y + wa.height - hitBottom >= reserve + totalH) {
       x = Math.max(wa.x, Math.min(hitCx - Math.round(bw / 2), wa.x + wa.width - bw));
-      let yTop = hitBottom;
+      let yTop = hitBottom + reserve;
       for (let i = 0; i < N; i++) {
         const bh = bubbleHeights[i];
         bounds[i] = { x, y: yTop, width: bw, height: bh };
@@ -215,7 +287,8 @@ const PASSTHROUGH_TOOLS = new Set([
 function sendToBubble(bubble, channel, payload) {
   if (!bubble || bubble.isDestroyed()) return false;
   const wc = bubble.webContents;
-  if (!wc || wc.isDestroyed()) return false;
+  if (!wc) return false;
+  if (typeof wc.isDestroyed === "function" && wc.isDestroyed()) return false;
   try {
     wc.send(channel, payload);
     return true;
@@ -302,7 +375,8 @@ function syncSingle(actionId, current, target, handler, setState) {
 
 function syncPermissionShortcuts() {
   const shortcutSnapshot = getShortcutSnapshot();
-  const shouldRegister = !ctx.hideBubbles && !ctx.petHidden
+  const permissionPolicy = getPolicy(ctx, "permission");
+  const shouldRegister = permissionPolicy.enabled && !ctx.petHidden
     && getActionablePermissions().length > 0;
   const targetAllow = shouldRegister ? shortcutSnapshot.permissionAllow : null;
   const targetDeny = shouldRegister ? shortcutSnapshot.permissionDeny : null;
@@ -313,6 +387,12 @@ function syncPermissionShortcuts() {
   syncSingle("permissionDeny", registeredDenyAccel, targetDeny, hotkeyDeny, (value) => {
     registeredDenyAccel = value;
   });
+}
+
+function repositionDependentBubbles() {
+  if (typeof ctx.repositionUpdateBubble === "function") {
+    try { ctx.repositionUpdateBubble(); } catch {}
+  }
 }
 
 function hotkeyResolve(behavior, message) {
@@ -343,6 +423,13 @@ function estimateBubbleHeight(sugCount) {
   return 200 + (sugCount || 0) * 37;
 }
 
+function getAnchorWorkArea(petBounds) {
+  const bounds = petBounds || ctx.getPetWindowBounds();
+  const cx = bounds.x + bounds.width / 2;
+  const cy = bounds.y + bounds.height / 2;
+  return ctx.getNearestWorkArea(cx, cy);
+}
+
 function repositionBubbles() {
   // Thin wrapper around computeBubbleStackLayout (top of file). All the
   // geometry lives there so it can be unit-tested without Electron windows.
@@ -351,13 +438,14 @@ function repositionBubbles() {
   const gap = 6;
   const bw = 340;
   const petBounds = ctx.getPetWindowBounds();
-  const cx = petBounds.x + petBounds.width / 2;
-  const cy = petBounds.y + petBounds.height / 2;
-  const wa = ctx.getNearestWorkArea(cx, cy);
+  const wa = getAnchorWorkArea(petBounds);
   const hitRect = ctx.bubbleFollowPet ? ctx.getHitRectScreen(petBounds) : null;
 
   const bubbleHeights = pendingPermissions.map(perm =>
-    perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length)
+    clampBubbleHeight(
+      perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length),
+      wa.height
+    )
   );
 
   const bounds = computeBubbleStackLayout({
@@ -368,6 +456,7 @@ function repositionBubbles() {
     gap,
     workArea: wa,
     hitRect,
+    hudReservedOffset: typeof ctx.getHudReservedOffset === "function" ? ctx.getHudReservedOffset() : 0,
   });
 
   for (let i = 0; i < pendingPermissions.length; i++) {
@@ -380,7 +469,8 @@ function repositionBubbles() {
 
 function showPermissionBubble(permEntry) {
   const sugCount = (permEntry.suggestions || []).length;
-  const bh = estimateBubbleHeight(sugCount);
+  const wa = getAnchorWorkArea();
+  const bh = clampBubbleHeight(estimateBubbleHeight(sugCount), wa.height);
   // Temporary position — repositionBubbles() will finalize after renderer reports real height
   const pos = { x: 0, y: 0, width: 340, height: bh };
 
@@ -411,6 +501,7 @@ function showPermissionBubble(permEntry) {
   });
 
   permEntry.bubble = bub;
+  permEntry.bubbleReady = false;
 
   if (isWin) {
     bub.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
@@ -419,35 +510,17 @@ function showPermissionBubble(permEntry) {
   bub.loadFile(path.join(__dirname, "bubble.html"));
 
   bub.webContents.once("did-finish-load", () => {
-    // Session disambiguation: same as Sessions submenu (state.js:648-649) so the
-    // bubble matches what the user sees in the right-click menu. Lets users tell
-    // apart multiple permission requests from the same project directory.
-    const sess = ctx.sessions.get(permEntry.sessionId);
-    const sessionFolder = sess && sess.cwd ? path.basename(sess.cwd) : null;
-    const sessionShortId = permEntry.sessionId
-      ? String(permEntry.sessionId).slice(-3)
-      : null;
     if (permEntry.bubble !== bub || pendingPermissions.indexOf(permEntry) === -1) return;
-    sendToBubble(bub, "permission-show", {
-      toolName: permEntry.toolName,
-      toolInput: permEntry.toolInput,
-      suggestions: permEntry.suggestions || [],
-      lang: ctx.lang,
-      isElicitation: permEntry.isElicitation || false,
-      isOpencode: permEntry.isOpencode || false,
-      opencodeAlways: permEntry.opencodeAlwaysCandidates || [],
-      opencodePatterns: permEntry.opencodePatterns || [],
-      sessionFolder,
-      sessionShortId,
-    });
+    permEntry.bubbleReady = true;
+    syncPermissionBubbleContent(permEntry);
     // Don't call bub.focus() — it steals focus from terminal and can trigger
     // false "User answered in terminal" denials in Claude Code, wasting tokens.
   });
 
   repositionBubbles();
   bub.showInactive();
-  // Linux WMs may reset skipTaskbar after showInactive — re-apply explicitly
-  if (isLinux) bub.setSkipTaskbar(true);
+  repositionDependentBubbles();
+  keepOutOfTaskbar(bub);
   // macOS: constructing/raising a topmost panel too early can still activate
   // Clawd on some setups. Defer topmost restoration until after showInactive.
   if (isMac) deferMacFloatingVisibility(ctx, bub);
@@ -464,12 +537,38 @@ function showPermissionBubble(permEntry) {
   syncPermissionShortcuts();
 }
 
-function resolvePermissionEntry(permEntry, behavior, message) {
-  // Codex notify bubbles have no HTTP connection — route to dedicated cleanup
-  if (permEntry.isCodexNotify || permEntry.isKimiNotify) {
-    dismissPassiveNotify(permEntry);
-    return;
-  }
+function buildPermissionBubblePayload(permEntry) {
+  const sess = ctx.sessions.get(permEntry.sessionId);
+  const sessionFolder = sess && sess.cwd ? path.basename(sess.cwd) : null;
+  const sessionShortId = permEntry.sessionId
+    ? String(permEntry.sessionId).slice(-3)
+    : null;
+  return {
+    toolName: permEntry.toolName,
+    toolInput: permEntry.toolInput,
+    suggestions: permEntry.suggestions || [],
+    lang: ctx.lang,
+    isElicitation: permEntry.isElicitation || false,
+    isOpencode: permEntry.isOpencode || false,
+    opencodeAlways: permEntry.opencodeAlwaysCandidates || [],
+    opencodePatterns: permEntry.opencodePatterns || [],
+    sessionFolder,
+    sessionShortId,
+  };
+}
+
+function syncPermissionBubbleContent(permEntry) {
+  const bub = permEntry && permEntry.bubble;
+  if (!bub || bub.isDestroyed() || !permEntry.bubbleReady) return false;
+  return sendToBubble(bub, "permission-show", buildPermissionBubblePayload(permEntry));
+}
+
+  function resolvePermissionEntry(permEntry, behavior, message) {
+    // Codex notify bubbles have no HTTP connection — route to dedicated cleanup
+    if (permEntry.isCodexNotify || permEntry.isKimiNotify) {
+      dismissPassiveNotify(permEntry, `resolve:${behavior || "unknown"}`);
+      return;
+    }
   const idx = pendingPermissions.indexOf(permEntry);
   if (idx === -1) return;
 
@@ -500,6 +599,7 @@ function resolvePermissionEntry(permEntry, behavior, message) {
 
   // Reposition remaining bubbles to fill the gap
   repositionBubbles();
+  repositionDependentBubbles();
   syncPermissionShortcuts();
 
   // opencode: decisions go back via the plugin's reverse bridge (Bun.serve
@@ -523,6 +623,18 @@ function resolvePermissionEntry(permEntry, behavior, message) {
 
   // Guard: client may have disconnected
   if (!res || res.writableEnded || res.destroyed) return;
+
+  if (permEntry.isCodex) {
+    if (behavior === "no-decision") {
+      sendCodexNoDecisionResponse(res, message || "fallback");
+    } else {
+      sendCodexPermissionResponse(res, {
+        behavior: behavior === "deny" ? "deny" : "allow",
+        message,
+      });
+    }
+    return;
+  }
 
   if (permEntry.isElicitation) {
     if (behavior === "allow" && permEntry.resolvedUpdatedInput) {
@@ -635,12 +747,36 @@ function sendPermissionResponse(res, decisionOrBehavior, message, hookEventName 
   res.end(responseBody);
 }
 
+function sendCodexNoDecisionResponse(res, reason = "") {
+  if (!res || res.writableEnded || res.destroyed || res.headersSent) return false;
+  if (reason) permLog(`codex no-decision: ${reason}`);
+  res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+  res.end();
+  return true;
+}
+
+function sendCodexPermissionResponse(res, decisionOrBehavior, message) {
+  if (!res || res.writableEnded || res.destroyed || res.headersSent) return false;
+  const responseBody = buildCodexPermissionResponseBody(decisionOrBehavior, message);
+  if (responseBody === "{}") {
+    return sendCodexNoDecisionResponse(res, "invalid decision");
+  }
+  permLog(`codex response: ${responseBody}`);
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,
+  });
+  res.end(responseBody);
+  return true;
+}
+
 function handleBubbleHeight(event, height) {
   const senderWin = BrowserWindow.fromWebContents(event.sender);
   const perm = pendingPermissions.find(p => p.bubble === senderWin);
   if (perm && typeof height === "number" && height > 0) {
     perm.measuredHeight = Math.ceil(height);
     repositionBubbles();
+    repositionDependentBubbles();
   }
 }
 
@@ -651,7 +787,19 @@ function handleDecide(event, behavior) {
   permLog(`IPC permission-decide: behavior=${behavior} matched=${!!perm}`);
   if (!perm) return;
   if (perm.isCodexNotify || perm.isKimiNotify) {
-    dismissPassiveNotify(perm);
+    dismissPassiveNotify(perm, "ipc-decide");
+    return;
+  }
+  if (perm.isCodex) {
+    if (behavior === "allow" || behavior === "deny") {
+      resolvePermissionEntry(perm, behavior);
+      return;
+    }
+    // Codex is blocking on the hook socket. UI actions that mean "handle it
+    // elsewhere" must answer no-decision immediately instead of leaving the
+    // hook parked until its long timeout.
+    resolvePermissionEntry(perm, "no-decision", `Unsupported Codex bubble action: ${String(behavior)}`);
+    if (behavior === "deny-and-focus") ctx.focusTerminalForSession(perm.sessionId);
     return;
   }
   if (perm.isElicitation && behavior && typeof behavior === "object" && behavior.type === "elicitation-submit") {
@@ -700,6 +848,7 @@ function handleDecide(event, behavior) {
       perm.hideTimer = setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
     }
     repositionBubbles();
+    repositionDependentBubbles();
     syncPermissionShortcuts();
     ctx.focusTerminalForSession(perm.sessionId);
   } else {
@@ -707,11 +856,20 @@ function handleDecide(event, behavior) {
   }
 }
 
-const CODEX_NOTIFY_EXPIRE_MS = 30000;
-
 function showCodexNotifyBubble({ sessionId, command }) {
   if (shouldSuppressCodexNotifyBubble(ctx)) {
-    permLog(`codex notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} hideBubbles=${ctx.hideBubbles}`);
+    const policy = getPolicy(ctx, "notification");
+    permLog(`codex notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} notificationEnabled=${policy.enabled}`);
+    return;
+  }
+  const policy = getPolicy(ctx, "notification");
+  const existing = findCodexNotifyEntryBySession(sessionId);
+  if (existing) {
+    existing.toolInput = { command: command || "(unknown)" };
+    existing.createdAt = Date.now();
+    permLog(`passive notify refresh: agent=codex session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
+    syncPermissionBubbleContent(existing);
+    schedulePassiveNotifyAutoExpire(existing, policy.autoCloseMs);
     return;
   }
   const permEntry = {
@@ -727,16 +885,17 @@ function showCodexNotifyBubble({ sessionId, command }) {
   };
   pendingPermissions.push(permEntry);
   showPermissionBubble(permEntry);
-  permEntry.autoExpireTimer = setTimeout(() => {
-    dismissPassiveNotify(permEntry);
-  }, CODEX_NOTIFY_EXPIRE_MS);
+  permLog(`passive notify show: agent=codex session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
+  schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
 }
 
 function showKimiNotifyBubble({ sessionId, command }) {
   if (shouldSuppressKimiNotifyBubble(ctx)) {
-    permLog(`kimi notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} hideBubbles=${ctx.hideBubbles}`);
+    const policy = getPolicy(ctx, "notification");
+    permLog(`kimi notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} notificationEnabled=${policy.enabled}`);
     return;
   }
+  const policy = getPolicy(ctx, "notification");
   const permEntry = {
     res: null,
     abortHandler: null, suggestions: [],
@@ -750,11 +909,27 @@ function showKimiNotifyBubble({ sessionId, command }) {
   };
   pendingPermissions.push(permEntry);
   showPermissionBubble(permEntry);
+  permLog(`passive notify show: agent=kimi-cli session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
+  schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
 }
 
-function dismissPassiveNotify(permEntry) {
+function getPassiveNotifyAgentId(permEntry) {
+  if (permEntry?.isCodexNotify) return "codex";
+  if (permEntry?.isKimiNotify) return "kimi-cli";
+  return permEntry?.agentId || "unknown";
+}
+
+function findCodexNotifyEntryBySession(sessionId) {
+  if (!sessionId) return null;
+  return pendingPermissions.find((permEntry) => permEntry && permEntry.isCodexNotify && permEntry.sessionId === sessionId) || null;
+}
+
+function dismissPassiveNotify(permEntry, reason = "unknown") {
   const idx = pendingPermissions.indexOf(permEntry);
   if (idx === -1) return;
+  permLog(
+    `passive notify dismiss: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"} reason=${reason}`
+  );
   pendingPermissions.splice(idx, 1);
   if (permEntry.autoExpireTimer) clearTimeout(permEntry.autoExpireTimer);
   if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
@@ -764,7 +939,42 @@ function dismissPassiveNotify(permEntry) {
     setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
   }
   repositionBubbles();
+  repositionDependentBubbles();
   syncPermissionShortcuts();
+}
+
+function schedulePassiveNotifyAutoExpire(permEntry, autoCloseMs, now = Date.now()) {
+  if (!isPassiveNotifyEntry(permEntry)) return false;
+  if (permEntry.autoExpireTimer) {
+    clearTimeout(permEntry.autoExpireTimer);
+    permEntry.autoExpireTimer = null;
+  }
+  const remainingMs = computePassiveNotifyRemainingMs(permEntry.createdAt, autoCloseMs, now);
+  permLog(
+    `passive notify schedule: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"} autoCloseMs=${autoCloseMs} remainingMs=${remainingMs}`
+  );
+  if (remainingMs <= 0) {
+    dismissPassiveNotify(permEntry, "auto-expire-immediate");
+    return false;
+  }
+  permEntry.autoExpireTimer = setTimeout(() => {
+    dismissPassiveNotify(permEntry, "auto-expire-timeout");
+  }, remainingMs);
+  return true;
+}
+
+function refreshPassiveNotifyAutoClose() {
+  const passiveEntries = pendingPermissions.filter(isPassiveNotifyEntry);
+  if (passiveEntries.length === 0) return 0;
+  const policy = getPolicy(ctx, "notification");
+  const now = Date.now();
+  let processed = 0;
+  for (const permEntry of [...passiveEntries]) {
+    processed += 1;
+    schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs, now);
+  }
+  permLog(`passive notify refresh: processed=${processed} autoCloseMs=${policy.autoCloseMs}`);
+  return processed;
 }
 
 // Mirrors the DND dispatcher: CC res.destroy() so it falls back to chat,
@@ -775,7 +985,7 @@ function dismissPermissionsByAgent(agentId) {
   if (toDismiss.length === 0) return 0;
   for (const perm of toDismiss) {
     if (perm.isCodexNotify || perm.isKimiNotify) {
-      dismissPassiveNotify(perm);
+      dismissPassiveNotify(perm, `dismiss-by-agent:${agentId}`);
       continue;
     }
     const idx = pendingPermissions.indexOf(perm);
@@ -793,34 +1003,71 @@ function dismissPermissionsByAgent(agentId) {
       }, 250);
     }
     // opencode: skip bridge reply — TUI has its own fallback prompt.
+    // Codex: close with no decision so the native approval prompt continues.
     // CC / codebuddy / elicitation: destroy the connection so CC falls back
     //   to its built-in chat permission prompt (same pattern as DND, see
     //   commit 9f90... spike 2026-04-07).
-    if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
+    if (perm.isCodex) {
+      sendCodexNoDecisionResponse(perm.res, `dismiss-by-agent:${agentId}`);
+    } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
       try { perm.res.destroy(); } catch {}
     }
   }
   repositionBubbles();
+  repositionDependentBubbles();
   syncPermissionShortcuts();
   permLog(`dismissPermissionsByAgent(${agentId}): cleared ${toDismiss.length}`);
   return toDismiss.length;
 }
 
-function clearCodexNotifyBubbles(sessionId) {
-  if (!pendingPermissions.some(p => p.isCodexNotify)) return;
-  const toRemove = pendingPermissions.filter(
-    p => p.isCodexNotify && p.sessionId === sessionId
-  );
-  for (const perm of toRemove) dismissPassiveNotify(perm);
+function dismissInteractivePermissionBubbles() {
+  const toDismiss = pendingPermissions.filter((p) => p && !p.isCodexNotify && !p.isKimiNotify);
+  if (toDismiss.length === 0) return 0;
+  for (const perm of toDismiss) {
+    const idx = pendingPermissions.indexOf(perm);
+    if (idx !== -1) pendingPermissions.splice(idx, 1);
+    if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
+    if (perm.abortHandler && perm.res) {
+      try { perm.res.removeListener("close", perm.abortHandler); } catch {}
+    }
+    if (perm.hideTimer) clearTimeout(perm.hideTimer);
+    if (perm.bubble && !perm.bubble.isDestroyed()) {
+      try { perm.bubble.webContents.send("permission-hide"); } catch {}
+      const bub = perm.bubble;
+      perm.hideTimer = setTimeout(() => {
+        if (bub && !bub.isDestroyed()) bub.destroy();
+      }, 250);
+    }
+    // Do not answer approval requests on the user's behalf. Dropping the UI
+    // means Codex receives no decision, CC/CodeBuddy fall back via socket
+    // close, and opencode falls back by receiving no bridge reply.
+    if (perm.isCodex) {
+      sendCodexNoDecisionResponse(perm.res, "interactive-bubbles-dismissed");
+    } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
+      try { perm.res.destroy(); } catch {}
+    }
+  }
+  repositionBubbles();
+  syncPermissionShortcuts();
+  permLog(`dismissInteractivePermissionBubbles(): cleared ${toDismiss.length}`);
+  return toDismiss.length;
 }
 
-function clearKimiNotifyBubbles(sessionId) {
+function clearCodexNotifyBubbles(sessionId, reason = sessionId ? "codex-session-activity" : "codex-global-clear") {
+  if (!pendingPermissions.some(p => p.isCodexNotify)) return;
+  const toRemove = sessionId
+    ? pendingPermissions.filter((p) => p.isCodexNotify && p.sessionId === sessionId)
+    : pendingPermissions.filter((p) => p.isCodexNotify);
+  for (const perm of toRemove) dismissPassiveNotify(perm, reason);
+}
+
+function clearKimiNotifyBubbles(sessionId, reason = sessionId ? "kimi-session-release" : "kimi-global-clear") {
   const hasKimi = pendingPermissions.some(p => p.isKimiNotify);
   if (!hasKimi) return;
   const toRemove = sessionId
     ? pendingPermissions.filter((p) => p.isKimiNotify && p.sessionId === sessionId)
     : pendingPermissions.filter((p) => p.isKimiNotify);
-  for (const perm of toRemove) dismissPassiveNotify(perm);
+  for (const perm of toRemove) dismissPassiveNotify(perm, reason);
 }
 
 function cleanup() {
@@ -836,10 +1083,14 @@ function cleanup() {
   if (typeof unsubscribeShortcuts === "function") {
     try { unsubscribeShortcuts(); } catch {}
   }
-  // Clean up all pending permission requests — send explicit deny so Claude Code doesn't hang
+  // Clean up all pending permission requests. Codex gets no-decision so its
+  // native approval flow can continue; Claude/CodeBuddy get explicit deny so
+  // they don't hang while the app is quitting.
   for (const perm of [...pendingPermissions]) {
     if (perm._delayTimer) clearTimeout(perm._delayTimer);
-    resolvePermissionEntry(perm, "deny", "Clawd is quitting");
+    if (perm.autoExpireTimer) clearTimeout(perm.autoExpireTimer);
+    if (perm.isCodex) resolvePermissionEntry(perm, "no-decision", "Clawd is quitting");
+    else resolvePermissionEntry(perm, "deny", "Clawd is quitting");
   }
 }
 
@@ -850,7 +1101,8 @@ return {
   handleBubbleHeight, handleDecide, cleanup,
   showCodexNotifyBubble, clearCodexNotifyBubbles,
   showKimiNotifyBubble, clearKimiNotifyBubbles,
-  dismissPermissionsByAgent,
+  refreshPassiveNotifyAutoClose,
+  dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
   syncPermissionShortcuts,
   replyOpencodePermission,
 };
@@ -861,6 +1113,10 @@ return {
 // hit the pure layout function without standing up Electron / ctx mocks.
 module.exports.__test = {
   computeBubbleStackLayout,
+  computePassiveNotifyRemainingMs,
+  clampBubbleHeight,
   shouldSuppressCodexNotifyBubble,
+  sanitizeCodexPermissionDecision,
+  buildCodexPermissionResponseBody,
   buildElicitationUpdatedInput,
 };

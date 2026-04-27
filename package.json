@@ -1,11 +1,14 @@
 {
   "name": "clawd-on-desk",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A desktop pet that reacts to your Claude Code sessions in real-time.",
   "main": "src/main.js",
   "scripts": {
     "start": "node launch.js",
     "build": "electron-builder --win",
+    "build:win:x64": "electron-builder --win nsis:x64",
+    "build:win:arm64": "electron-builder --win nsis:arm64",
+    "build:win:all": "electron-builder --win nsis:x64 nsis:arm64",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --win --mac --linux",
@@ -19,7 +22,11 @@
     "install:gemini-hooks": "node hooks/gemini-install.js",
     "install:cursor-hooks": "node hooks/cursor-install.js",
     "install:kiro-hooks": "node hooks/kiro-install.js",
-    "install:kimi-hooks": "node hooks/kimi-install.js"
+    "install:kimi-hooks": "node hooks/kimi-install.js",
+    "install:codex-hooks": "node hooks/codex-install.js",
+    "uninstall:codex-hooks": "node hooks/codex-install.js --uninstall",
+    "install:codex-debug-hooks": "node hooks/codex-debug-install.js",
+    "uninstall:codex-debug-hooks": "node hooks/codex-debug-install.js --uninstall"
   },
   "keywords": [
     "clawd",
@@ -28,7 +35,7 @@
     "claude-code"
   ],
   "author": "rullerzhou-afk",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "type": "commonjs",
   "build": {
     "appId": "com.clawd.on-desk",
@@ -52,12 +59,13 @@
     "win": {
       "icon": "assets/icon.ico",
       "signAndEditExecutable": false,
-      "artifactName": "Clawd-on-Desk-Setup-${version}.${ext}",
+      "artifactName": "Clawd-on-Desk-Setup-${version}-${arch}.${ext}",
       "target": [
         {
           "target": "nsis",
           "arch": [
-            "x64"
+            "x64",
+            "arm64"
           ]
         }
       ]
@@ -84,6 +92,7 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "buildUniversalInstaller": false,
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico",
       "installerHeaderIcon": "assets/icon.ico"

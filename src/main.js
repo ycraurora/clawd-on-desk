@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme, dialog, shell } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { pathToFileURL } = require("url");
@@ -26,6 +26,7 @@ const {
 } = require("./work-area");
 const {
   getThemeMarginBox,
+  computeThemeAnchorRect,
   computeStableVisibleContentMargins,
   getLooseDragMargins,
   getRestClampMargins,
@@ -42,6 +43,7 @@ const {
   getLaunchSizingWorkArea,
   getProportionalPixelSize,
 } = require("./size-utils");
+const { keepOutOfTaskbar } = require("./taskbar");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
@@ -92,6 +94,11 @@ const SIZES = {
 const prefsModule = require("./prefs");
 const { createSettingsController } = require("./settings-controller");
 const { ANIMATION_OVERRIDES_EXPORT_VERSION } = require("./settings-actions");
+const { createTranslator, i18n } = require("./i18n");
+const {
+  getBubblePolicy,
+  isAllBubblesHidden,
+} = require("./bubble-policy");
 const {
   SHORTCUT_ACTIONS,
   SHORTCUT_ACTION_IDS,
@@ -202,6 +209,10 @@ const _settingsController = createSettingsController({
     clearSessionsByAgent: _deferredClearSessionsByAgent,
     dismissPermissionsByAgent: _deferredDismissPermissionsByAgent,
     resizePet: _deferredResizePet,
+    getActiveSessionAliasKeys: () =>
+      _state && typeof _state.getActiveSessionAliasKeys === "function"
+        ? _state.getActiveSessionAliasKeys()
+        : new Set(),
     // Theme deps — defined much later in the file, wrapped in lazy closures.
     // activateTheme accepts (themeId, variantId?, overrideMap?) and returns
     // { themeId, variantId } with the actually-resolved variantId
@@ -223,6 +234,12 @@ const _settingsController = createSettingsController({
 // Updated by the subscriber in `wireSettingsSubscribers()` below — never
 // assign directly.
 let lang = _settingsController.get("lang");
+const translate = createTranslator(() => lang);
+
+function getDashboardI18nPayload() {
+  const dict = i18n[lang] || i18n.en;
+  return { lang, translations: { ...dict } };
+}
 
 // First-run import of system-backed settings into prefs. The actual truth for
 // `openAtLogin` lives in OS login items / autostart files; if we just trusted
@@ -293,6 +310,50 @@ function captureCurrentDisplaySnapshot(bounds) {
 
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
 let _geminiMonitor = null;         // Gemini CLI session JSON polling instance
+const CODEX_OFFICIAL_LOG_SUPPRESS_TTL_MS = 10 * 60 * 1000;
+const CODEX_LOG_EVENTS_COVERED_BY_OFFICIAL_HOOKS = new Set([
+  "session_meta",
+  "event_msg:task_started",
+  "event_msg:user_message",
+  "response_item:function_call",
+  "response_item:custom_tool_call",
+  "event_msg:exec_command_end",
+  "event_msg:patch_apply_end",
+  "event_msg:custom_tool_call_output",
+  "event_msg:task_complete",
+]);
+const codexOfficialHookSessions = new Map();
+
+function markCodexOfficialHookSession(sessionId) {
+  if (!sessionId) return;
+  codexOfficialHookSessions.set(String(sessionId), Date.now());
+}
+
+function hasRecentCodexOfficialHookSession(sessionId) {
+  const lastHookAt = codexOfficialHookSessions.get(String(sessionId));
+  if (!lastHookAt) return false;
+  if (Date.now() - lastHookAt > CODEX_OFFICIAL_LOG_SUPPRESS_TTL_MS) {
+    codexOfficialHookSessions.delete(String(sessionId));
+    return false;
+  }
+  return true;
+}
+
+function shouldSuppressCodexLogEvent(sessionId, state, event) {
+  // P2: official PermissionRequest owns the interactive bubble. Drop the
+  // legacy JSONL codex-permission notification for hook-active sessions so the
+  // user does not see both the real approval bubble and the old "Got it" hint.
+  if (state === "codex-permission") return hasRecentCodexOfficialHookSession(sessionId);
+  if (!CODEX_LOG_EVENTS_COVERED_BY_OFFICIAL_HOOKS.has(event)) return false;
+  return hasRecentCodexOfficialHookSession(sessionId);
+}
+
+function updateSessionFromServer(sessionId, state, event, opts = {}) {
+  if (opts && opts.agentId === "codex" && opts.hookSource === "codex-official") {
+    markCodexOfficialHookSession(sessionId);
+  }
+  return updateSession(sessionId, state, event, opts);
+}
 
 // Hook-based agents have no module-level monitor — they're gated at the
 // HTTP route layer. Only log-poll agents hit these branches.
@@ -419,10 +480,10 @@ let manageClaudeHooksAutomatically = _settingsController.get("manageClaudeHooksA
 let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
 let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
-let hideBubbles = _settingsController.get("hideBubbles");
-let showSessionId = _settingsController.get("showSessionId");
+let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
 let soundMuted = _settingsController.get("soundMuted");
 let soundVolume = _settingsController.get("soundVolume");
+let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
 let petHidden = false;
@@ -440,6 +501,14 @@ function broadcastShortcutFailures() {
     "shortcut-failures-changed",
     Object.fromEntries(shortcutRegistrationFailures)
   );
+}
+
+function getRuntimeBubblePolicy(kind) {
+  return getBubblePolicy(_settingsController.getSnapshot(), kind);
+}
+
+function getAllBubblesHidden() {
+  return isAllBubblesHidden(_settingsController.getSnapshot());
 }
 
 function reportShortcutFailure(actionId, reason) {
@@ -460,16 +529,16 @@ function togglePetVisibility() {
   if (_mini.getMiniTransitioning()) return;
   if (petHidden) {
     win.showInactive();
-    if (isLinux) win.setSkipTaskbar(true);
+    keepOutOfTaskbar(win);
     if (hitWin && !hitWin.isDestroyed()) {
       hitWin.showInactive();
-      if (isLinux) hitWin.setSkipTaskbar(true);
+      keepOutOfTaskbar(hitWin);
     }
     // Restore any permission bubbles that were hidden
     for (const perm of pendingPermissions) {
       if (perm.bubble && !perm.bubble.isDestroyed()) {
         perm.bubble.showInactive();
-        if (isLinux) perm.bubble.setSkipTaskbar(true);
+        keepOutOfTaskbar(perm.bubble);
       }
     }
     syncUpdateBubbleVisibility();
@@ -485,6 +554,8 @@ function togglePetVisibility() {
     hideUpdateBubble();
     petHidden = true;
   }
+  syncSessionHudVisibility();
+  repositionFloatingBubbles();
   syncPermissionShortcuts();
   buildTrayMenu();
   buildContextMenu();
@@ -511,10 +582,10 @@ function bringPetToPrimaryDisplay() {
     togglePetVisibility();
   } else {
     win.showInactive();
-    if (isLinux) win.setSkipTaskbar(true);
+    keepOutOfTaskbar(win);
     if (hitWin && !hitWin.isDestroyed()) {
       hitWin.showInactive();
-      if (isLinux) hitWin.setSkipTaskbar(true);
+      keepOutOfTaskbar(hitWin);
     }
   }
 
@@ -587,6 +658,7 @@ function applyPetWindowBounds(bounds) {
   if (!materialized) return null;
   win.setBounds(materialized.bounds);
   setViewportOffsetY(materialized.viewportOffsetY);
+  repositionSessionHud();
   return materialized.bounds;
 }
 
@@ -612,6 +684,7 @@ function syncHitStateAfterLoad() {
 }
 
 function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
+  sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
   }
@@ -698,6 +771,7 @@ function syncHitWin() {
     _lastHitW = w; _lastHitH = h;
     hitWin.setShape([{ x: 0, y: 0, width: w, height: h }]);
   }
+  repositionSessionHud();
 }
 
 let mouseOverPet = false;
@@ -706,7 +780,23 @@ let dragSnapshot = null;
 let menuOpen = false;
 let idlePaused = false;
 let forceEyeResend = false;
+let forceEyeResendBoostUntil = 0;
+let requestFastTick = () => {};
 let themeReloadInProgress = false;
+let repositionSessionHud = () => {};
+let syncSessionHudVisibility = () => {};
+let broadcastSessionHudSnapshot = () => {};
+let sendSessionHudI18n = () => {};
+let getSessionHudReservedOffset = () => 0;
+let getSessionHudWindow = () => null;
+
+function setForceEyeResend(value) {
+  forceEyeResend = !!value;
+  if (forceEyeResend) {
+    forceEyeResendBoostUntil = Math.max(forceEyeResendBoostUntil, Date.now() + 2000);
+    requestFastTick(100);
+  }
+}
 
 // Keep drag math in Electron's main-process DIP coordinate space. Renderer
 // PointerEvent.screenX/Y can be scaled differently on high-DPI displays.
@@ -751,6 +841,7 @@ function moveWindowForDrag() {
   applyPetWindowBounds(bounds);
   if (isWin && isNearWorkAreaEdge(bounds)) reassertWinTopmost();
   syncHitWin();
+  repositionSessionHud();
   repositionFloatingBubbles();
 }
 
@@ -760,7 +851,7 @@ function moveWindowForDrag() {
 
 
 // ── Permission bubble — delegated to src/permission.js ──
-const { isAgentEnabled: _isAgentEnabled, isAgentPermissionsEnabled: _isAgentPermissionsEnabled } = require("./agent-gate");
+const { isAgentEnabled: _isAgentEnabled, isAgentPermissionsEnabled: _isAgentPermissionsEnabled, isAgentNotificationHookEnabled: _isAgentNotificationHookEnabled } = require("./agent-gate");
 const _permCtx = {
   get win() { return win; },
   get lang() { return lang; },
@@ -768,11 +859,13 @@ const _permCtx = {
   get bubbleFollowPet() { return bubbleFollowPet; },
   get permDebugLog() { return permDebugLog; },
   get doNotDisturb() { return doNotDisturb; },
-  get hideBubbles() { return hideBubbles; },
+  get hideBubbles() { return getAllBubblesHidden(); },
   get petHidden() { return petHidden; },
+  getBubblePolicy: getRuntimeBubblePolicy,
   getPetWindowBounds,
   getNearestWorkArea,
   getHitRectScreen,
+  getHudReservedOffset: () => getSessionHudReservedOffset(),
   guardAlwaysOnTop,
   reapplyMacVisibility,
   isAgentPermissionsEnabled: (agentId) =>
@@ -787,6 +880,7 @@ const _permCtx = {
   }),
   reportShortcutFailure: (actionId, reason) => reportShortcutFailure(actionId, reason),
   clearShortcutFailure: (actionId) => clearShortcutFailure(actionId),
+  repositionUpdateBubble: () => repositionUpdateBubble(),
 };
 const _perm = require("./permission")(_permCtx);
 const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
@@ -799,10 +893,13 @@ const _updateBubbleCtx = {
   get win() { return win; },
   get bubbleFollowPet() { return bubbleFollowPet; },
   get petHidden() { return petHidden; },
+  getBubblePolicy: getRuntimeBubblePolicy,
   getPendingPermissions: () => pendingPermissions,
   getPetWindowBounds,
   getNearestWorkArea,
+  getUpdateBubbleAnchorRect,
   getHitRectScreen,
+  getHudReservedOffset: () => getSessionHudReservedOffset(),
   guardAlwaysOnTop,
   reapplyMacVisibility,
 };
@@ -848,10 +945,15 @@ function reapplyMacVisibility() {
   apply(hitWin);
   for (const perm of pendingPermissions) apply(perm.bubble);
   apply(_updateBubble.getBubbleWindow());
+  apply(getSessionHudWindow());
   apply(contextMenuOwner);
 }
 
 // ── State machine — delegated to src/state.js ──
+let showDashboard = () => {};
+let broadcastDashboardSessionSnapshot = () => {};
+let sendDashboardI18n = () => {};
+
 const _stateCtx = {
   get theme() { return activeTheme; },
   get win() { return win; },
@@ -868,10 +970,9 @@ const _stateCtx = {
   get idlePaused() { return idlePaused; },
   set idlePaused(v) { idlePaused = v; },
   get forceEyeResend() { return forceEyeResend; },
-  set forceEyeResend(v) { forceEyeResend = v; },
+  set forceEyeResend(v) { setForceEyeResend(v); },
   get mouseStillSince() { return _tick ? _tick._mouseStillSince : Date.now(); },
   get pendingPermissions() { return pendingPermissions; },
-  get showSessionId() { return showSessionId; },
   sendToRenderer,
   sendToHitWin,
   syncHitWin,
@@ -887,11 +988,21 @@ const _stateCtx = {
   // incoming Kimi PermissionRequest.
   isAgentPermissionsEnabled: (agentId) =>
     _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  // state.js gates self-issued Notification events (idle / wait-for-input
+  // pings) via this reader. Living in updateSession (not at the HTTP
+  // boundary) keeps the gate consistent for hook / log-poll / plugin paths.
+  isAgentNotificationHookEnabled: (agentId) =>
+    _isAgentNotificationHookEnabled({ agents: _settingsController.get("agents") }, agentId),
   miniPeekIn: () => miniPeekIn(),
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
   debugLog: (msg) => sessionLog(msg),
+  broadcastSessionSnapshot: (snapshot) => {
+    broadcastDashboardSessionSnapshot(snapshot);
+    broadcastSessionHudSnapshot(snapshot);
+    repositionFloatingBubbles();
+  },
   // Phase 3b: 读 prefs.themeOverrides 判断某个 oneshot state 是否被用户禁用。
   // state.js gate 调这个做 early-return。不做白名单校验——settings-actions
   // 负责写入合法性，这里只读。
@@ -904,6 +1015,7 @@ const _stateCtx = {
     const entry = (stateMap && stateMap[stateKey]) || (themeMap && themeMap[stateKey]);
     return !!(entry && entry.disabled === true);
   },
+  getSessionAliases: () => _settingsController.get("sessionAliases"),
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
     // reading. Missing agents field falls back to "assume enabled" (the
@@ -923,7 +1035,7 @@ const _stateCtx = {
 const _state = require("./state")(_stateCtx);
 const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride,
         enableDoNotDisturb, disableDoNotDisturb, startStaleCleanup, stopStaleCleanup,
-        startWakePoll, stopWakePoll, detectRunningAgentProcesses, buildSessionSubmenu,
+        startWakePoll, stopWakePoll, detectRunningAgentProcesses,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
 const STATE_PRIORITY = _state.STATE_PRIORITY;
@@ -945,6 +1057,26 @@ function getHitRectScreen(bounds) {
     }
   );
   return hit || { left: bounds.x, top: bounds.y, right: bounds.x + bounds.width, bottom: bounds.y + bounds.height };
+}
+
+function getUpdateBubbleAnchorRect(bounds) {
+  if (!bounds || !activeTheme) return getHitRectScreen(bounds);
+
+  const stableAnchor = computeThemeAnchorRect(activeTheme, bounds);
+  if (stableAnchor) return stableAnchor;
+
+  const box = getThemeMarginBox(activeTheme);
+  const currentFile = _state.getCurrentSvg();
+  if (box && currentFile) {
+    const currentAnchor = computeThemeAnchorRect(activeTheme, bounds, {
+      box,
+      state: _state.getCurrentState(),
+      file: currentFile,
+    });
+    if (currentAnchor) return currentAnchor;
+  }
+
+  return getHitRectScreen(bounds);
 }
 
 function getVisibleContentMargins(bounds) {
@@ -987,7 +1119,8 @@ const _tickCtx = {
   get mouseOverPet() { return mouseOverPet; },
   set mouseOverPet(v) { mouseOverPet = v; },
   get forceEyeResend() { return forceEyeResend; },
-  set forceEyeResend(v) { forceEyeResend = v; },
+  set forceEyeResend(v) { setForceEyeResend(v); },
+  get forceEyeResendBoostUntil() { return forceEyeResendBoostUntil; },
   get startupRecoveryActive() { return _state.getStartupRecoveryActive(); },
   sendToRenderer,
   sendToHitWin,
@@ -999,18 +1132,63 @@ const _tickCtx = {
   getHitRectScreen,
 };
 const _tick = require("./tick")(_tickCtx);
+requestFastTick = (maxDelay) => _tick.scheduleSoon(maxDelay);
 const { startMainTick, resetIdleTimer } = _tick;
 
 // ── Terminal focus — delegated to src/focus.js ──
 const _focus = require("./focus")({ _allowSetForeground });
 const { initFocusHelper, killFocusHelper, focusTerminalWindow, clearMacFocusCooldownTimer } = _focus;
 
+function focusDashboardSession(sessionId) {
+  if (!sessionId) return;
+  const session = sessions.get(String(sessionId));
+  if (session && session.sourcePid) {
+    focusTerminalWindow(session.sourcePid, session.cwd, session.editor, session.pidChain);
+  }
+}
+
+const _dashboard = require("./dashboard")({
+  get lang() { return lang; },
+  t: (key) => translate(key),
+  getSessionSnapshot: () => _state.buildSessionSnapshot(),
+  getI18n: () => getDashboardI18nPayload(),
+  getPetWindowBounds,
+  getNearestWorkArea,
+  iconPath: getSettingsWindowIcon(),
+});
+showDashboard = _dashboard.showDashboard;
+broadcastDashboardSessionSnapshot = _dashboard.broadcastSessionSnapshot;
+sendDashboardI18n = _dashboard.sendI18n;
+
+const _sessionHud = require("./session-hud")({
+  get win() { return win; },
+  get petHidden() { return petHidden; },
+  get sessionHudEnabled() { return sessionHudEnabled; },
+  getMiniMode: () => _mini.getMiniMode(),
+  getMiniTransitioning: () => _mini.getMiniTransitioning(),
+  getSessionSnapshot: () => _state.buildSessionSnapshot(),
+  getI18n: () => getDashboardI18nPayload(),
+  getPetWindowBounds,
+  getHitRectScreen,
+  getNearestWorkArea,
+  guardAlwaysOnTop,
+  reapplyMacVisibility,
+  onReservedOffsetChange: () => repositionFloatingBubbles(),
+});
+repositionSessionHud = _sessionHud.repositionSessionHud;
+syncSessionHudVisibility = _sessionHud.syncSessionHud;
+broadcastSessionHudSnapshot = _sessionHud.broadcastSessionSnapshot;
+sendSessionHudI18n = _sessionHud.sendI18n;
+getSessionHudReservedOffset = _sessionHud.getHudReservedOffset;
+getSessionHudWindow = _sessionHud.getWindow;
+
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
   get manageClaudeHooksAutomatically() { return manageClaudeHooksAutomatically; },
   get autoStartWithClaude() { return autoStartWithClaude; },
   get doNotDisturb() { return doNotDisturb; },
-  get hideBubbles() { return hideBubbles; },
+  get hideBubbles() { return getAllBubblesHidden(); },
+  getBubblePolicy: getRuntimeBubblePolicy,
   get pendingPermissions() { return pendingPermissions; },
   get PASSTHROUGH_TOOLS() { return PASSTHROUGH_TOOLS; },
   get STATE_SVGS() { return _state.STATE_SVGS; },
@@ -1018,7 +1196,7 @@ const _serverCtx = {
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   setState,
-  updateSession,
+  updateSession: updateSessionFromServer,
   resolvePermissionEntry,
   sendPermissionResponse,
   showPermissionBubble,
@@ -1071,7 +1249,7 @@ function scheduleHwndRecovery() {
     if (!win || win.isDestroyed()) return;
     // Just restore z-order — input routing is handled by hitWin now
     reassertWinTopmost();
-    forceEyeResend = true;
+    setForceEyeResend(true);
   }, 1000);
 }
 
@@ -1081,7 +1259,7 @@ function guardAlwaysOnTop(w) {
     if (!isOnTop && w && !w.isDestroyed()) {
       w.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
       if (w === win && !dragLocked && !_mini.getIsAnimating() && !_mini.getMiniTransitioning()) {
-        forceEyeResend = true;
+        setForceEyeResend(true);
         const bounds = getPetWindowBounds();
         applyPetWindowPosition(bounds.x + 1, bounds.y);
         applyPetWindowPosition(bounds.x, bounds.y);
@@ -1097,17 +1275,31 @@ function startTopmostWatchdog() {
   topmostWatchdog = setInterval(() => {
     if (win && !win.isDestroyed()) {
       win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+      keepOutOfTaskbar(win);
     }
     // Keep hitWin topmost too
     if (hitWin && !hitWin.isDestroyed()) {
       hitWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+      keepOutOfTaskbar(hitWin);
     }
     for (const perm of pendingPermissions) {
-      if (perm.bubble && !perm.bubble.isDestroyed() && perm.bubble.isVisible()) perm.bubble.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+      if (perm.bubble && !perm.bubble.isDestroyed() && perm.bubble.isVisible()) {
+        perm.bubble.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+        keepOutOfTaskbar(perm.bubble);
+      }
     }
     const updateBubbleWin = _updateBubble.getBubbleWindow();
     if (updateBubbleWin && !updateBubbleWin.isDestroyed() && updateBubbleWin.isVisible()) {
       updateBubbleWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+      keepOutOfTaskbar(updateBubbleWin);
+    }
+    const sessionHudWin = getSessionHudWindow();
+    if (sessionHudWin && !sessionHudWin.isDestroyed() && sessionHudWin.isVisible()) {
+      sessionHudWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+      keepOutOfTaskbar(sessionHudWin);
+    }
+    if (contextMenuOwner && !contextMenuOwner.isDestroyed()) {
+      keepOutOfTaskbar(contextMenuOwner);
     }
   }, TOPMOST_WATCHDOG_MS);
 }
@@ -1155,10 +1347,10 @@ const _menuCtx = {
   set openAtLogin(v) { _settingsController.applyUpdate("openAtLogin", v); },
   get bubbleFollowPet() { return bubbleFollowPet; },
   set bubbleFollowPet(v) { _settingsController.applyUpdate("bubbleFollowPet", v); },
-  get hideBubbles() { return hideBubbles; },
-  set hideBubbles(v) { _settingsController.applyUpdate("hideBubbles", v); },
-  get showSessionId() { return showSessionId; },
-  set showSessionId(v) { _settingsController.applyUpdate("showSessionId", v); },
+  get hideBubbles() { return getAllBubblesHidden(); },
+  set hideBubbles(v) { _settingsController.applyCommand("setAllBubblesHidden", { hidden: !!v }).catch((err) => {
+    console.warn("Clawd: setAllBubblesHidden failed:", err && err.message);
+  }); },
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get soundVolume() { return soundVolume; },
@@ -1184,10 +1376,9 @@ const _menuCtx = {
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
   miniHandleResize: (sizeKey) => _mini.handleResize(sizeKey),
-  focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   checkForUpdates: (...args) => checkForUpdates(...args),
   getUpdateMenuItem: () => getUpdateMenuItem(),
-  buildSessionSubmenu: () => buildSessionSubmenu(),
+  openDashboard: () => showDashboard(),
   // The settings controller is the only writer of persisted prefs. Toggle
   // setters above route through it; resize/sendToDisplay use
   // flushRuntimeStateToPrefs to capture window bounds after movement.
@@ -1213,7 +1404,7 @@ const _menuCtx = {
 };
 const _menu = require("./menu")(_menuCtx);
 const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
-        destroyTray, showPetContextMenu, popupMenuAt, ensureContextMenuOwner,
+        destroyTray, showPetContextMenu, ensureContextMenuOwner,
         requestAppQuit, applyDockVisibility } = _menu;
 
 // ── Settings subscribers ──
@@ -1225,8 +1416,10 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 // route writes through the controller, so menu clicks and IPC updates
 // from a future settings panel land here identically.
 const MENU_AFFECTING_KEYS = new Set([
-  "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId",
+  "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "permissionBubblesEnabled",
+  "notificationBubbleAutoCloseSeconds", "updateBubbleAutoCloseSeconds",
   "manageClaudeHooksAutomatically", "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
+  "sessionAliases",
 ]);
 let lastTogglePetShortcut = ((_settingsController.getSnapshot().shortcuts) || {}).togglePet || null;
 
@@ -1262,22 +1455,101 @@ function wireSettingsSubscribers() {
       openAtLogin = changes.openAtLogin;
     }
     if ("bubbleFollowPet" in changes) bubbleFollowPet = changes.bubbleFollowPet;
-    if ("hideBubbles" in changes) hideBubbles = changes.hideBubbles;
-    if ("showSessionId" in changes) showSessionId = changes.showSessionId;
+    if ("sessionHudEnabled" in changes) sessionHudEnabled = changes.sessionHudEnabled;
     if ("soundMuted" in changes) soundMuted = changes.soundMuted;
     if ("soundVolume" in changes) soundVolume = changes.soundVolume;
+    if ("lowPowerIdleMode" in changes) {
+      lowPowerIdleMode = changes.lowPowerIdleMode;
+      sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
+    }
     if ("allowEdgePinning" in changes) allowEdgePinningCached = changes.allowEdgePinning;
     if ("keepSizeAcrossDisplays" in changes) keepSizeAcrossDisplaysCached = changes.keepSizeAcrossDisplays;
+    if ("lang" in changes) {
+      try { sendDashboardI18n(); } catch (err) {
+        console.warn("Clawd: dashboard lang broadcast failed:", err && err.message);
+      }
+      try { sendSessionHudI18n(); } catch (err) {
+        console.warn("Clawd: session HUD lang broadcast failed:", err && err.message);
+      }
+    }
+    if ("sessionAliases" in changes) {
+      try { _state.emitSessionSnapshot({ force: true }); } catch (err) {
+        console.warn("Clawd: session alias snapshot broadcast failed:", err && err.message);
+      }
+    }
 
     // 2. Reactive side effects (mirror what the legacy setters / click handlers used to do).
-    if ("hideBubbles" in changes) {
+    if ("hideBubbles" in changes || "permissionBubblesEnabled" in changes) {
       try { syncPermissionShortcuts(); } catch (err) {
         console.warn("Clawd: syncPermissionShortcuts failed:", err && err.message);
+      }
+    }
+    if (
+      ("permissionBubblesEnabled" in changes && changes.permissionBubblesEnabled === false) ||
+      ("hideBubbles" in changes && changes.hideBubbles === true)
+    ) {
+      try {
+        if (_perm && typeof _perm.dismissInteractivePermissionBubbles === "function") {
+          _perm.dismissInteractivePermissionBubbles();
+        }
+      } catch (err) {
+        console.warn("Clawd: dismiss interactive bubbles failed:", err && err.message);
+      }
+    }
+    if (
+      ("notificationBubbleAutoCloseSeconds" in changes && changes.notificationBubbleAutoCloseSeconds === 0) ||
+      ("hideBubbles" in changes && changes.hideBubbles === true)
+      ) {
+        try {
+          clearCodexNotifyBubbles(undefined, "settings-policy-disabled");
+          clearKimiNotifyBubbles(undefined, "settings-policy-disabled");
+        } catch (err) {
+          console.warn("Clawd: clear notification bubbles failed:", err && err.message);
+        }
+    } else if (
+      "notificationBubbleAutoCloseSeconds" in changes &&
+      changes.notificationBubbleAutoCloseSeconds > 0
+    ) {
+      try {
+        if (_perm && typeof _perm.refreshPassiveNotifyAutoClose === "function") {
+          _perm.refreshPassiveNotifyAutoClose();
+        }
+      } catch (err) {
+        console.warn("Clawd: refresh notification bubble timers failed:", err && err.message);
+      }
+    }
+    if (
+      ("updateBubbleAutoCloseSeconds" in changes && changes.updateBubbleAutoCloseSeconds === 0) ||
+      ("hideBubbles" in changes && changes.hideBubbles === true)
+    ) {
+      try {
+        if (_updateBubble && typeof _updateBubble.hideForPolicy === "function") _updateBubble.hideForPolicy();
+      } catch (err) {
+        console.warn("Clawd: hide update bubble failed:", err && err.message);
+      }
+    } else if (
+      "updateBubbleAutoCloseSeconds" in changes &&
+      changes.updateBubbleAutoCloseSeconds > 0
+    ) {
+      try {
+        if (_updateBubble && typeof _updateBubble.refreshAutoCloseForPolicy === "function") {
+          _updateBubble.refreshAutoCloseForPolicy();
+        }
+      } catch (err) {
+        console.warn("Clawd: refresh update bubble timer failed:", err && err.message);
       }
     }
     if ("bubbleFollowPet" in changes) {
       try { repositionFloatingBubbles(); } catch (err) {
         console.warn("Clawd: repositionFloatingBubbles failed:", err && err.message);
+      }
+    }
+    if ("sessionHudEnabled" in changes) {
+      try {
+        syncSessionHudVisibility();
+        repositionFloatingBubbles();
+      } catch (err) {
+        console.warn("Clawd: session HUD setting sync failed:", err && err.message);
       }
     }
     if ("allowEdgePinning" in changes) {
@@ -2032,6 +2304,16 @@ function _runAnimationOverridePreview(stateKey, file, durationMs) {
 // ── IPC: settings panel write entry points ──
 // Renderer-side callers (the future settings panel) use these. Menu/main code
 // in this process calls _settingsController directly — no IPC round-trip.
+ipcMain.handle("dashboard:get-snapshot", () => _state.buildSessionSnapshot());
+ipcMain.handle("dashboard:get-i18n", () => getDashboardI18nPayload());
+ipcMain.on("dashboard:focus-session", (_event, sessionId) => focusDashboardSession(sessionId));
+ipcMain.handle("dashboard:set-session-alias", async (_event, payload) => {
+  return _settingsController.applyCommand("setSessionAlias", payload);
+});
+ipcMain.handle("session-hud:get-i18n", () => getDashboardI18nPayload());
+ipcMain.on("session-hud:focus-session", (_event, sessionId) => focusDashboardSession(sessionId));
+ipcMain.on("session-hud:open-dashboard", () => showDashboard());
+
 ipcMain.handle("settings:get-snapshot", () => _settingsController.getSnapshot());
 ipcMain.handle("settings:getShortcutFailures", () =>
   Object.fromEntries(shortcutRegistrationFailures)
@@ -2062,6 +2344,7 @@ ipcMain.handle("settings:end-size-preview", (_event, value) => {
   }
   return settingsSizePreviewSession.end(value || null);
 });
+ipcMain.on("settings:open-dashboard", () => showDashboard());
 ipcMain.handle("settings:get-preview-sound-url", () => {
   try { return themeLoader.getPreviewSoundUrl(); }
   catch { return null; }
@@ -2545,7 +2828,7 @@ ipcMain.handle("settings:get-about-info", () => {
   return {
     version: app.getVersion(),
     repoUrl: "https://github.com/rullerzhou-afk/clawd-on-desk",
-    license: "MIT",
+    license: "AGPL-3.0",
     copyright: "\u00a9 2026 Ruller_Lulu",
     authorName: "Ruller_Lulu / \u9e7f\u9e7f",
     authorUrl: "https://github.com/rullerzhou-afk",
@@ -2946,7 +3229,10 @@ function createWindow() {
     win.on("close", (event) => {
       if (!isQuitting) {
         event.preventDefault();
-        if (!win.isVisible()) win.showInactive();
+        if (!win.isVisible()) {
+          win.showInactive();
+          keepOutOfTaskbar(win);
+        }
       }
     });
     win.on("unresponsive", () => {
@@ -2963,8 +3249,7 @@ function createWindow() {
   win.loadFile(path.join(__dirname, "index.html"));
   applyPetWindowBounds(initialVirtualBounds);
   win.showInactive();
-  // Linux WMs may reset skipTaskbar after showInactive — re-apply explicitly
-  if (isLinux) win.setSkipTaskbar(true);
+  keepOutOfTaskbar(win);
   // macOS: apply after showInactive() — it resets NSWindowCollectionBehavior
   reapplyMacVisibility();
 
@@ -3018,8 +3303,7 @@ function createWindow() {
     hitWin.setIgnoreMouseEvents(false);  // PERMANENT — never toggle
     if (isMac) hitWin.setFocusable(false);
     hitWin.showInactive();
-    // Linux WMs may reset skipTaskbar after showInactive — re-apply explicitly
-    if (isLinux) hitWin.setSkipTaskbar(true);
+    keepOutOfTaskbar(hitWin);
     if (isWin) {
       hitWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
     }
@@ -3032,6 +3316,7 @@ function createWindow() {
     const syncFloatingWindows = () => {
       if (settingsSizePreviewSyncFrozen) return;
       syncHitWin();
+      repositionSessionHud();
       repositionFloatingBubbles();
     };
     win.on("move", syncFloatingWindows);
@@ -3050,6 +3335,8 @@ function createWindow() {
       hitWin.webContents.reload();
     });
   }
+
+  syncSessionHudVisibility();
 
   ipcMain.on("show-context-menu", showPetContextMenu);
 
@@ -3127,8 +3414,8 @@ function createWindow() {
     if (best) focusTerminalWindow(best.sourcePid, best.cwd, best.editor, best.pidChain);
   });
 
-  ipcMain.on("show-session-menu", () => {
-    popupMenuAt(Menu.buildFromTemplate(buildSessionSubmenu()));
+  ipcMain.on("show-dashboard", () => {
+    showDashboard();
   });
 
   ipcMain.on("bubble-height", (event, height) => _perm.handleBubbleHeight(event, height));
@@ -3183,6 +3470,7 @@ function createWindow() {
     if (proportionalRecalc || clamped.x !== current.x || clamped.y !== current.y) {
       applyPetWindowBounds({ ...clamped, width: size.width, height: size.height });
       syncHitWin();
+      repositionSessionHud();
       repositionFloatingBubbles();
     }
   });
@@ -3201,10 +3489,12 @@ function createWindow() {
     const clamped = clampToScreenVisual(current.x, current.y, size.width, size.height);
     applyPetWindowBounds({ ...clamped, width: size.width, height: size.height });
     syncHitWin();
+    repositionSessionHud();
     repositionFloatingBubbles();
   });
   screen.on("display-added", () => {
     reapplyMacVisibility();
+    repositionSessionHud();
     repositionFloatingBubbles();
   });
 }
@@ -3317,6 +3607,11 @@ const _miniCtx = {
   get bubbleFollowPet() { return bubbleFollowPet; },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionFloatingBubbles(),
+  syncSessionHudVisibility: () => {
+    syncSessionHudVisibility();
+    repositionFloatingBubbles();
+  },
+  repositionSessionHud: () => repositionSessionHud(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
   getAnimationAssetCycleMs: (file) => {
@@ -3417,6 +3712,7 @@ function activateTheme(themeId, variantId) {
     syncHitStateAfterLoad();
     syncRendererStateAfterLoad({ includeStartupRecovery: false });
     syncHitWin();
+    syncSessionHudVisibility();
     startMainTick();
     _runPendingPostReloadTasks();
   };
@@ -3518,11 +3814,11 @@ if (!gotTheLock) {
   app.on("second-instance", (_event, commandLine) => {
     if (win) {
       win.showInactive();
-      if (isLinux) win.setSkipTaskbar(true);
+      keepOutOfTaskbar(win);
     }
     if (hitWin && !hitWin.isDestroyed()) {
       hitWin.showInactive();
-      if (isLinux) hitWin.setSkipTaskbar(true);
+      keepOutOfTaskbar(hitWin);
     }
     if (shouldOpenSettingsWindowFromArgv(commandLine)) {
       openSettingsWindowWhenReady();
@@ -3563,6 +3859,7 @@ if (!gotTheLock) {
       const CodexLogMonitor = require("../agents/codex-log-monitor");
       const codexAgent = require("../agents/codex");
       _codexMonitor = new CodexLogMonitor(codexAgent, (sid, state, event, extra) => {
+        if (shouldSuppressCodexLogEvent(sid, state, event)) return;
         if (state === "codex-permission") {
           updateSession(sid, "notification", event, {
             cwd: extra.cwd,
@@ -3575,7 +3872,7 @@ if (!gotTheLock) {
           });
           return;
         }
-        clearCodexNotifyBubbles(sid);
+        clearCodexNotifyBubbles(sid, `codex-state-transition:${state}`);
         updateSession(sid, state, event, {
           cwd: extra.cwd,
           agentId: "codex",
@@ -3625,6 +3922,7 @@ if (!gotTheLock) {
     _state.cleanup();
     _tick.cleanup();
     _mini.cleanup();
+    _sessionHud.cleanup();
     if (_codexMonitor) _codexMonitor.stop();
     if (_geminiMonitor) _geminiMonitor.stop();
     stopTopmostWatchdog();

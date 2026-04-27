@@ -51,6 +51,17 @@
 const { CURRENT_VERSION, AGENT_FLAGS, normalizeThemeOverrides } = require("./prefs");
 const { isValidDisplaySnapshot } = require("./work-area");
 const {
+  MAX_AUTO_CLOSE_SECONDS,
+  buildAggregateHideCommit,
+  buildCategoryEnabledCommit,
+} = require("./bubble-policy");
+const {
+  normalizeSessionAliases,
+  pruneExpiredSessionAliases,
+  sanitizeSessionAlias,
+  sessionAliasKey,
+} = require("./session-alias");
+const {
   SHORTCUT_ACTIONS,
   SHORTCUT_ACTION_IDS,
   getDefaultShortcuts,
@@ -95,6 +106,15 @@ function requireNumberInRange(key, min, max) {
   return function (value) {
     if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
       return { status: "error", message: `${key} must be a finite number between ${min} and ${max}` };
+    }
+    return { status: "ok" };
+  };
+}
+
+function requireIntegerInRange(key, min, max) {
+  return function (value) {
+    if (!Number.isInteger(value) || value < min || value > max) {
+      return { status: "error", message: `${key} must be an integer between ${min} and ${max}` };
     }
     return { status: "ok" };
   };
@@ -270,9 +290,21 @@ const updateRegistry = {
   lang: requireEnum("lang", ["en", "zh", "ko"]),
   soundMuted: requireBoolean("soundMuted"),
   soundVolume: requireNumberInRange("soundVolume", 0, 1),
+  lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
+  sessionHudEnabled: requireBoolean("sessionHudEnabled"),
   hideBubbles: requireBoolean("hideBubbles"),
-  showSessionId: requireBoolean("showSessionId"),
+  permissionBubblesEnabled: requireBoolean("permissionBubblesEnabled"),
+  notificationBubbleAutoCloseSeconds: requireIntegerInRange(
+    "notificationBubbleAutoCloseSeconds",
+    0,
+    MAX_AUTO_CLOSE_SECONDS
+  ),
+  updateBubbleAutoCloseSeconds: requireIntegerInRange(
+    "updateBubbleAutoCloseSeconds",
+    0,
+    MAX_AUTO_CLOSE_SECONDS
+  ),
   allowEdgePinning: requireBoolean("allowEdgePinning"),
   keepSizeAcrossDisplays: requireBoolean("keepSizeAcrossDisplays"),
 
@@ -424,6 +456,16 @@ const updateRegistry = {
   // ── Phase 2/3 placeholders — schema reserves these so applyUpdate accepts them ──
   agents: requirePlainObject("agents"),
   themeOverrides: requirePlainObject("themeOverrides"),
+  sessionAliases(value, deps = {}) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { status: "error", message: "sessionAliases must be a plain object" };
+    }
+    const normalized = normalizeSessionAliases(value, { now: deps.now });
+    if (Object.keys(normalized).length !== Object.keys(value).length) {
+      return { status: "error", message: "sessionAliases must contain valid alias entries" };
+    }
+    return { status: "ok" };
+  },
 
   // Phase 3b-swap: per-theme variant selection. NO effect — the runtime switch
   // runs through the `setThemeSelection` command which atomically commits
@@ -764,8 +806,11 @@ function resetAllShortcuts(_payload, deps) {
 // Payload `{ agentId, flag, value }` where flag ∈ AGENT_FLAGS.
 //
 // Flags:
-//   enabled             — master: event stream on/off
-//   permissionsEnabled  — sub: bubble UI on/off (events still flow)
+//   enabled                  — master: event stream on/off
+//   permissionsEnabled       — sub: bubble UI on/off (events still flow)
+//   notificationHookEnabled  — sub: wait-for-input bell + animation on/off
+//                              (presentation-layer mute; session bookkeeping
+//                              and Kimi hold-release cleanup still run)
 //
 // Main + sub share one command so rapid toggles serialize under the same
 // controller lockKey — two separate commands would lost-update the
@@ -820,6 +865,89 @@ function setAgentFlag(payload, deps) {
   const nextEntry = { ...(currentEntry || {}), [flag]: value };
   const nextAgents = { ...currentAgents, [agentId]: nextEntry };
   return { status: "ok", commit: { agents: nextAgents } };
+}
+
+function setAllBubblesHidden(payload, deps) {
+  const hidden = typeof payload === "boolean" ? payload : payload && payload.hidden;
+  if (typeof hidden !== "boolean") {
+    return { status: "error", message: "setAllBubblesHidden.hidden must be a boolean" };
+  }
+  return { status: "ok", commit: buildAggregateHideCommit(hidden, deps && deps.snapshot) };
+}
+
+function setBubbleCategoryEnabled(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "setBubbleCategoryEnabled: payload must be an object" };
+  }
+  const { category, enabled } = payload;
+  const result = buildCategoryEnabledCommit((deps && deps.snapshot) || {}, category, enabled);
+  if (result.error) return { status: "error", message: result.error };
+  return { status: "ok", commit: result.commit };
+}
+
+function sessionAliasMapEqual(a, b) {
+  const aKeys = Object.keys(a || {});
+  const bKeys = Object.keys(b || {});
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    const av = a[key];
+    const bv = b[key];
+    if (!bv || av.title !== bv.title || av.updatedAt !== bv.updatedAt) return false;
+  }
+  return true;
+}
+
+function getCommandNow(deps) {
+  const now = deps && typeof deps.now === "function" ? deps.now() : deps && deps.now;
+  return Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now();
+}
+
+function getActiveSessionAliasKeys(deps) {
+  if (!deps || typeof deps.getActiveSessionAliasKeys !== "function") return new Set();
+  try {
+    const keys = deps.getActiveSessionAliasKeys();
+    if (keys instanceof Set) return keys;
+    if (Array.isArray(keys)) return new Set(keys);
+    if (keys && typeof keys[Symbol.iterator] === "function") return new Set(keys);
+  } catch {}
+  return new Set();
+}
+
+function setSessionAlias(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "setSessionAlias: payload must be an object" };
+  }
+  const { host, agentId, sessionId, cwd, alias } = payload;
+  const key = sessionAliasKey(host, agentId, sessionId, { cwd });
+  if (!key) {
+    return { status: "error", message: "setSessionAlias.sessionId must be a non-empty string" };
+  }
+  const cleanAlias = sanitizeSessionAlias(alias);
+  if (cleanAlias === null) {
+    return { status: "error", message: "setSessionAlias.alias must be a string" };
+  }
+
+  const now = getCommandNow(deps);
+  const snapshot = (deps && deps.snapshot) || {};
+  const currentAliases = normalizeSessionAliases(snapshot.sessionAliases || {}, { now });
+  const nextAliases = { ...currentAliases };
+  if (cleanAlias) {
+    const existing = currentAliases[key];
+    if (!existing || existing.title !== cleanAlias) {
+      nextAliases[key] = { title: cleanAlias, updatedAt: now };
+    }
+  }
+  else delete nextAliases[key];
+
+  const prunedAliases = pruneExpiredSessionAliases(nextAliases, {
+    now,
+    activeKeys: getActiveSessionAliasKeys(deps),
+  });
+
+  if (sessionAliasMapEqual(prunedAliases, currentAliases)) {
+    return { status: "ok", noop: true };
+  }
+  return { status: "ok", commit: { sessionAliases: prunedAliases } };
 }
 
 const _validateRemoveThemeId = requireString("removeTheme.themeId");
@@ -1489,6 +1617,9 @@ const commandRegistry = {
   resetShortcut,
   resetAllShortcuts,
   setAgentFlag,
+  setAllBubblesHidden,
+  setBubbleCategoryEnabled,
+  setSessionAlias,
   setAnimationOverride,
   setSoundOverride,
   setThemeOverrideDisabled,
@@ -1509,4 +1640,5 @@ module.exports = {
   requireEnum,
   requireString,
   requirePlainObject,
+  requireIntegerInRange,
 };

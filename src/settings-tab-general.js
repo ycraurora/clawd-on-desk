@@ -5,14 +5,23 @@
     "size",
     "soundMuted",
     "soundVolume",
+    "lowPowerIdleMode",
+    "sessionHudEnabled",
     "allowEdgePinning",
     "keepSizeAcrossDisplays",
     "openAtLogin",
     "autoStartWithClaude",
     "bubbleFollowPet",
-    "hideBubbles",
-    "showSessionId",
+    "permissionBubblesEnabled",
+    "notificationBubbleAutoCloseSeconds",
+    "updateBubbleAutoCloseSeconds",
   ]);
+  const BUBBLE_POLICY_KEYS = new Set([
+    "permissionBubblesEnabled",
+    "notificationBubbleAutoCloseSeconds",
+    "updateBubbleAutoCloseSeconds",
+  ]);
+  const BUBBLE_SECONDS_AUTO_COMMIT_DELAY_MS = 600;
 
   let state = null;
   let readers = null;
@@ -37,12 +46,23 @@
       buildLanguageRow(),
       buildSizeSliderRow(),
       helpers.buildSwitchRow({
+        key: "sessionHudEnabled",
+        labelKey: "rowSessionHud",
+        descKey: "rowSessionHudDesc",
+      }),
+      buildDashboardRow(),
+      helpers.buildSwitchRow({
         key: "soundMuted",
         labelKey: "rowSound",
         descKey: "rowSoundDesc",
         invert: true,
       }),
       buildVolumeSliderRow(),
+      helpers.buildSwitchRow({
+        key: "lowPowerIdleMode",
+        labelKey: "rowLowPowerIdleMode",
+        descKey: "rowLowPowerIdleModeDesc",
+      }),
       helpers.buildSwitchRow({
         key: "allowEdgePinning",
         labelKey: "rowAllowEdgePinning",
@@ -84,20 +104,17 @@
 
     parent.appendChild(helpers.buildSection(t("sectionBubbles"), [
       helpers.buildSwitchRow({
+        key: "hideBubbles",
+        labelKey: "rowHideBubbles",
+        descKey: "rowHideBubblesDesc",
+        onToggle: ({ nextRaw }) => window.settingsAPI.command("setAllBubblesHidden", { hidden: nextRaw }),
+      }),
+      helpers.buildSwitchRow({
         key: "bubbleFollowPet",
         labelKey: "rowBubbleFollow",
         descKey: "rowBubbleFollowDesc",
       }),
-      helpers.buildSwitchRow({
-        key: "hideBubbles",
-        labelKey: "rowHideBubbles",
-        descKey: "rowHideBubblesDesc",
-      }),
-      helpers.buildSwitchRow({
-        key: "showSessionId",
-        labelKey: "rowShowSessionId",
-        descKey: "rowShowSessionIdDesc",
-      }),
+      buildBubblePolicyRow(),
     ]));
   }
 
@@ -124,6 +141,29 @@
       if (!result || !result.confirmed) return { status: "ok", noop: true };
       return window.settingsAPI.command("uninstallHooks");
     });
+  }
+
+  function buildDashboardRow() {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      `<div class="row-text">` +
+        `<span class="row-label"></span>` +
+        `<span class="row-desc"></span>` +
+      `</div>` +
+      `<div class="row-control">` +
+        `<button type="button" class="soft-btn accent"></button>` +
+      `</div>`;
+    row.querySelector(".row-label").textContent = t("rowSessionDashboard");
+    row.querySelector(".row-desc").textContent = t("rowSessionDashboardDesc");
+    const btn = row.querySelector("button");
+    btn.textContent = t("actionOpenDashboard");
+    btn.addEventListener("click", () => {
+      if (window.settingsAPI && typeof window.settingsAPI.openDashboard === "function") {
+        window.settingsAPI.openDashboard();
+      }
+    });
+    return row;
   }
 
   function buildLanguageRow() {
@@ -164,6 +204,399 @@
       });
     }
     return row;
+  }
+
+  function buildBubblePolicyRow() {
+    const summaryControl = buildBubblePolicySummary();
+    state.mountedControls.bubblePolicySummary = summaryControl;
+    return helpers.buildCollapsibleGroup({
+      id: "general:bubble-policy",
+      title: t("rowBubblePolicy"),
+      desc: t("rowBubblePolicyDesc"),
+      summary: summaryControl.element,
+      defaultCollapsed: true,
+      children: [buildBubblePolicyList()],
+      className: "bubble-policy-collapsible",
+    });
+  }
+
+  function readBubblePolicySnapshot() {
+    const aggregateHidden = !!(state.snapshot && state.snapshot.hideBubbles === true);
+    return {
+      permissionOn: !aggregateHidden && !!(state.snapshot && state.snapshot.permissionBubblesEnabled !== false),
+      notificationSeconds: aggregateHidden ? 0 : Number(state.snapshot && state.snapshot.notificationBubbleAutoCloseSeconds) || 0,
+      updateSeconds: aggregateHidden ? 0 : Number(state.snapshot && state.snapshot.updateBubbleAutoCloseSeconds) || 0,
+    };
+  }
+
+  function buildBubblePolicySummary() {
+    const wrap = document.createElement("div");
+
+    function syncFromSnapshot() {
+      wrap.innerHTML = "";
+      const snapshot = readBubblePolicySnapshot();
+      const items = [
+      {
+        text: t("bubblePolicySummaryPermission").replace(
+          "{state}",
+          snapshot.permissionOn ? t("bubblePolicySummaryOn") : t("bubblePolicySummaryOff")
+        ),
+        accent: snapshot.permissionOn,
+      },
+      {
+        text: t("bubblePolicySummaryNotification").replace("{seconds}", String(snapshot.notificationSeconds)),
+        accent: snapshot.notificationSeconds > 0,
+      },
+      {
+        text: t("bubblePolicySummaryUpdate").replace("{seconds}", String(snapshot.updateSeconds)),
+        accent: snapshot.updateSeconds > 0,
+      },
+      ];
+      for (const item of items) {
+        const chip = document.createElement("span");
+        chip.className = "collapsible-summary-chip" + (item.accent ? " accent" : "");
+        chip.textContent = item.text;
+        wrap.appendChild(chip);
+      }
+    }
+
+    syncFromSnapshot();
+    return {
+      element: wrap,
+      syncFromSnapshot,
+    };
+  }
+
+  function buildBubblePolicyList() {
+    const list = document.createElement("div");
+    list.className = "bubble-policy-list";
+    list.appendChild(buildBubbleCategoryControl({
+      category: "permission",
+      labelKey: "bubblePermissionLabel",
+      descKey: "bubblePermissionDesc",
+      secondsKey: null,
+    }));
+    list.appendChild(buildBubbleCategoryControl({
+      category: "notification",
+      labelKey: "bubbleNotificationLabel",
+      descKey: "bubbleNotificationDesc",
+      secondsKey: "notificationBubbleAutoCloseSeconds",
+    }));
+    list.appendChild(buildBubbleCategoryControl({
+      category: "update",
+      labelKey: "bubbleUpdateLabel",
+      descKey: "bubbleUpdateDesc",
+      warningKey: "bubbleUpdateWarning",
+      secondsKey: "updateBubbleAutoCloseSeconds",
+    }));
+    return list;
+  }
+
+  function buildBubbleCategoryControl({ category, labelKey, descKey, warningKey = null, secondsKey = null }) {
+    const stateKey = secondsKey || "permissionBubblesEnabled";
+    const item = document.createElement("div");
+    item.className = "bubble-policy-item";
+    item.innerHTML =
+      `<div class="bubble-policy-copy">` +
+        `<span class="row-label"></span>` +
+        `<span class="row-desc"></span>` +
+      `</div>` +
+      `<div class="bubble-policy-controls">` +
+        `<div class="switch" role="switch" tabindex="0"></div>` +
+      `</div>`;
+    item.querySelector(".row-label").textContent = t(labelKey);
+    item.querySelector(".row-desc").textContent = t(descKey);
+    if (warningKey) {
+      const warning = document.createElement("span");
+      warning.className = "row-desc bubble-policy-warning";
+      warning.textContent = t(warningKey);
+      item.querySelector(".bubble-policy-copy").appendChild(warning);
+    }
+
+    const sw = item.querySelector(".switch");
+    const controls = item.querySelector(".bubble-policy-controls");
+    let secondsInput = null;
+    let secondsCommitTimer = null;
+    let secondsDraftValue = null;
+    let secondsInFlightValue = null;
+    let secondsCommitSeq = 0;
+
+    function currentEnabled() {
+      if (state.snapshot && state.snapshot.hideBubbles === true) return false;
+      if (!secondsKey) return !!(state.snapshot && state.snapshot.permissionBubblesEnabled !== false);
+      const seconds = Number(state.snapshot && state.snapshot[secondsKey]);
+      return Number.isFinite(seconds) && seconds > 0;
+    }
+
+    function currentSeconds() {
+      if (!secondsKey) return 0;
+      return Number(state.snapshot && state.snapshot[secondsKey]) || 0;
+    }
+
+    function setVisual(enabled, pending = false) {
+      helpers.setSwitchVisual(sw, enabled, { pending });
+      if (secondsInput) secondsInput.disabled = !enabled || pending;
+    }
+
+    function clearSecondsCommitTimer() {
+      if (secondsCommitTimer) {
+        clearTimeout(secondsCommitTimer);
+        secondsCommitTimer = null;
+      }
+    }
+
+    function syncFromSnapshot() {
+      setVisual(currentEnabled(), false);
+      if (!secondsInput) return;
+      const snapshotSeconds = currentSeconds();
+      if (secondsDraftValue === snapshotSeconds) secondsDraftValue = null;
+      if (secondsInFlightValue === snapshotSeconds) secondsInFlightValue = null;
+      if (document.activeElement === secondsInput || secondsDraftValue != null) return;
+      secondsInput.value = String(snapshotSeconds);
+    }
+
+    function submitSecondsCommit(next) {
+      if (!secondsInput) return Promise.resolve(false);
+      if (next === currentSeconds() || next === secondsInFlightValue) {
+        if (secondsDraftValue === next) secondsDraftValue = null;
+        return Promise.resolve(true);
+      }
+      clearSecondsCommitTimer();
+      secondsDraftValue = next;
+      secondsInFlightValue = next;
+      const seq = ++secondsCommitSeq;
+      return commitSecondsValue(secondsInput, secondsKey, next, category).then((committed) => {
+        if (seq === secondsCommitSeq && secondsInFlightValue === next) secondsInFlightValue = null;
+        if (seq !== secondsCommitSeq) return committed;
+        if (committed && secondsDraftValue === next) secondsDraftValue = null;
+        if (!committed) secondsDraftValue = null;
+        return committed;
+      });
+    }
+
+    function scheduleSecondsCommit(next) {
+      secondsDraftValue = next;
+      clearSecondsCommitTimer();
+      secondsCommitTimer = setTimeout(() => {
+        secondsCommitTimer = null;
+        void submitSecondsCommit(next);
+      }, BUBBLE_SECONDS_AUTO_COMMIT_DELAY_MS);
+    }
+
+    function flushSecondsCommit() {
+      clearSecondsCommitTimer();
+      const raw = secondsInput.value.trim();
+      const next = parseBubbleSecondsInputValue(raw);
+      if (next == null) {
+        secondsDraftValue = null;
+        secondsInput.value = String(Number(state.snapshot && state.snapshot[secondsKey]) || 0);
+        ops.showToast(t("toastSaveFailed") + t("bubbleSecondsInvalid"), { error: true });
+        return;
+      }
+      void submitSecondsCommit(next);
+    }
+
+    function runToggle() {
+      if (sw.classList.contains("pending")) return;
+      const nextEnabled = !currentEnabled();
+      if (category === "update" && !nextEnabled) {
+        setVisual(nextEnabled, true);
+        confirmDisableUpdateBubbles().then((confirmed) => {
+          if (confirmed) runToggleCommit(nextEnabled);
+          else setVisual(currentEnabled(), false);
+        });
+        return;
+      }
+      runToggleCommit(nextEnabled);
+    }
+
+    function runToggleCommit(nextEnabled) {
+      setVisual(nextEnabled, true);
+      window.settingsAPI.command("setBubbleCategoryEnabled", { category, enabled: nextEnabled }).then((result) => {
+        if (!result || result.status !== "ok") {
+          setVisual(currentEnabled(), false);
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+        }
+      }).catch((err) => {
+        setVisual(currentEnabled(), false);
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      });
+    }
+
+    setVisual(currentEnabled(), false);
+    sw.addEventListener("click", runToggle);
+    sw.addEventListener("keydown", (ev) => {
+      if (ev.key === " " || ev.key === "Enter") {
+        ev.preventDefault();
+        runToggle();
+      }
+    });
+
+    if (secondsKey) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "bubble-policy-seconds";
+      input.inputMode = "numeric";
+      input.maxLength = 4;
+      input.pattern = "[0-9]*";
+      input.value = String(Number(state.snapshot && state.snapshot[secondsKey]) || 0);
+      const prefix = document.createElement("span");
+      prefix.className = "bubble-policy-prefix";
+      prefix.textContent = t("bubbleSecondsPrefix");
+      const suffix = document.createElement("span");
+      suffix.className = "bubble-policy-unit";
+      suffix.textContent = t("bubbleSecondsUnit");
+      controls.insertBefore(prefix, sw);
+      controls.insertBefore(input, sw);
+      controls.insertBefore(suffix, sw);
+      secondsInput = input;
+      input.disabled = !currentEnabled();
+      input.addEventListener("input", () => {
+        const sanitized = input.value.replace(/\D+/g, "").slice(0, 4);
+        if (input.value !== sanitized) input.value = sanitized;
+        const raw = input.value.trim();
+        const next = parseBubbleSecondsInputValue(raw);
+        if (next == null) {
+          clearSecondsCommitTimer();
+          secondsDraftValue = null;
+          return;
+        }
+        if (category === "update" && next === 0) return;
+        scheduleSecondsCommit(next);
+      });
+      input.addEventListener("blur", () => {
+        flushSecondsCommit();
+      });
+      input.addEventListener("change", () => {
+        flushSecondsCommit();
+      });
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Enter") return;
+        ev.preventDefault();
+        flushSecondsCommit();
+        input.blur();
+      });
+    }
+
+    state.mountedControls.bubblePolicyControls.set(stateKey, {
+      row: item,
+      syncFromSnapshot,
+    });
+
+    return item;
+  }
+
+  function confirmDisableUpdateBubbles() {
+    return showSettingsConfirmModal({
+      title: t("updateBubbleDisableConfirmTitle"),
+      detail: t("updateBubbleDisableConfirmDetail"),
+      confirmLabel: t("updateBubbleDisableConfirmAction"),
+      cancelLabel: t("updateBubbleDisableConfirmCancel"),
+    });
+  }
+
+  function showSettingsConfirmModal({ title, detail, confirmLabel, cancelLabel }) {
+    const rootNode = document.getElementById("modalRoot");
+    if (!rootNode) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let settled = false;
+      const overlay = document.createElement("div");
+      overlay.className = "modal-backdrop settings-confirm-backdrop";
+
+      const modal = document.createElement("div");
+      modal.className = "settings-confirm-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+
+      const icon = document.createElement("div");
+      icon.className = "settings-confirm-icon";
+      icon.textContent = "!";
+
+      const titleNode = document.createElement("h2");
+      titleNode.textContent = title;
+
+      const detailNode = document.createElement("p");
+      detailNode.textContent = detail;
+
+      const actions = document.createElement("div");
+      actions.className = "settings-confirm-actions";
+
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "soft-btn accent";
+      cancelBtn.textContent = cancelLabel;
+
+      const confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.className = "soft-btn";
+      confirmBtn.textContent = confirmLabel;
+
+      function close(confirmed) {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeyDown, true);
+        rootNode.innerHTML = "";
+        resolve(confirmed);
+      }
+
+      function onKeyDown(ev) {
+        if (ev.key === "Escape") close(false);
+      }
+
+      overlay.addEventListener("click", (ev) => {
+        if (ev.target === overlay) close(false);
+      });
+      cancelBtn.addEventListener("click", () => close(false));
+      confirmBtn.addEventListener("click", () => close(true));
+      document.addEventListener("keydown", onKeyDown, true);
+
+      actions.appendChild(confirmBtn);
+      actions.appendChild(cancelBtn);
+      modal.appendChild(icon);
+      modal.appendChild(titleNode);
+      modal.appendChild(detailNode);
+      modal.appendChild(actions);
+      overlay.appendChild(modal);
+      rootNode.innerHTML = "";
+      rootNode.appendChild(overlay);
+      cancelBtn.focus();
+    });
+  }
+
+  function commitSecondsValue(input, secondsKey, next, category) {
+    const previous = Number(state.snapshot && state.snapshot[secondsKey]) || 0;
+    const doCommit = () => {
+      return window.settingsAPI.update(secondsKey, next).then((result) => {
+        if (!result || result.status !== "ok") {
+          input.value = String(Number(state.snapshot && state.snapshot[secondsKey]) || 0);
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+          return false;
+        }
+        return true;
+      }).catch((err) => {
+        input.value = String(Number(state.snapshot && state.snapshot[secondsKey]) || 0);
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+        return false;
+      });
+    };
+    if (category === "update" && next === 0 && previous !== 0) {
+      return confirmDisableUpdateBubbles().then((confirmed) => {
+        if (confirmed) return doCommit();
+        input.value = String(previous);
+        return false;
+      });
+    }
+    return doCommit();
+  }
+
+  function parseBubbleSecondsInputValue(raw) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return null;
+    const next = Number(trimmed);
+    if (!Number.isInteger(next) || next < 0 || next > 3600) return null;
+    return next;
   }
 
   function buildVolumeSliderRow() {
@@ -405,6 +838,15 @@
   function patchInPlace(changes) {
     const keys = changes ? Object.keys(changes) : [];
     if (keys.length === 0) return false;
+    if (keys.includes("hideBubbles")) {
+      // Aggregate hiding also changes the policy summary and category controls.
+      const meta = state.mountedControls.generalSwitches.get("hideBubbles");
+      if (meta && document.body.contains(meta.element)) {
+        state.transientUiState.generalSwitches.delete("hideBubbles");
+        helpers.setSwitchVisual(meta.element, readers.readGeneralSwitchVisual("hideBubbles", meta.invert), { pending: false });
+      }
+      return false;
+    }
     if (!keys.every((key) => GENERAL_IN_PLACE_KEYS.has(key))) return false;
     if (keys.includes("size") && !ops.syncMountedSizeControl({ fromBroadcast: true })) return false;
     if (keys.includes("soundVolume") || keys.includes("soundMuted")) {
@@ -413,6 +855,11 @@
     }
     for (const key of keys) {
       if (key === "size" || key === "soundVolume") continue;
+      if (BUBBLE_POLICY_KEYS.has(key)) {
+        const meta = state.mountedControls.bubblePolicyControls.get(key);
+        if (!meta || !document.body.contains(meta.row)) return false;
+        continue;
+      }
       const meta = state.mountedControls.generalSwitches.get(key);
       if (!meta || !document.body.contains(meta.element)) return false;
     }
@@ -422,12 +869,21 @@
         state.mountedControls.soundVolume.syncValueFromSnapshot();
         continue;
       }
+      if (BUBBLE_POLICY_KEYS.has(key)) {
+        state.mountedControls.bubblePolicyControls.get(key).syncFromSnapshot();
+        continue;
+      }
       const meta = state.mountedControls.generalSwitches.get(key);
       state.transientUiState.generalSwitches.delete(key);
       helpers.setSwitchVisual(meta.element, readers.readGeneralSwitchVisual(key, meta.invert), { pending: false });
       if (key === "soundMuted") {
         state.mountedControls.soundVolume.syncDisabled();
       }
+    }
+    if (keys.some((key) => BUBBLE_POLICY_KEYS.has(key))) {
+      const summaryControl = state.mountedControls.bubblePolicySummary;
+      if (!summaryControl || !document.body.contains(summaryControl.element)) return false;
+      summaryControl.syncFromSnapshot();
     }
     return true;
   }

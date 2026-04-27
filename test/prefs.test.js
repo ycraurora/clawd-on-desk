@@ -30,6 +30,7 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a.agents, b.agents);
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
     assert.notStrictEqual(a.shortcuts, b.shortcuts);
+    assert.notStrictEqual(a.sessionAliases, b.sessionAliases);
     // Mutating one shouldn't affect the other
     a.agents["claude-code"].enabled = false;
     assert.strictEqual(b.agents["claude-code"].enabled, true);
@@ -44,10 +45,16 @@ describe("prefs.getDefaults", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.manageClaudeHooksAutomatically, true);
     assert.strictEqual(d.autoStartWithClaude, false);
+    assert.strictEqual(d.lowPowerIdleMode, false);
     assert.strictEqual(d.allowEdgePinning, false);
     assert.strictEqual(d.keepSizeAcrossDisplays, false);
+    assert.strictEqual(d.sessionHudEnabled, true);
     assert.strictEqual(d.savedPixelWidth, 0);
     assert.strictEqual(d.savedPixelHeight, 0);
+    assert.strictEqual(d.permissionBubblesEnabled, true);
+    assert.strictEqual(d.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(d.updateBubbleAutoCloseSeconds, 9);
+    assert.deepStrictEqual(d.sessionAliases, {});
   });
 
   it("seeds all known agents as enabled", () => {
@@ -75,9 +82,14 @@ describe("prefs.validate", () => {
       lang: "klingon",       // not in enum
       soundMuted: "yes",     // wrong type
       soundVolume: 2,        // out of range → default 1
+      lowPowerIdleMode: "yes",
       x: NaN,                // not finite
       bubbleFollowPet: true, // ok
+      sessionHudEnabled: "yes",
       hideBubbles: 0,        // wrong type
+      permissionBubblesEnabled: "yes",
+      notificationBubbleAutoCloseSeconds: -1,
+      updateBubbleAutoCloseSeconds: 3601,
       allowEdgePinning: "yes",
       savedPixelWidth: -1,
       savedPixelHeight: "286",
@@ -86,12 +98,45 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.lang, d.lang);
     assert.strictEqual(v.soundMuted, false);
     assert.strictEqual(v.soundVolume, 1);
+    assert.strictEqual(v.lowPowerIdleMode, false);
     assert.strictEqual(v.x, 0);
     assert.strictEqual(v.bubbleFollowPet, true);
+    assert.strictEqual(v.sessionHudEnabled, true);
     assert.strictEqual(v.hideBubbles, false);
+    assert.strictEqual(v.permissionBubblesEnabled, true);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(v.updateBubbleAutoCloseSeconds, 9);
     assert.strictEqual(v.allowEdgePinning, false);
     assert.strictEqual(v.savedPixelWidth, 0);
     assert.strictEqual(v.savedPixelHeight, 0);
+  });
+
+  it("backfills split bubble prefs from legacy hideBubbles=true", () => {
+    const v = prefs.validate(prefs.migrate({ hideBubbles: true }));
+    assert.strictEqual(v.hideBubbles, true);
+    assert.strictEqual(v.permissionBubblesEnabled, false);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 0);
+    assert.strictEqual(v.updateBubbleAutoCloseSeconds, 0);
+  });
+
+  it("backfills split bubble prefs from legacy hideBubbles=false", () => {
+    const v = prefs.validate(prefs.migrate({ hideBubbles: false }));
+    assert.strictEqual(v.hideBubbles, false);
+    assert.strictEqual(v.permissionBubblesEnabled, true);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(v.updateBubbleAutoCloseSeconds, 9);
+  });
+
+  it("preserves explicit split bubble prefs during legacy backfill", () => {
+    const v = prefs.validate(prefs.migrate({
+      hideBubbles: true,
+      permissionBubblesEnabled: true,
+      notificationBubbleAutoCloseSeconds: 12,
+      updateBubbleAutoCloseSeconds: 8,
+    }));
+    assert.strictEqual(v.permissionBubblesEnabled, true);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 12);
+    assert.strictEqual(v.updateBubbleAutoCloseSeconds, 8);
   });
 
   it("keeps valid fields verbatim", () => {
@@ -99,7 +144,9 @@ describe("prefs.validate", () => {
       lang: "ko",
       soundMuted: true,
       soundVolume: 0.4,
+      lowPowerIdleMode: true,
       bubbleFollowPet: true,
+      sessionHudEnabled: false,
       allowEdgePinning: true,
       keepSizeAcrossDisplays: true,
       savedPixelWidth: 286,
@@ -113,7 +160,9 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.lang, "ko");
     assert.strictEqual(v.soundMuted, true);
     assert.strictEqual(v.soundVolume, 0.4);
+    assert.strictEqual(v.lowPowerIdleMode, true);
     assert.strictEqual(v.bubbleFollowPet, true);
+    assert.strictEqual(v.sessionHudEnabled, false);
     assert.strictEqual(v.allowEdgePinning, true);
     assert.strictEqual(v.keepSizeAcrossDisplays, true);
     assert.strictEqual(v.savedPixelWidth, 286);
@@ -177,6 +226,39 @@ describe("prefs.validate", () => {
     // Bad flag falls back to the default for that agent (true), not dropped
     // altogether — the entry has a valid flag so it survives.
     assert.strictEqual(v.agents["claude-code"].permissionsEnabled, true);
+  });
+
+  it("normalizes agents: preserves notificationHookEnabled flag", () => {
+    const v = prefs.validate({
+      agents: {
+        "claude-code": { enabled: true, notificationHookEnabled: false },
+      },
+    });
+    assert.strictEqual(v.agents["claude-code"].enabled, true);
+    assert.strictEqual(v.agents["claude-code"].notificationHookEnabled, false);
+  });
+
+  it("normalizes agents: fills missing notificationHookEnabled from defaults", () => {
+    // Pre-flag prefs files don't carry notificationHookEnabled. The default
+    // must be true so an upgrade doesn't silently suppress idle notifications
+    // on users who never opted in.
+    const v = prefs.validate({
+      agents: {
+        "claude-code": { enabled: true, permissionsEnabled: false },
+      },
+    });
+    assert.strictEqual(v.agents["claude-code"].notificationHookEnabled, true);
+  });
+
+  it("seeds all known agents with notificationHookEnabled=true", () => {
+    const d = prefs.getDefaults();
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "opencode"]) {
+      assert.strictEqual(
+        d.agents[id].notificationHookEnabled,
+        true,
+        `${id} should default notificationHookEnabled`
+      );
+    }
   });
 
   it("returns defaults for null/non-object input", () => {
@@ -244,6 +326,38 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(v.themeVariant, {});
     const w = prefs.validate({ themeVariant: [1, 2] });
     assert.deepStrictEqual(w.themeVariant, {});
+  });
+
+  it("sessionAliases normalizes valid entries and drops malformed values", () => {
+    const v = prefs.validate({
+      sessionAliases: {
+        "local|codex|s1": { title: "  Codex main  ", updatedAt: 100 },
+        "local|codex|missing-time": { title: "Missing time" },
+        "local|codex|empty": { title: "   ", updatedAt: 100 },
+        "local|codex|bad": { title: 42, updatedAt: 100 },
+      },
+    });
+    assert.strictEqual(v.sessionAliases["local|codex|s1"].title, "Codex main");
+    assert.strictEqual(v.sessionAliases["local|codex|s1"].updatedAt, 100);
+    assert.strictEqual(v.sessionAliases["local|codex|missing-time"].title, "Missing time");
+    assert.strictEqual(typeof v.sessionAliases["local|codex|missing-time"].updatedAt, "number");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v.sessionAliases, "local|codex|empty"), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v.sessionAliases, "local|codex|bad"), false);
+  });
+
+  it("sessionAliases falls back to defaults when not an object", () => {
+    assert.deepStrictEqual(prefs.validate({ sessionAliases: "nope" }).sessionAliases, {});
+    assert.deepStrictEqual(prefs.validate({ sessionAliases: [1, 2] }).sessionAliases, {});
+  });
+
+  it("drops legacy workspaceAliases because they are no longer in the schema", () => {
+    const v = prefs.validate({
+      workspaceAliases: {
+        "local|d:/animation": "Clawd main repo",
+      },
+    });
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v, "workspaceAliases"), false);
+    assert.deepStrictEqual(v.sessionAliases, {});
   });
 
   it("shortcuts defaults to the built-in shortcut map", () => {
