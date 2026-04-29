@@ -48,7 +48,13 @@
 // prefs without writing them right back. Object-form entries must therefore
 // keep validate side-effect-free.
 
-const { CURRENT_VERSION, AGENT_FLAGS, normalizeThemeOverrides } = require("./prefs");
+const {
+  CURRENT_VERSION,
+  AGENT_FLAGS,
+  CODEX_PERMISSION_MODES,
+  normalizeThemeOverrides,
+} = require("./prefs");
+const { getCodexPermissionMode, isAgentEnabled } = require("./agent-gate");
 const { isValidDisplaySnapshot } = require("./work-area");
 const {
   MAX_AUTO_CLOSE_SECONDS,
@@ -72,6 +78,17 @@ const {
 
 const ANIMATION_OVERRIDES_EXPORT_VERSION = 1;
 const { isPlainObject } = require("./theme-loader");
+
+const AUTO_REPAIRABLE_AGENT_IDS = new Set([
+  "claude-code",
+  "codex",
+  "cursor-agent",
+  "gemini-cli",
+  "codebuddy",
+  "kiro-cli",
+  "kimi-cli",
+  "opencode",
+]);
 
 // ── Validator helpers ──
 
@@ -287,7 +304,7 @@ const updateRegistry = {
   savedPixelHeight: requireNonNegativeFiniteNumber("savedPixelHeight"),
 
   // ── Pure data prefs (function-form: validator only) ──
-  lang: requireEnum("lang", ["en", "zh", "ko"]),
+  lang: requireEnum("lang", ["en", "zh", "ko", "ja"]),
   soundMuted: requireBoolean("soundMuted"),
   soundVolume: requireNumberInRange("soundVolume", 0, 1),
   lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
@@ -355,6 +372,9 @@ const updateRegistry = {
       }
       try {
         if (value) {
+          if (!isAgentEnabled(deps.snapshot, "claude-code")) {
+            return { status: "ok" };
+          }
           deps.syncClaudeHooksNow();
           deps.startClaudeSettingsWatcher();
         } else {
@@ -844,10 +864,14 @@ function setAgentFlag(payload, deps) {
   try {
     if (flag === "enabled") {
       if (!value) {
+        if (agentId === "claude-code" && typeof deps.stopIntegrationForAgent === "function") {
+          deps.stopIntegrationForAgent(agentId);
+        }
         if (typeof deps.stopMonitorForAgent === "function") deps.stopMonitorForAgent(agentId);
         if (typeof deps.clearSessionsByAgent === "function") deps.clearSessionsByAgent(agentId);
         if (typeof deps.dismissPermissionsByAgent === "function") deps.dismissPermissionsByAgent(agentId);
       } else {
+        if (typeof deps.syncIntegrationForAgent === "function") deps.syncIntegrationForAgent(agentId);
         if (typeof deps.startMonitorForAgent === "function") deps.startMonitorForAgent(agentId);
       }
     } else if (flag === "permissionsEnabled") {
@@ -864,6 +888,47 @@ function setAgentFlag(payload, deps) {
 
   const nextEntry = { ...(currentEntry || {}), [flag]: value };
   const nextAgents = { ...currentAgents, [agentId]: nextEntry };
+  return { status: "ok", commit: { agents: nextAgents } };
+}
+
+const _validateAgentPermissionModeId = requireString("setAgentPermissionMode.agentId");
+function setAgentPermissionMode(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "setAgentPermissionMode: payload must be an object" };
+  }
+  const idCheck = _validateAgentPermissionModeId(payload.agentId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (payload.agentId !== "codex") {
+    return { status: "error", message: "setAgentPermissionMode only supports codex" };
+  }
+  if (!CODEX_PERMISSION_MODES.includes(payload.mode)) {
+    return {
+      status: "error",
+      message: `setAgentPermissionMode.mode must be one of: ${CODEX_PERMISSION_MODES.join(", ")}`,
+    };
+  }
+
+  const snapshot = deps && deps.snapshot;
+  const currentAgents = (snapshot && snapshot.agents) || {};
+  const currentEntry = currentAgents.codex || {};
+  const currentMode = getCodexPermissionMode({ agents: currentAgents });
+  if (currentMode === payload.mode) return { status: "ok", noop: true };
+
+  try {
+    if (payload.mode !== "intercept" && typeof deps.dismissPermissionsByAgent === "function") {
+      deps.dismissPermissionsByAgent("codex");
+    }
+  } catch (err) {
+    return {
+      status: "error",
+      message: `setAgentPermissionMode side effect threw: ${err && err.message}`,
+    };
+  }
+
+  const nextAgents = {
+    ...currentAgents,
+    codex: { ...currentEntry, permissionMode: payload.mode },
+  };
   return { status: "ok", commit: { agents: nextAgents } };
 }
 
@@ -1588,6 +1653,156 @@ function uninstallHooks(_payload, deps) {
   }
 }
 
+async function repairAgentIntegration(payload, deps) {
+  const agentId = typeof payload === "string" ? payload : payload && payload.agentId;
+  const idCheck = _validateAgentFlagId(agentId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (
+    payload
+    && typeof payload === "object"
+    && Object.prototype.hasOwnProperty.call(payload, "forceCodexHooksFeature")
+    && typeof payload.forceCodexHooksFeature !== "boolean"
+  ) {
+    return { status: "error", message: "repairAgentIntegration.forceCodexHooksFeature must be a boolean" };
+  }
+  const forceCodexHooksFeature =
+    !!(payload && typeof payload === "object" && payload.forceCodexHooksFeature === true);
+
+  if (!AUTO_REPAIRABLE_AGENT_IDS.has(agentId)) {
+    return {
+      status: "error",
+      message: agentId === "copilot-cli"
+        ? "Copilot CLI uses manual project-level hooks and cannot be auto-repaired"
+        : `No automatic integration repair is available for ${agentId}`,
+    };
+  }
+
+  const snapshot = deps && deps.snapshot;
+  if (!isAgentEnabled(snapshot, agentId)) {
+    return {
+      status: "error",
+      message: `${agentId} is disabled in Settings; enable it before repairing the integration`,
+    };
+  }
+
+  if (agentId === "claude-code" && snapshot && snapshot.manageClaudeHooksAutomatically === false) {
+    return {
+      status: "error",
+      message: "Claude hook management is disabled in Settings",
+    };
+  }
+
+  const repairFn =
+    deps && typeof deps.repairIntegrationForAgent === "function"
+      ? deps.repairIntegrationForAgent
+      : deps && typeof deps.syncIntegrationForAgent === "function"
+        ? deps.syncIntegrationForAgent
+        : null;
+  if (!repairFn) {
+    return {
+      status: "error",
+      message: "repairAgentIntegration requires repairIntegrationForAgent or syncIntegrationForAgent dep",
+    };
+  }
+
+  try {
+    const result = await repairFn(agentId, {
+      forceCodexHooksFeature: agentId === "codex" && forceCodexHooksFeature,
+    });
+    if (result === false) {
+      return { status: "error", message: `No automatic integration repair is available for ${agentId}` };
+    }
+    if (result && typeof result === "object" && result.status && result.status !== "ok") {
+      return {
+        status: "error",
+        message: result.message || `Failed to repair ${agentId}`,
+      };
+    }
+    return {
+      status: "ok",
+      message: result && typeof result === "object" && result.message
+        ? result.message
+        : `Repaired ${agentId}`,
+    };
+  } catch (err) {
+    return {
+      status: "error",
+      message: `repairAgentIntegration: ${err && err.message}`,
+    };
+  }
+}
+
+async function repairLocalServer(_payload, deps) {
+  if (!deps || typeof deps.repairLocalServer !== "function") {
+    return {
+      status: "error",
+      message: "repairLocalServer requires repairLocalServer dep",
+    };
+  }
+  try {
+    const result = await deps.repairLocalServer();
+    if (result === false) {
+      return { status: "error", message: "Local server repair failed" };
+    }
+    if (result && typeof result === "object" && result.status && result.status !== "ok") {
+      return {
+        status: "error",
+        message: result.message || "Local server repair failed",
+      };
+    }
+    return { status: "ok" };
+  } catch (err) {
+    return {
+      status: "error",
+      message: `repairLocalServer: ${err && err.message}`,
+    };
+  }
+}
+
+async function repairDoctorIssue(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "repairDoctorIssue payload must be an object" };
+  }
+  const { type } = payload;
+  if (type === "agent-integration") {
+    return repairAgentIntegration(payload, deps);
+  }
+  if (type === "permission-bubble-policy") {
+    return setBubbleCategoryEnabled({ category: "permission", enabled: true }, deps);
+  }
+  if (type === "theme-health") {
+    return {
+      status: "error",
+      message: "Theme health issues must be fixed manually in Settings -> Theme",
+    };
+  }
+  if (type === "local-server") {
+    return repairLocalServer(payload, deps);
+  }
+  if (type === "restart-clawd") {
+    return restartClawd(payload, deps);
+  }
+  return {
+    status: "error",
+    message: `Unknown Doctor repair target: ${type || "missing"}`,
+  };
+}
+
+function restartClawd(payload, deps) {
+  if (!payload || payload.confirmed !== true) {
+    return { status: "error", message: "restartClawd requires confirmation" };
+  }
+  if (!deps || typeof deps.restartClawd !== "function") {
+    return { status: "error", message: "restartClawd requires deps.restartClawd" };
+  }
+  try {
+    deps.restartClawd();
+    return { status: "ok", message: "Clawd is restarting" };
+  } catch (err) {
+    return { status: "error", message: `restartClawd: ${err && err.message}` };
+  }
+}
+
 function resizePet(payload, deps) {
   // Settings panel slider entry point. Routes to menu.resizeWindow via
   // deps.resizePet so it picks up the full side-effect chain (actual window
@@ -1612,11 +1827,15 @@ const commandRegistry = {
   removeTheme,
   installHooks,
   uninstallHooks,
+  repairAgentIntegration,
+  repairLocalServer,
+  repairDoctorIssue,
   resizePet,
   registerShortcut,
   resetShortcut,
   resetAllShortcuts,
   setAgentFlag,
+  setAgentPermissionMode,
   setAllBubblesHidden,
   setBubbleCategoryEnabled,
   setSessionAlias,

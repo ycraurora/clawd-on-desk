@@ -59,20 +59,25 @@ describe("prefs.getDefaults", () => {
 
   it("seeds all known agents as enabled", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "opencode"]) {
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode"]) {
       assert.strictEqual(d.agents[id].enabled, true, `${id} should default enabled`);
     }
   });
 
   it("seeds all known agents with permissionsEnabled=true", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "opencode"]) {
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode"]) {
       assert.strictEqual(
         d.agents[id].permissionsEnabled,
         true,
         `${id} should default permissionsEnabled`
       );
     }
+  });
+
+  it("defaults Codex permissions to intercept mode", () => {
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.agents.codex.permissionMode, "intercept");
   });
 });
 
@@ -236,6 +241,25 @@ describe("prefs.validate", () => {
     });
     assert.strictEqual(v.agents["claude-code"].enabled, true);
     assert.strictEqual(v.agents["claude-code"].notificationHookEnabled, false);
+  });
+
+  it("normalizes agents: preserves valid Codex permissionMode", () => {
+    const v = prefs.validate({
+      agents: {
+        codex: { enabled: true, permissionMode: "intercept" },
+      },
+    });
+    assert.strictEqual(v.agents.codex.enabled, true);
+    assert.strictEqual(v.agents.codex.permissionMode, "intercept");
+  });
+
+  it("normalizes agents: drops invalid Codex permissionMode to intercept", () => {
+    const v = prefs.validate({
+      agents: {
+        codex: { enabled: true, permissionMode: "auto" },
+      },
+    });
+    assert.strictEqual(v.agents.codex.permissionMode, "intercept");
   });
 
   it("normalizes agents: fills missing notificationHookEnabled from defaults", () => {

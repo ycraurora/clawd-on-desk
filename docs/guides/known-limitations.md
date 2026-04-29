@@ -5,7 +5,7 @@
 | Limitation | Details |
 |---|---|
 | **Codex CLI: no terminal focus** | Codex official hooks and JSONL fallback do not carry a usable terminal PID. Clicking Clawd still won't jump to the Codex terminal. Claude Code and Copilot CLI work fine. |
-| **Codex CLI: partial hook coverage** | Official hooks cover live state and `PermissionRequest` bubbles, but not every runtime signal. Clawd keeps JSONL polling active for hook-disabled sessions and fallback-only events such as web search, compaction, and aborted turns, so those events can still have polling latency. |
+| **Codex CLI: partial hook coverage** | Official hooks cover live state and `PermissionRequest` observation/intercept mode, but not every runtime signal. Clawd keeps JSONL polling active for hook-disabled sessions and fallback-only events such as web search, compaction, and aborted turns, so those events can still have polling latency. |
 | **VS Code Codex in devcontainers: helper install is manual** | The local bridge extension auto-installs, but the remote workspace helper still needs to be installed into the container's VS Code Server manually. |
 | **VS Code Codex in devcontainers: focus not wired yet** | Remote VS Code Codex sessions can drive pet state once the helper is installed, but clicking the session menu does not yet jump to the exact remote Codex surface. |
 | **Copilot CLI: manual hook setup** | Copilot is the one supported agent that still requires manually creating `~/.copilot/hooks/hooks.json`. |

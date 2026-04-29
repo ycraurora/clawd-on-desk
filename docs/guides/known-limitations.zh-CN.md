@@ -5,7 +5,7 @@
 | 限制 | 说明 |
 |------|------|
 | **Codex CLI：无法跳转终端** | Codex official hooks 和 JSONL fallback 都不携带可用终端 PID，点击桌宠仍无法跳转到 Codex 终端。Claude Code 和 Copilot CLI 正常。 |
-| **Codex CLI：hook 覆盖仍不完整** | Official hooks 已覆盖实时状态和 `PermissionRequest` 权限气泡，但不是所有运行时信号都有 hook。Clawd 会保留 JSONL 轮询，用于 hook 被禁用的会话，以及 web search、context compaction、turn aborted 等 fallback-only 事件；这些事件仍可能有轮询延迟。 |
+| **Codex CLI：hook 覆盖仍不完整** | Official hooks 已覆盖实时状态和 `PermissionRequest` 观察 / intercept 模式，但不是所有运行时信号都有 hook。Clawd 会保留 JSONL 轮询，用于 hook 被禁用的会话，以及 web search、context compaction、turn aborted 等 fallback-only 事件；这些事件仍可能有轮询延迟。 |
 | **Docker / devcontainer 里的 VS Code Codex：helper 仍需手动安装** | 本地 bridge 扩展会自动安装，但 remote/workspace 侧的 helper 目前还需要手动装进容器内的 VS Code Server。 |
 | **Docker / devcontainer 里的 VS Code Codex：暂不支持精确聚焦** | 装好 helper 后，远程 VS Code Codex 会话可以驱动桌宠状态，但点击会话菜单还不能精确跳转到对应的远程 Codex 界面。 |
 | **Copilot CLI：需手动配置 hooks** | Copilot 是目前唯一仍需手动创建 `~/.copilot/hooks/hooks.json` 的受支持 Agent。 |

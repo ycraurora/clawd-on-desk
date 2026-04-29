@@ -97,7 +97,7 @@ Official hook 实现在 [`hooks/codex-hook.js`](../../hooks/codex-hook.js)，fal
 运行时：
 
 - official hooks 处理 SessionStart、UserPromptSubmit、PreToolUse、PermissionRequest、PostToolUse 和 Stop
-- PermissionRequest 可以弹出真正的 Clawd Allow/Deny 气泡；DND、agent disabled、bubble disabled、服务不可用时会返回 no-decision，让 Codex 回到原生审批流程
+- PermissionRequest 默认使用 intercept 模式：Clawd 会弹出真正的 Allow/Deny 气泡。用户可以把 Codex permission mode 切到 native，让 Codex AutoReview / 原生审批继续接管。
 - JSONL 轮询仍保留，用于 hook 被禁用的会话，以及 WebSearch、context compaction、turn aborted 等 official hooks 未覆盖事件
 
 Fallback 监控会把 `~` 展开成当前进程自己的 `os.homedir()`。也就是说：

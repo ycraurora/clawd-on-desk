@@ -72,7 +72,7 @@ const SCHEMA = {
   preMiniX: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   preMiniY: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   // Pure data prefs
-  lang: { type: "string", default: "en", enum: ["en", "zh", "ko"] },
+  lang: { type: "string", default: "en", enum: ["en", "zh", "ko", "ja"] },
   showTray: { type: "boolean", default: true },
   showDock: { type: "boolean", default: true },
   manageClaudeHooksAutomatically: { type: "boolean", default: true },
@@ -122,12 +122,13 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => ({
       "claude-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept" },
       "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
@@ -243,6 +244,7 @@ function migrate(raw) {
 }
 
 const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled"];
+const CODEX_PERMISSION_MODES = ["native", "intercept"];
 
 function normalizePositionDisplay(value) {
   if (!isValidDisplaySnapshot(value)) return null;
@@ -278,6 +280,10 @@ function normalizeAgents(value, defaultsValue) {
         merged[flag] = entry[flag];
         touched = true;
       }
+    }
+    if (id === "codex" && CODEX_PERMISSION_MODES.includes(entry.permissionMode)) {
+      merged.permissionMode = entry.permissionMode;
+      touched = true;
     }
     if (touched) out[id] = merged;
   }
@@ -541,6 +547,7 @@ module.exports = {
   SCHEMA,
   SCHEMA_KEYS,
   AGENT_FLAGS,
+  CODEX_PERMISSION_MODES,
   getDefaults,
   validate,
   migrate,
