@@ -86,7 +86,7 @@ const VARIANT_ALLOWED_KEYS = new Set([
   // Runtime fields (see §6.1 allow-list table)
   "workingTiers", "jugglingTiers", "idleAnimations",
   "wideHitboxFiles", "sleepingHitboxFiles",
-  "hitBoxes", "timings", "transitions",
+  "hitBoxes", "fileHitBoxes", "timings", "transitions",
   "objectScale", "displayHintMap",
 ]);
 // Fields that replace wholesale instead of deep-merge.
@@ -253,7 +253,7 @@ function loadTheme(themeId, opts = {}) {
 
   // For external themes: sanitize SVGs + resolve asset paths
   if (!isBuiltin) {
-    const assetsDir = _resolveExternalAssetsDir(themeId, themeDir);
+    const assetsDir = _resolveExternalAssetsDir(themeId, themeDir, { strict });
     theme._assetsDir = assetsDir;
     theme._assetsFileUrl = pathToFileURL(assetsDir).href;
   } else {
@@ -294,29 +294,34 @@ function _resolveSoundOverrideFiles(themeId, userOverrides) {
  */
 function _readThemeJson(themeId) {
   // Built-in first
-  const builtinPath = path.join(builtinThemesDir, themeId, "theme.json");
-  if (fs.existsSync(builtinPath)) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(builtinPath, "utf8"));
-      return { raw, isBuiltin: true, themeDir: path.join(builtinThemesDir, themeId) };
-    } catch (e) {
-      console.error(`[theme-loader] Failed to parse built-in theme "${themeId}":`, e.message);
+  if (builtinThemesDir) {
+    const builtinPath = path.resolve(builtinThemesDir, themeId, "theme.json");
+    if (!_isPathInsideDir(builtinThemesDir, builtinPath)) {
+      console.error(`[theme-loader] Path traversal detected for built-in theme "${themeId}"`);
+      return { raw: null, isBuiltin: false, themeDir: null };
+    }
+    if (fs.existsSync(builtinPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(builtinPath, "utf8"));
+        return { raw, isBuiltin: true, themeDir: path.dirname(builtinPath) };
+      } catch (e) {
+        console.error(`[theme-loader] Failed to parse built-in theme "${themeId}":`, e.message);
+      }
     }
   }
 
   // User themes
   if (userThemesDir) {
-    const userPath = path.join(userThemesDir, themeId, "theme.json");
+    const userPath = path.resolve(userThemesDir, themeId, "theme.json");
     if (fs.existsSync(userPath)) {
       // Path traversal check: resolved path must be within userThemesDir
-      const resolved = path.resolve(userPath);
-      if (!resolved.startsWith(path.resolve(userThemesDir) + path.sep)) {
+      if (!_isPathInsideDir(userThemesDir, userPath)) {
         console.error(`[theme-loader] Path traversal detected for theme "${themeId}"`);
         return { raw: null, isBuiltin: false, themeDir: null };
       }
       try {
         const raw = JSON.parse(fs.readFileSync(userPath, "utf8"));
-        return { raw, isBuiltin: false, themeDir: path.join(userThemesDir, themeId) };
+        return { raw, isBuiltin: false, themeDir: path.dirname(userPath) };
       } catch (e) {
         console.error(`[theme-loader] Failed to parse user theme "${themeId}":`, e.message);
       }
@@ -330,7 +335,8 @@ function _readThemeJson(themeId) {
  * Resolve external theme assets: sanitize SVGs → cache dir, return cache path.
  * Non-SVG files (GIF/APNG/WebP) are used directly from theme dir (no sanitization needed).
  */
-function _resolveExternalAssetsDir(themeId, themeDir) {
+function _resolveExternalAssetsDir(themeId, themeDir, opts = {}) {
+  const strict = !!(opts && opts.strict);
   const sourceAssetsDir = path.join(themeDir, "assets");
   if (!themeCacheDir) return sourceAssetsDir;
 
@@ -338,16 +344,22 @@ function _resolveExternalAssetsDir(themeId, themeDir) {
   const cacheMetaPath = path.join(themeCacheDir, themeId, ".cache-meta.json");
 
   // Load existing cache meta
-  let cacheMeta = {};
+  let cacheMeta = _emptyCacheMeta();
+  let metaChanged = false;
+  let forceSvgRefresh = false;
   try {
-    cacheMeta = JSON.parse(fs.readFileSync(cacheMetaPath, "utf8"));
+    const rawMeta = JSON.parse(fs.readFileSync(cacheMetaPath, "utf8"));
+    const normalized = _normalizeCacheMeta(rawMeta);
+    cacheMeta = normalized.meta;
+    metaChanged = normalized.changed;
+    forceSvgRefresh = normalized.invalidateSvgs;
   } catch { /* no cache yet */ }
 
   // Ensure cache directory exists
   fs.mkdirSync(cacheDir, { recursive: true });
 
   // Scan source assets and sanitize SVGs
-  let metaChanged = false;
+  const rasterRefs = new Map();
   try {
     const files = fs.readdirSync(sourceAssetsDir);
     for (const file of files) {
@@ -367,28 +379,43 @@ function _resolveExternalAssetsDir(themeId, themeDir) {
 
       if (file.endsWith(".svg")) {
         // Check cache freshness
-        const cached = cacheMeta[file];
-        if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
-          // Cache is fresh
-          continue;
+        const cachedSvgPath = path.join(cacheDir, file);
+        const cached = cacheMeta.svgs[file];
+        let sanitized = null;
+        if (!forceSvgRefresh && cached && cached.mtime === stat.mtimeMs && cached.size === stat.size && fs.existsSync(cachedSvgPath)) {
+          try {
+            sanitized = fs.readFileSync(cachedSvgPath, "utf8");
+          } catch {
+            sanitized = null;
+          }
         }
 
-        // Sanitize and cache
+        // Sanitize and cache when stale/missing
         try {
-          const svgContent = fs.readFileSync(srcFile, "utf8");
-          const sanitized = sanitizeSvg(svgContent);
-          fs.writeFileSync(path.join(cacheDir, file), sanitized, "utf8");
-          cacheMeta[file] = { mtime: stat.mtimeMs, size: stat.size };
-          metaChanged = true;
+          if (sanitized == null) {
+            const svgContent = fs.readFileSync(srcFile, "utf8");
+            sanitized = sanitizeSvg(svgContent);
+            fs.writeFileSync(cachedSvgPath, sanitized, "utf8");
+            cacheMeta.svgs[file] = { mtime: stat.mtimeMs, size: stat.size };
+            metaChanged = true;
+          }
+          for (const ref of _collectSafeRasterRefs(sanitized, sourceAssetsDir).values()) {
+            rasterRefs.set(ref.destRel, ref);
+          }
         } catch (e) {
           console.error(`[theme-loader] Failed to sanitize ${file}:`, e.message);
         }
       }
-      // Non-SVG files are NOT copied — we serve them directly from source
+      // Unreferenced non-SVG files are still served directly from source.
+      // Safe raster dependencies referenced by sanitized SVGs are copied below
+      // so cached SVG documents can resolve them relatively.
     }
   } catch (e) {
     console.error(`[theme-loader] Failed to scan assets for theme "${themeId}":`, e.message);
   }
+
+  const rasterCopyResult = _syncRasterCache(themeId, cacheDir, cacheMeta, rasterRefs);
+  if (rasterCopyResult.changed) metaChanged = true;
 
   if (metaChanged) {
     try {
@@ -396,11 +423,223 @@ function _resolveExternalAssetsDir(themeId, themeDir) {
     } catch {}
   }
 
+  if (strict && rasterCopyResult.missing.length > 0) {
+    throw new Error(
+      `Theme "${themeId}" missing raster dependencies: ${rasterCopyResult.missing.join(", ")}`
+    );
+  }
+
   return cacheDir; // SVGs from cache, non-SVGs resolved at getAssetPath() time
 }
 
 function _externalAssetsSourceDir(themeDir) {
   return path.join(themeDir, "assets");
+}
+
+function _emptyCacheMeta() {
+  return { version: 2, svgs: {}, rasters: {} };
+}
+
+function _normalizeCacheMeta(value) {
+  if (value && value.version === 2) {
+    return {
+      meta: {
+        version: 2,
+        svgs: _isPlainObject(value.svgs) ? value.svgs : {},
+        rasters: _isPlainObject(value.rasters) ? value.rasters : {},
+      },
+      changed: false,
+      invalidateSvgs: false,
+    };
+  }
+  if (_isPlainObject(value)) {
+    const svgs = {};
+    for (const [file, entry] of Object.entries(value)) {
+      if (file === "version" || file === "svgs" || file === "rasters") continue;
+      if (!_isPlainObject(entry)) continue;
+      svgs[file] = entry;
+    }
+    return { meta: { version: 2, svgs, rasters: {} }, changed: true, invalidateSvgs: true };
+  }
+  return { meta: _emptyCacheMeta(), changed: true, invalidateSvgs: true };
+}
+
+function _stripUrlSuffix(value) {
+  if (typeof value !== "string") return "";
+  const hashIndex = value.indexOf("#");
+  const queryIndex = value.indexOf("?");
+  const cut = [hashIndex, queryIndex].filter((i) => i >= 0).sort((a, b) => a - b)[0];
+  return cut == null ? value : value.slice(0, cut);
+}
+
+function _normalizeRasterReference(rawValue, sourceAssetsDir) {
+  const target = _unwrapCssUrlTarget(rawValue);
+  if (!target || target.startsWith("#")) return null;
+  const decoded = _decodeResourceTarget(target);
+  if (!decoded || decoded.startsWith("#")) return null;
+  if (_hasUnsafeResourcePattern(target) || _hasUnsafeResourcePattern(decoded)) return null;
+
+  const withoutSuffix = _stripUrlSuffix(decoded).replace(/\\/g, "/");
+  if (!withoutSuffix || withoutSuffix.startsWith("#")) return null;
+  const normalized = path.posix.normalize(withoutSuffix);
+  if (!normalized || normalized === "." || normalized.startsWith("../") || normalized === ".." || path.posix.isAbsolute(normalized)) {
+    return null;
+  }
+
+  const ext = path.posix.extname(normalized).toLowerCase();
+  if (ext !== ".webp" && ext !== ".png") return null;
+
+  const sourceAbs = path.resolve(sourceAssetsDir, ...normalized.split("/"));
+  if (!_isPathInsideDir(sourceAssetsDir, sourceAbs)) return null;
+  const destRel = normalized;
+  const sourceKey = process.platform === "win32" ? sourceAbs.toLowerCase() : sourceAbs;
+  return { destRel, sourceRel: normalized, sourceAbs, sourceKey };
+}
+
+function _collectCssUrlRefs(value, out, sourceAssetsDir) {
+  if (typeof value !== "string" || !value) return;
+  for (const match of value.matchAll(/url\s*\(\s*([^)]*?)\s*\)/gi)) {
+    const ref = _normalizeRasterReference(match[1], sourceAssetsDir);
+    if (ref) out.set(ref.destRel, ref);
+  }
+}
+
+function _collectSafeRasterRefs(svgContent, sourceAssetsDir) {
+  const out = new Map();
+  let doc;
+  try {
+    const { parseDocument } = require("htmlparser2");
+    doc = parseDocument(svgContent, { xmlMode: true });
+  } catch {
+    return out;
+  }
+
+  function visit(node) {
+    if (!node) return;
+    if (node.attribs) {
+      for (const [rawKey, value] of Object.entries(node.attribs)) {
+        const key = rawKey.toLowerCase();
+        if (key === "href" || key === "xlink:href") {
+          const ref = _normalizeRasterReference(value, sourceAssetsDir);
+          if (ref) out.set(ref.destRel, ref);
+        }
+        if (key === "style" || SVG_URL_ATTRS.has(key)) {
+          _collectCssUrlRefs(value, out, sourceAssetsDir);
+        }
+      }
+    }
+    if ((node.type === "style" || (node.type === "tag" && (node.name || "").toLowerCase() === "style")) && node.children) {
+      for (const child of node.children) {
+        if (child.type === "text") _collectCssUrlRefs(child.data, out, sourceAssetsDir);
+      }
+    }
+    if (node.children) {
+      for (const child of node.children) visit(child);
+    }
+  }
+
+  visit(doc);
+  return out;
+}
+
+function _removeCachedRaster(cacheDir, relPath) {
+  try {
+    fs.rmSync(path.join(cacheDir, ...relPath.split("/")), { force: true });
+  } catch {}
+}
+
+function _copyRasterToCache(sourceAbs, destAbs, stat) {
+  fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+  const tmp = `${destAbs}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.copyFileSync(sourceAbs, tmp);
+    const tmpStat = fs.statSync(tmp);
+    if (!tmpStat.isFile() || tmpStat.size !== stat.size) {
+      throw new Error("copied raster size mismatch");
+    }
+    fs.renameSync(tmp, destAbs);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+
+function _syncRasterCache(themeId, cacheDir, cacheMeta, rasterRefs) {
+  let changed = false;
+  const missing = [];
+  const referenced = new Set(rasterRefs.keys());
+  const sourceStats = new Map();
+
+  for (const [destRel, ref] of rasterRefs.entries()) {
+    let stat = sourceStats.get(ref.sourceKey);
+    if (!stat) {
+      try {
+        stat = fs.statSync(ref.sourceAbs);
+      } catch {
+        console.warn(`[theme-loader] Missing raster dependency for theme "${themeId}": ${ref.sourceRel}`);
+        missing.push(ref.sourceRel);
+        _removeCachedRaster(cacheDir, destRel);
+        if (cacheMeta.rasters[destRel]) {
+          delete cacheMeta.rasters[destRel];
+          changed = true;
+        }
+        continue;
+      }
+      sourceStats.set(ref.sourceKey, stat);
+    }
+    if (!stat.isFile()) {
+      console.warn(`[theme-loader] Raster dependency is not a file for theme "${themeId}": ${ref.sourceRel}`);
+      missing.push(ref.sourceRel);
+      _removeCachedRaster(cacheDir, destRel);
+      if (cacheMeta.rasters[destRel]) {
+        delete cacheMeta.rasters[destRel];
+        changed = true;
+      }
+      continue;
+    }
+
+    const destAbs = path.join(cacheDir, ...destRel.split("/"));
+    const cached = cacheMeta.rasters[destRel];
+    let destStat = null;
+    try { destStat = fs.statSync(destAbs); } catch {}
+    if (
+      cached
+      && cached.source === ref.sourceRel
+      && cached.mtime === stat.mtimeMs
+      && cached.size === stat.size
+      && destStat
+      && destStat.isFile()
+      && destStat.size === stat.size
+    ) {
+      continue;
+    }
+
+    try {
+      _copyRasterToCache(ref.sourceAbs, destAbs, stat);
+      cacheMeta.rasters[destRel] = {
+        source: ref.sourceRel,
+        mtime: stat.mtimeMs,
+        size: stat.size,
+      };
+      changed = true;
+    } catch (e) {
+      console.error(`[theme-loader] Failed to cache raster ${ref.sourceRel} for theme "${themeId}":`, e.message);
+      _removeCachedRaster(cacheDir, destRel);
+      if (cacheMeta.rasters[destRel]) {
+        delete cacheMeta.rasters[destRel];
+        changed = true;
+      }
+    }
+  }
+
+  for (const relPath of Object.keys(cacheMeta.rasters)) {
+    if (referenced.has(relPath)) continue;
+    _removeCachedRaster(cacheDir, relPath);
+    delete cacheMeta.rasters[relPath];
+    changed = true;
+  }
+
+  return { changed, missing };
 }
 
 // ── SVG Sanitization ──
@@ -643,8 +882,13 @@ function getRendererSourceAssetsPath() {
 function getRendererConfig() {
   if (!activeTheme) return null;
   const t = activeTheme;
+  const trustedScriptedSvgFiles = t._builtin && t.trustedRuntime
+    ? (t.trustedRuntime.scriptedSvgFiles || [])
+    : [];
   return {
     viewBox: t.viewBox,
+    miniModeViewBox: t.miniMode ? t.miniMode.viewBox : null,
+    fileViewBoxes: { ...(t.fileViewBoxes || {}) },
     layout: t.layout,
     assetsPath: getRendererAssetsPath(),
     // For external themes: non-SVG assets served from source dir (not cache)
@@ -656,6 +900,8 @@ function getRendererConfig() {
     idleFollowSvg: t.states.idle[0],
     // renderer needs to know which states need eye tracking (for <object> vs <img> decision)
     eyeTrackingStates: t.eyeTracking.enabled ? t.eyeTracking.states : [],
+    trustedScriptedSvgFiles: [...trustedScriptedSvgFiles],
+    rendering: t.rendering || { svgChannel: "auto" },
     objectScale: t.objectScale,
     transitions: t.transitions || {},
   };
@@ -780,6 +1026,18 @@ function validateTheme(cfg) {
     }
   }
 
+  if (cfg.rendering !== undefined) {
+    if (!_isPlainObject(cfg.rendering)) {
+      errors.push("rendering must be an object when present");
+    } else if (
+      cfg.rendering.svgChannel !== undefined
+      && cfg.rendering.svgChannel !== "auto"
+      && cfg.rendering.svgChannel !== "object"
+    ) {
+      errors.push(`rendering.svgChannel must be "auto" or "object", got ${cfg.rendering.svgChannel}`);
+    }
+  }
+
   const fallbackStateKeys = Object.keys(normalizedStates);
   for (const stateKey of fallbackStateKeys) {
     const entry = normalizedStates[stateKey];
@@ -887,6 +1145,15 @@ function validateThemeShape(themeId, opts = {}) {
 
 function _isPlainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
+}
+
+function _isPathInsideDir(baseDir, candidatePath) {
+  if (!baseDir || !candidatePath) return false;
+  const base = path.resolve(baseDir);
+  const candidate = path.resolve(candidatePath);
+  const relative = path.relative(base, candidate);
+  const firstSegment = relative.split(/[\\/]/)[0];
+  return relative === "" || (!!relative && firstSegment !== ".." && !path.isAbsolute(relative));
 }
 
 function _hasNonEmptyArray(value) {
@@ -1063,6 +1330,121 @@ function _basenameOnly(value) {
   return typeof value === "string" ? value.replace(/^.*[\/\\]/, "") : value;
 }
 
+function _normalizeViewBox(value) {
+  if (!_isPlainObject(value)) return null;
+  const { x, y, width, height } = value;
+  if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return { x, y, width, height };
+}
+
+function _normalizeTrustedRuntime(value, isBuiltin, themeId) {
+  const out = { scriptedSvgFiles: [] };
+  if (!isBuiltin) {
+    if (value !== undefined) {
+      console.warn(`[theme-loader] trustedRuntime ignored for non-builtin theme "${themeId}"`);
+    }
+    return out;
+  }
+  if (!_isPlainObject(value) || !Array.isArray(value.scriptedSvgFiles)) {
+    return out;
+  }
+  const seen = new Set();
+  for (const file of value.scriptedSvgFiles) {
+    if (typeof file !== "string") continue;
+    const safeFile = _basenameOnly(file);
+    if (!safeFile || !safeFile.toLowerCase().endsWith(".svg") || seen.has(safeFile)) continue;
+    seen.add(safeFile);
+    out.scriptedSvgFiles.push(safeFile);
+  }
+  if (_isPlainObject(value.scriptedSvgCycleMs)) {
+    const cycleMap = {};
+    for (const [file, ms] of Object.entries(value.scriptedSvgCycleMs)) {
+      const safeFile = _basenameOnly(file);
+      if (!safeFile || !safeFile.toLowerCase().endsWith(".svg") || !seen.has(safeFile)) continue;
+      if (!Number.isFinite(ms) || ms <= 0) continue;
+      cycleMap[safeFile] = Math.round(ms);
+    }
+    if (Object.keys(cycleMap).length > 0) out.scriptedSvgCycleMs = cycleMap;
+  }
+  return out;
+}
+
+function _normalizeRendering(value) {
+  if (!_isPlainObject(value)) return { svgChannel: "auto" };
+  return {
+    svgChannel: value.svgChannel === "object" ? "object" : "auto",
+  };
+}
+
+function _warnFileViewBoxDropped(rawKey, reason) {
+  console.warn(`[theme-loader] fileViewBoxes["${rawKey}"] dropped: ${reason}`);
+}
+
+function _normalizeFileViewBoxes(value) {
+  const out = {};
+  if (value == null) return out;
+  if (!_isPlainObject(value)) {
+    console.warn("[theme-loader] fileViewBoxes dropped: expected object map");
+    return out;
+  }
+
+  for (const [rawKey, viewBox] of Object.entries(value)) {
+    const key = _basenameOnly(rawKey);
+    if (!key) {
+      _warnFileViewBoxDropped(rawKey, "invalid filename key");
+      continue;
+    }
+    const normalized = _normalizeViewBox(viewBox);
+    if (!normalized) {
+      _warnFileViewBoxDropped(rawKey, "expected finite x/y/width/height with positive width/height");
+      continue;
+    }
+    out[key] = normalized;
+  }
+  return out;
+}
+
+function _warnFileHitBoxDropped(rawKey, reason) {
+  console.warn(`[theme-loader] fileHitBoxes["${rawKey}"] dropped: ${reason}`);
+}
+
+function _normalizeFileHitBoxes(value) {
+  const out = {};
+  if (value == null) return out;
+  if (!_isPlainObject(value)) {
+    console.warn("[theme-loader] fileHitBoxes dropped: expected object map");
+    return out;
+  }
+
+  for (const [rawKey, box] of Object.entries(value)) {
+    const key = _basenameOnly(rawKey);
+    if (!key) {
+      _warnFileHitBoxDropped(rawKey, "invalid filename key");
+      continue;
+    }
+    if (!_isPlainObject(box)) {
+      _warnFileHitBoxDropped(rawKey, "expected object with finite x/y/w/h");
+      continue;
+    }
+    const { x, y, w, h } = box;
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
+      _warnFileHitBoxDropped(rawKey, "missing/invalid x/y/w/h");
+      continue;
+    }
+    out[key] = { x, y, w, h };
+  }
+  return out;
+}
+
+function _mergeFileHitBoxes(base, patch) {
+  return {
+    ..._normalizeFileHitBoxes(base),
+    ..._normalizeFileHitBoxes(patch),
+  };
+}
+
 /**
  * Resolve a requested variant id against the theme's declared variants.
  * Synthesises a `default` variant when the author didn't declare one so the
@@ -1104,6 +1486,10 @@ function _applyVariantPatch(raw, variantSpec, themeId, variantId) {
     if (key === "name" || key === "description" || key === "preview") continue;
     if (!VARIANT_ALLOWED_KEYS.has(key)) {
       console.warn(`[theme-loader] variant "${themeId}:${variantId}" declares ignored field "${key}" (not in allow-list)`);
+      continue;
+    }
+    if (key === "fileHitBoxes") {
+      patched.fileHitBoxes = _mergeFileHitBoxes(patched.fileHitBoxes, value);
       continue;
     }
     if (VARIANT_REPLACE_FIELDS.has(key) || Array.isArray(value)) {
@@ -1424,8 +1810,15 @@ function mergeDefaults(raw, themeId, isBuiltin) {
 
   // hitBoxes
   theme.hitBoxes = { ...DEFAULT_HITBOXES, ...(raw.hitBoxes || {}) };
+  theme.fileHitBoxes = _normalizeFileHitBoxes(raw.fileHitBoxes);
+  // fileViewBoxes / miniMode.viewBox are layout metadata only and safe for external themes.
+  theme.fileViewBoxes = _normalizeFileViewBoxes(raw.fileViewBoxes);
   theme.wideHitboxFiles = raw.wideHitboxFiles || [];
   theme.sleepingHitboxFiles = raw.sleepingHitboxFiles || [];
+
+  // trustedRuntime grants script execution capability, so it requires loader-derived built-in trust.
+  theme.trustedRuntime = _normalizeTrustedRuntime(raw.trustedRuntime, isBuiltin, themeId);
+  theme.rendering = _normalizeRendering(raw.rendering);
 
   // objectScale
   theme.objectScale = { ...DEFAULT_OBJECT_SCALE, ...(raw.objectScale || {}) };
@@ -1477,6 +1870,7 @@ function mergeDefaults(raw, themeId, isBuiltin) {
       supported: true,
       offsetRatio: 0.486,
       ...raw.miniMode,
+      viewBox: _normalizeViewBox(raw.miniMode.viewBox),
       timings: {
         minDisplay: {},
         autoReturn: {},
@@ -1485,7 +1879,7 @@ function mergeDefaults(raw, themeId, isBuiltin) {
       glyphFlips: raw.miniMode.glyphFlips || {},
     };
   } else {
-    theme.miniMode = { supported: false, states: {}, timings: { minDisplay: {}, autoReturn: {} }, glyphFlips: {} };
+    theme.miniMode = { supported: false, states: {}, viewBox: null, timings: { minDisplay: {}, autoReturn: {} }, glyphFlips: {} };
   }
 
   // Merge mini timings into main timings for state.js convenience

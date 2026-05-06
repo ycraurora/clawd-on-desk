@@ -513,8 +513,12 @@ function showPermissionBubble(permEntry) {
     if (permEntry.bubble !== bub || pendingPermissions.indexOf(permEntry) === -1) return;
     permEntry.bubbleReady = true;
     syncPermissionBubbleContent(permEntry);
-    // Don't call bub.focus() — it steals focus from terminal and can trigger
-    // false "User answered in terminal" denials in Claude Code, wasting tokens.
+    // Elicitation bubbles need keyboard focus so arrow keys and Enter work.
+    // Regular permission bubbles must NOT steal focus from the terminal —
+    // doing so triggers false "User answered in terminal" denials in Claude Code.
+    if (permEntry.isElicitation) {
+      bub.focus();
+    }
   });
 
   repositionBubbles();

@@ -9,6 +9,7 @@ const LOW_POWER_IDLE_PAUSE_MS = 5000;
 const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
 const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
 const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
+const CLOUDLING_POINTER_BRIDGE_STATES = new Set(["idle", "mini-idle", "mini-peek"]);
 let lowPowerIdleMode = false;
 let lowPowerIdlePauseTimer = null;
 let lowPowerSvgPaused = false;
@@ -27,6 +28,11 @@ function initWithConfig(cfg) {
   _shadowStretch = (tc.eyeTracking && tc.eyeTracking.shadowStretch) || 0.15;
   _shadowShift = (tc.eyeTracking && tc.eyeTracking.shadowShift) || 0.3;
   _eyeTrackingStates = (tc.eyeTrackingStates) || ["idle", "dozing", "mini-idle"];
+  _trustedScriptedSvgFiles = new Set(Array.isArray(tc.trustedScriptedSvgFiles) ? tc.trustedScriptedSvgFiles : []);
+  _forceSvgObjectChannel = !!(tc.rendering && tc.rendering.svgChannel === "object");
+  _imgCacheBustSeq = 0;
+  _miniViewBox = tc.miniModeViewBox || null;
+  _fileViewBoxes = tc.fileViewBoxes || {};
   _dragSvg = tc.dragSvg || null;
   _idleFollowSvg = tc.idleFollowSvg || "clawd-idle-follow.svg";
   _glyphFlipDefs = tc.glyphFlips || { "pixel-z": 4, "pixel-z-small": 3 };
@@ -54,14 +60,14 @@ function initWithConfig(cfg) {
   _transitions = tc.transitions || {};
   _miniFlipAssets = !!tc.miniFlipAssets;
 
-  applyObjectScaleStyle(clawdEl, getObjectSvgName(clawdEl));
-  applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext));
+  applyObjectScaleStyle(clawdEl, getObjectSvgName(clawdEl), null);
+  applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext), null);
 }
 
-function applyObjectScaleStyle(el, file) {
+function applyObjectScaleStyle(el, file, state) {
   if (!el || !_objectScaleCSS) return;
-  if (shouldUseNormalizedLayout(file)) {
-    applyNormalizedLayoutStyle(el, file);
+  if (shouldUseNormalizedLayout(file, state)) {
+    applyNormalizedLayoutStyle(el, file, state);
     return;
   }
   const fo = (file && _fileOffsets[file]) || null;
@@ -233,14 +239,39 @@ function setLowPowerIdleMode(enabled) {
   }
 }
 
-function shouldUseNormalizedLayout(file) {
+function isSvgFile(file) {
+  return typeof file === "string" && file.toLowerCase().endsWith(".svg");
+}
+
+function resolveViewBox(state, file) {
+  if (file && _fileViewBoxes && _fileViewBoxes[file]) return _fileViewBoxes[file];
+  if (state && state.startsWith("mini-") && _miniViewBox) return _miniViewBox;
+  return _viewBox;
+}
+
+function viewBoxEquals(a, b) {
+  return !!(a && b
+    && a.x === b.x
+    && a.y === b.y
+    && a.width === b.width
+    && a.height === b.height);
+}
+
+function hasRootViewBoxFileOverride(file) {
+  return !!(file && _fileViewBoxes && viewBoxEquals(_fileViewBoxes[file], _viewBox));
+}
+
+function shouldUseNormalizedLayout(file, state) {
   if (!_layout || !_layout.contentBox) return false;
-  if (_inMiniMode || (file && file.startsWith("mini-"))) return false;
+  if (_inMiniMode) return false;
+  if (hasRootViewBoxFileOverride(file)) return true;
+  if ((state && state.startsWith("mini-")) || (file && file.startsWith("mini-"))) return false;
   return true;
 }
 
-function applyNormalizedLayoutStyle(el, file) {
-  if (!el || !_layout || !_layout.contentBox || !_viewBox) return;
+function applyNormalizedLayoutStyle(el, file, state) {
+  const viewBox = resolveViewBox(state, file);
+  if (!el || !_layout || !_layout.contentBox || !viewBox) return;
   const fo = (file && _fileOffsets[file]) || null;
   const ox = fo ? fo.x : 0;
   const oy = fo ? fo.y : 0;
@@ -249,12 +280,12 @@ function applyNormalizedLayoutStyle(el, file) {
   const centerX = _layout.centerX != null ? _layout.centerX : (cb.x + cb.width / 2);
   const baselineY = _layout.baselineY != null ? _layout.baselineY : (cb.y + cb.height);
   const unitRatio = ((_layout.visibleHeightRatio || 0.58) * scale) / cb.height;
-  const widthRatio = _viewBox.width * unitRatio;
-  const heightRatio = _viewBox.height * unitRatio;
+  const widthRatio = viewBox.width * unitRatio;
+  const heightRatio = viewBox.height * unitRatio;
   const leftRatio = (_layout.centerXRatio != null ? _layout.centerXRatio : 0.5)
-    - ((centerX - _viewBox.x) * unitRatio);
+    - ((centerX - viewBox.x) * unitRatio);
   const bottomRatio = (_layout.baselineBottomRatio != null ? _layout.baselineBottomRatio : 0.05)
-    - ((_viewBox.y + _viewBox.height - baselineY) * unitRatio);
+    - ((viewBox.y + viewBox.height - baselineY) * unitRatio);
 
   if (el.tagName === "IMG") {
     el.style.width = `${widthRatio * 100}%`;
@@ -280,6 +311,11 @@ let _bodyScale;
 let _shadowStretch;
 let _shadowShift;
 let _eyeTrackingStates;
+let _trustedScriptedSvgFiles = new Set();
+let _forceSvgObjectChannel = false;
+let _imgCacheBustSeq = 0;
+let _miniViewBox = null;
+let _fileViewBoxes = {};
 let _dragSvg;
 let _idleFollowSvg;
 let _glyphFlipDefs;
@@ -295,9 +331,9 @@ function setViewportOffset(offsetY) {
   const next = Number.isFinite(offsetY) ? Math.max(0, Math.round(offsetY)) : 0;
   if (next === _viewportOffsetY) return;
   _viewportOffsetY = next;
-  applyObjectScaleStyle(clawdEl, currentDisplayedSvg);
+  applyObjectScaleStyle(clawdEl, currentDisplayedSvg, currentState);
   if (pendingNext) {
-    applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext));
+    applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext), currentState);
   }
 }
 
@@ -351,6 +387,7 @@ let isDragReacting = false;
 let reactTimer = null;
 let currentIdleSvg = null;    // tracks which SVG is currently showing
 let currentState = null;      // last state name received from main (for re-pulse)
+let lastCloudlingPointerPayload = null;
 let dndEnabled = false;
 let miniLeftFlip = false;
 
@@ -360,15 +397,19 @@ if (window.electronAPI && typeof window.electronAPI.onLowPowerIdleModeChange ===
 
 window.electronAPI.onDndChange((enabled) => { dndEnabled = enabled; });
 
-window.electronAPI.onMiniModeChange((enabled, edge) => {
-  _inMiniMode = enabled;
-  miniLeftFlip = enabled && edge === "left";
+window.electronAPI.onMiniModeChange((enabled, edge, options) => {
+  const preEntry = !!(options && options.preEntry);
+  _inMiniMode = !!enabled && !preEntry;
+  miniLeftFlip = !!enabled && edge === "left";
   container.classList.toggle("mini-left", miniLeftFlip);
   applyMiniFlip(clawdEl);
   if (miniLeftFlip) {
     applyGlyphFlipCompensation(clawdEl);
   } else {
     removeGlyphFlipCompensation(clawdEl);
+  }
+  if (shouldUseCloudlingPointerBridge(currentState, currentDisplayedSvg) && lastCloudlingPointerPayload) {
+    applyCloudlingPointerBridge(lastCloudlingPointerPayload);
   }
 });
 
@@ -380,6 +421,10 @@ function applyGlyphFlipCompensation(objectEl) {
   try {
     const doc = objectEl.contentDocument;
     if (!doc) return;
+    const svgWindow = objectEl.contentWindow;
+    if (svgWindow && typeof svgWindow.__clawdSetGlyphFlipCompensation === "function") {
+      svgWindow.__clawdSetGlyphFlipCompensation(true);
+    }
     for (const [id, w] of Object.entries(_glyphFlipDefs)) {
       const el = doc.getElementById(id);
       if (el) el.setAttribute("transform", `translate(${w}, 0) scale(-1, 1)`);
@@ -392,6 +437,10 @@ function removeGlyphFlipCompensation(objectEl) {
   try {
     const doc = objectEl.contentDocument;
     if (!doc) return;
+    const svgWindow = objectEl.contentWindow;
+    if (svgWindow && typeof svgWindow.__clawdSetGlyphFlipCompensation === "function") {
+      svgWindow.__clawdSetGlyphFlipCompensation(false);
+    }
     for (const id of Object.keys(_glyphFlipDefs)) {
       const el = doc.getElementById(id);
       if (el) el.removeAttribute("transform");
@@ -412,15 +461,74 @@ function getObjectSvgName(objectEl) {
 
 // ── Dual-channel rendering ──
 // Object channel: <object type="image/svg+xml"> for SVG states needing eye tracking
+// or built-in trusted SVG files whose own scripts need a document context.
 // Img channel: <img> for all other formats (SVG/GIF/APNG/WebP pure playback)
 
 /**
- * Determine if a state+file needs the <object> channel (eye tracking).
+ * Determine if a state should attach Clawd-controlled eye tracking.
+ */
+function needsEyeTracking(state) {
+  return _eyeTrackingStates.includes(state);
+}
+
+/**
+ * Determine if a state+file needs the <object> channel.
  */
 function needsObjectChannel(state, file) {
-  if (!file) return false;
-  if (!file.endsWith(".svg")) return false;
-  return _eyeTrackingStates.includes(state);
+  if (!isSvgFile(file)) return false;
+  return _forceSvgObjectChannel || needsEyeTracking(state) || _trustedScriptedSvgFiles.has(file);
+}
+
+function shouldUseCloudlingPointerBridge(state, file) {
+  return CLOUDLING_POINTER_BRIDGE_STATES.has(state) && isSvgFile(file);
+}
+
+function normalizeCloudlingPointerPayload(payload) {
+  if (!payload || !Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null;
+  return {
+    x: payload.x,
+    y: payload.y,
+    inside: !!payload.inside,
+  };
+}
+
+function getDisplayedCloudlingPointerPayload(payload) {
+  const next = { ...payload };
+  if (miniLeftFlip) {
+    const viewBox = resolveViewBox(currentState, currentDisplayedSvg);
+    if (viewBox && Number.isFinite(viewBox.x) && Number.isFinite(viewBox.width)) {
+      next.x = viewBox.x + viewBox.width - (payload.x - viewBox.x);
+    }
+  }
+  return next;
+}
+
+function callCloudlingPointerBridge(objectEl, payload) {
+  if (!objectEl || objectEl.tagName !== "OBJECT" || !payload) return false;
+  try {
+    const svgWindow = objectEl.contentWindow;
+    if (svgWindow && typeof svgWindow.__cloudlingSetPointer === "function") {
+      svgWindow.__cloudlingSetPointer(payload);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function applyCloudlingPointerBridge(payload) {
+  const normalized = normalizeCloudlingPointerPayload(payload);
+  if (!normalized) return;
+  lastCloudlingPointerPayload = normalized;
+  if (!shouldUseCloudlingPointerBridge(currentState, currentDisplayedSvg)) return;
+  callCloudlingPointerBridge(clawdEl, getDisplayedCloudlingPointerPayload(normalized));
+}
+
+function clearCloudlingPointerBridge(objectEl = clawdEl) {
+  const payload = {
+    ...(lastCloudlingPointerPayload || { x: 0, y: 0 }),
+    inside: false,
+  };
+  callCloudlingPointerBridge(objectEl, getDisplayedCloudlingPointerPayload(payload));
 }
 
 /**
@@ -447,8 +555,9 @@ function playReaction(svgFile, durationMs) {
   resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
 
-  // Reactions always use <img> channel (no eye tracking needed)
-  swapToFile(svgFile, null, false);
+  // Reactions do not attach eye tracking, but some themes force SVGs through
+  // <object> so their SVG documents can load local sub-resources.
+  swapToFile(svgFile, null);
 
   reactTimer = setTimeout(() => endReaction(), durationMs);
 }
@@ -485,7 +594,7 @@ function startDragReaction() {
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
-  swapToFile(_dragSvg, null, false);
+  swapToFile(_dragSvg, null);
 }
 
 function endDragReaction() {
@@ -496,7 +605,9 @@ function endDragReaction() {
 
 // --- Generic swap function: handles both <object> and <img> channels ---
 let currentDisplayedSvg = getObjectSvgName(clawdEl);
+let currentDisplayedAssetUrl = null;
 let pendingSvgFile = null; // tracks the SVG currently being loaded (for dedup)
+let pendingAssetUrl = null;
 currentIdleSvg = currentDisplayedSvg;
 
 /**
@@ -520,11 +631,13 @@ function swapToFile(file, state, useObjectChannel) {
     if (pendingNext.tagName === "OBJECT") releaseObject(pendingNext);
     else releaseImg(pendingNext);
     pendingNext = null;
+    pendingAssetUrl = null;
   }
 
   pendingSvgFile = file; // track what's loading for dedup
   const useObj = useObjectChannel !== undefined ? useObjectChannel : needsObjectChannel(state, file);
   const url = getAssetUrl(file);
+  pendingAssetUrl = url;
 
   if (useObj) {
     // Object channel: <object type="image/svg+xml">
@@ -532,7 +645,7 @@ function swapToFile(file, state, useObjectChannel) {
     next.type = "image/svg+xml";
     next.id = "clawd";
     next.style.opacity = "0";
-    applyObjectScaleStyle(next, file);
+    applyObjectScaleStyle(next, file, state);
 
     const swap = () => {
       if (pendingNext !== next) return;
@@ -556,13 +669,18 @@ function swapToFile(file, state, useObjectChannel) {
       }
       pendingNext = null;
       pendingSvgFile = null;
+      pendingAssetUrl = null;
       clawdEl = next;
       currentDisplayedSvg = file;
+      currentDisplayedAssetUrl = url;
 
-      if (state && needsObjectChannel(state, file)) {
+      if (state && needsEyeTracking(state)) {
         attachEyeTracking(next);
       }
       if (miniLeftFlip) applyGlyphFlipCompensation(next);
+      if (shouldUseCloudlingPointerBridge(currentState, file) && lastCloudlingPointerPayload) {
+        callCloudlingPointerBridge(next, getDisplayedCloudlingPointerPayload(lastCloudlingPointerPayload));
+      }
       scheduleLowPowerIdlePause();
     };
 
@@ -572,7 +690,15 @@ function swapToFile(file, state, useObjectChannel) {
     pendingNext = next;
     setTimeout(() => {
       if (pendingNext !== next) return;
-      try { if (!next.contentDocument) { releaseObject(next); pendingNext = null; return; } } catch {}
+      try {
+        if (!next.contentDocument) {
+          releaseObject(next);
+          pendingNext = null;
+          pendingSvgFile = null;
+          pendingAssetUrl = null;
+          return;
+        }
+      } catch {}
       swap();
     }, 3000);
   } else {
@@ -581,7 +707,7 @@ function swapToFile(file, state, useObjectChannel) {
     next.className = "clawd-img";
     next.id = "clawd";
     next.style.opacity = "0";
-    applyObjectScaleStyle(next, file);
+    applyObjectScaleStyle(next, file, state);
     applyMiniFlip(next);
 
     const swap = () => {
@@ -606,8 +732,10 @@ function swapToFile(file, state, useObjectChannel) {
       }
       pendingNext = null;
       pendingSvgFile = null;
+      pendingAssetUrl = null;
       clawdEl = next;
       currentDisplayedSvg = file;
+      currentDisplayedAssetUrl = url;
       scheduleLowPowerIdlePause();
     };
 
@@ -617,11 +745,13 @@ function swapToFile(file, state, useObjectChannel) {
     // one-shot animations (`animation: foo 3.2s 1 forwards`) that already ran
     // once would reappear stuck on their last frame on subsequent loads —
     // the user sees a static pet instead of the entry animation. Appending
-    // a timestamp forces a fresh SVG document & fresh animation start each
-    // swap. Infinite animations are unaffected (they look identical either
-    // way). Load time stays ~0ms since the file itself is still in the HTTP
-    // cache; only the in-memory SVG document is rebuilt.
-    next.src = `${url}${url.includes("?") ? "&" : "?"}_t=${Date.now()}`;
+    // a timestamp plus monotonic sequence forces a fresh SVG document & fresh
+    // animation start each swap, even when several swaps happen in the same
+    // millisecond. Infinite animations are unaffected (they look identical
+    // either way). Load time stays ~0ms since the file itself is still in the
+    // HTTP cache; only the in-memory SVG document is rebuilt.
+    const cacheBust = `${Date.now()}-${++_imgCacheBustSeq}`;
+    next.src = `${url}${url.includes("?") ? "&" : "?"}_t=${cacheBust}`;
     container.appendChild(next);
     pendingNext = next;
     // Timeout fallback for images that fail to load
@@ -640,17 +770,33 @@ window.electronAPI.onStateChange((state, svg) => {
   // swapToFile() with the matching state for eye-tracking decisions.
   currentState = state;
   noteLowPowerActivity();
+  if (!shouldUseCloudlingPointerBridge(state, svg)) {
+    clearCloudlingPointerBridge();
+  }
 
-  // Dedup: same file already displayed OR currently loading → don't re-swap
-  const alreadyDisplayed = clawdEl && clawdEl.isConnected && currentDisplayedSvg === svg;
-  const alreadyPending = pendingSvgFile === svg && pendingNext;
+  // Dedup only when the same file resolves to the same asset URL. Imported
+  // Codex Pet themes reuse filenames, so filename-only dedup can keep showing
+  // the previous theme until a drag/click forces a different animation.
+  const desiredObjectChannel = needsObjectChannel(state, svg);
+  const desiredAssetUrl = getAssetUrl(svg);
+  const alreadyDisplayed = clawdEl && clawdEl.isConnected
+    && currentDisplayedSvg === svg
+    && currentDisplayedAssetUrl === desiredAssetUrl;
+  const displayedChannelMatches = !alreadyDisplayed || ((clawdEl.tagName === "OBJECT") === desiredObjectChannel);
+  const alreadyPending = pendingSvgFile === svg
+    && pendingNext
+    && pendingAssetUrl === desiredAssetUrl;
+  const pendingChannelMatches = !alreadyPending || ((pendingNext.tagName === "OBJECT") === desiredObjectChannel);
 
-  if (alreadyDisplayed || alreadyPending) {
+  if ((alreadyDisplayed && displayedChannelMatches) || (alreadyPending && pendingChannelMatches)) {
     if (alreadyDisplayed) {
-      if (needsObjectChannel(state, svg) && !eyeTarget && !_trackingLayers) {
+      if (needsEyeTracking(state) && !eyeTarget && !_trackingLayers) {
         if (clawdEl.tagName === "OBJECT") attachEyeTracking(clawdEl);
-      } else if (!needsObjectChannel(state, svg)) {
+      } else if (!needsEyeTracking(state)) {
         detachEyeTracking();
+      }
+      if (shouldUseCloudlingPointerBridge(state, svg) && lastCloudlingPointerPayload) {
+        applyCloudlingPointerBridge(lastCloudlingPointerPayload);
       }
       scheduleLowPowerIdlePause();
     }
@@ -664,6 +810,7 @@ window.electronAPI.onStateChange((state, svg) => {
     else releaseImg(pendingNext);
     pendingNext = null;
     pendingSvgFile = null;
+    pendingAssetUrl = null;
   }
   detachEyeTracking();
 
@@ -980,6 +1127,13 @@ window.electronAPI.onEyeMove((dx, dy) => {
   }
   applyEyeMove(effectiveDx, dy);
 });
+
+if (window.electronAPI && typeof window.electronAPI.onCloudlingPointer === "function") {
+  window.electronAPI.onCloudlingPointer((payload) => {
+    noteLowPowerActivity();
+    applyCloudlingPointerBridge(payload);
+  });
+}
 
 // --- Sound playback (IPC from main, receives { url, volume } from theme) ---
 const _audioCache = {};

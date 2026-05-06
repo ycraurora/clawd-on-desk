@@ -118,9 +118,9 @@ function _uninstallAutoStartHook() {
   const { unregisterAutoStart } = require("../hooks/install.js");
   unregisterAutoStart();
 }
-function _uninstallClaudeHooksNow() {
-  const { unregisterHooks } = require("../hooks/install.js");
-  unregisterHooks();
+async function _uninstallClaudeHooksNow() {
+  const { unregisterHooksAsync } = require("../hooks/install.js");
+  await unregisterHooksAsync();
 }
 
 // Cross-platform "open at login" writer used by both the openAtLogin effect
@@ -230,7 +230,10 @@ const _settingsController = createSettingsController({
   injectedDeps: {
     installAutoStart: _installAutoStartHook,
     uninstallAutoStart: _uninstallAutoStartHook,
-    syncClaudeHooksNow: () => _server.syncClawdHooks(),
+    syncClaudeHooksNow: () => {
+      const { registerHooksAsync } = require("../hooks/install.js");
+      return registerHooksAsync({ silent: true, autoStart: autoStartWithClaude, port: getHookServerPort() });
+    },
     uninstallClaudeHooksNow: _uninstallClaudeHooksNow,
     startClaudeSettingsWatcher: () => _server.startClaudeSettingsWatcher(),
     stopClaudeSettingsWatcher: () => _server.stopClaudeSettingsWatcher(),
@@ -346,8 +349,13 @@ function captureCurrentDisplaySnapshot(bounds) {
   }
 }
 
+const CodexSubagentClassifier = require("../agents/codex-subagent-classifier");
+const {
+  buildCodexMonitorUpdateOptions,
+  isCodexMonitorPermissionEvent,
+} = require("./codex-monitor-callback");
+const _codexSubagentClassifier = new CodexSubagentClassifier();
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
-let _geminiMonitor = null;         // Gemini CLI session JSON polling instance
 const CODEX_OFFICIAL_LOG_SUPPRESS_TTL_MS = 10 * 60 * 1000;
 const CODEX_LOG_EVENTS_COVERED_BY_OFFICIAL_HOOKS = new Set([
   "session_meta",
@@ -398,17 +406,466 @@ function updateSessionFromServer(sessionId, state, event, opts = {}) {
 // HTTP route layer. Only log-poll agents hit these branches.
 function startMonitorForAgent(agentId) {
   if (agentId === "codex" && _codexMonitor) _codexMonitor.start();
-  else if (agentId === "gemini-cli" && _geminiMonitor) _geminiMonitor.start();
 }
 function stopMonitorForAgent(agentId) {
   if (agentId === "codex" && _codexMonitor) _codexMonitor.stop();
-  else if (agentId === "gemini-cli" && _geminiMonitor) _geminiMonitor.stop();
+}
+
+function safeConsoleError(...args) {
+  try {
+    console.error(...args);
+  } catch (err) {
+    try {
+      const line = `${new Date().toISOString()} ${args.map((x) => String(x)).join(" ")}\n`;
+      fs.appendFileSync(path.join(app.getPath("userData"), "clawd-main.log"), line);
+    } catch {}
+  }
 }
 
 // ── Theme loader ──
 const themeLoader = require("./theme-loader");
+const codexPetAdapter = require("./codex-pet-adapter");
+const codexPetImporter = require("./codex-pet-importer");
 const { isPlainObject: _isPlainObject } = themeLoader;
 themeLoader.init(__dirname, app.getPath("userData"));
+
+let _lastCodexPetSyncSummary = null;
+const REGISTER_PROTOCOL_DEV_ARG = "--register-protocol";
+const CLAWD_PROTOCOL_SCHEME = "clawd";
+const _pendingCodexPetImportUrls = [];
+let _codexPetImportFlushRunning = false;
+
+function _emptyCodexPetSyncSummary(overrides = {}) {
+  return {
+    codexPetsDir: "",
+    userThemesDir: "",
+    imported: 0,
+    updated: 0,
+    unchanged: 0,
+    invalid: 0,
+    removed: 0,
+    activeOrphanThemeIds: [],
+    themes: [],
+    diagnostics: [],
+    ...overrides,
+  };
+}
+function _mergeCodexPetSyncSummaries(base, extra) {
+  const a = base || _emptyCodexPetSyncSummary();
+  const b = extra || _emptyCodexPetSyncSummary();
+  return {
+    codexPetsDir: b.codexPetsDir || a.codexPetsDir || "",
+    userThemesDir: b.userThemesDir || a.userThemesDir || "",
+    imported: (a.imported || 0) + (b.imported || 0),
+    updated: (a.updated || 0) + (b.updated || 0),
+    unchanged: (a.unchanged || 0) + (b.unchanged || 0),
+    invalid: (a.invalid || 0) + (b.invalid || 0),
+    removed: (a.removed || 0) + (b.removed || 0),
+    activeOrphanThemeIds: [
+      ...new Set([
+        ...((a.activeOrphanThemeIds || []).map(String)),
+        ...((b.activeOrphanThemeIds || []).map(String)),
+      ]),
+    ],
+    themes: [
+      ...(Array.isArray(a.themes) ? a.themes : []),
+      ...(Array.isArray(b.themes) ? b.themes : []),
+    ],
+    diagnostics: [
+      ...(Array.isArray(a.diagnostics) ? a.diagnostics : []),
+      ...(Array.isArray(b.diagnostics) ? b.diagnostics : []),
+    ],
+    error: a.error || b.error || null,
+  };
+}
+function _syncCodexPetThemesForMain(activeThemeId) {
+  try {
+    const summary = codexPetAdapter.syncCodexPetThemes({
+      userDataDir: app.getPath("userData"),
+      activeThemeId,
+    });
+    _lastCodexPetSyncSummary = summary;
+    return summary;
+  } catch (err) {
+    const summary = _emptyCodexPetSyncSummary({
+      error: err && err.message ? err.message : String(err),
+      diagnostics: [{ errors: [`failed to sync Codex Pet themes: ${err && err.message ? err.message : err}`] }],
+    });
+    _lastCodexPetSyncSummary = summary;
+    console.warn("Clawd: failed to sync Codex Pet themes:", err && err.message);
+    return summary;
+  }
+}
+function _summaryHasActiveCodexPetOrphan(summary, themeId) {
+  return !!(
+    themeId
+    && summary
+    && Array.isArray(summary.activeOrphanThemeIds)
+    && summary.activeOrphanThemeIds.includes(themeId)
+  );
+}
+function _sameFsPath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+function _isFsPathInsideDir(rootDir, candidatePath) {
+  if (typeof rootDir !== "string" || typeof candidatePath !== "string") return false;
+  let root = path.resolve(rootDir);
+  let candidate = path.resolve(candidatePath);
+  if (process.platform === "win32") {
+    root = root.toLowerCase();
+    candidate = candidate.toLowerCase();
+  }
+  return candidate !== root && candidate.startsWith(root + path.sep);
+}
+function _getCodexPetManagedThemeDir(themeId) {
+  if (typeof themeId !== "string" || !themeId) return null;
+  let userThemesDir;
+  try {
+    userThemesDir = themeLoader.ensureUserThemesDir();
+  } catch {
+    return null;
+  }
+  if (!userThemesDir) return null;
+  const root = path.resolve(userThemesDir);
+  const themeDir = path.resolve(path.join(userThemesDir, themeId));
+  if (!_isFsPathInsideDir(root, themeDir)) return null;
+  return themeDir;
+}
+function _readCodexPetManagedThemeMarker(themeId) {
+  const themeDir = _getCodexPetManagedThemeDir(themeId);
+  if (!themeDir) return null;
+  return codexPetAdapter.readManagedMarker(themeDir);
+}
+function _getCodexPetPreviewAtlasUrl(themeId, marker) {
+  const themeDir = _getCodexPetManagedThemeDir(themeId);
+  if (!themeDir || !marker || typeof marker.sourceSpritesheetPath !== "string") return null;
+  const filename = path.basename(marker.sourceSpritesheetPath);
+  if (!filename) return null;
+  const assetsDir = path.resolve(path.join(themeDir, "assets"));
+  const atlasPath = path.resolve(path.join(assetsDir, filename));
+  if (!_isFsPathInsideDir(assetsDir, atlasPath) || !fs.existsSync(atlasPath)) return null;
+  try {
+    return pathToFileURL(atlasPath).href;
+  } catch {
+    return null;
+  }
+}
+function _decorateCodexPetThemeMetadata(theme) {
+  const marker = theme && _readCodexPetManagedThemeMarker(theme.id);
+  if (!marker) return theme;
+  return {
+    ...theme,
+    managedCodexPet: true,
+    codexPet: {
+      sourcePetId: marker.sourcePetId || "",
+      sourcePackagePath: marker.sourcePackagePath || "",
+      previewAtlasUrl: _getCodexPetPreviewAtlasUrl(theme.id, marker),
+      adapterVersion: marker.adapterVersion || 0,
+    },
+  };
+}
+async function _refreshCodexPetThemesFromSettings() {
+  const activeId = activeTheme ? activeTheme._id : (_settingsController.get("theme") || "clawd");
+  let summary = _syncCodexPetThemesForMain(activeId);
+  let switchedToFallback = false;
+
+  if (summary.error) {
+    return { status: "error", message: summary.error, summary };
+  }
+
+  if (_summaryHasActiveCodexPetOrphan(summary, activeId)) {
+    const result = await _settingsController.applyCommand("setThemeSelection", { themeId: "clawd" });
+    if (!result || result.status !== "ok") {
+      return {
+        status: "error",
+        message: (result && result.message) || "failed to switch active orphan Codex Pet theme back to clawd",
+        summary,
+      };
+    }
+    switchedToFallback = true;
+    const cleanup = _syncCodexPetThemesForMain("clawd");
+    summary = _mergeCodexPetSyncSummaries(summary, cleanup);
+    _lastCodexPetSyncSummary = summary;
+    if (cleanup.error) {
+      return { status: "error", message: cleanup.error, summary, switchedToFallback };
+    }
+  }
+
+  try { rebuildAllMenus(); } catch (err) {
+    console.warn("Clawd: rebuildAllMenus after Codex Pet refresh failed:", err && err.message);
+  }
+  return { status: "ok", summary, switchedToFallback };
+}
+function _resolveCodexPetRemovalTarget(themeId) {
+  const marker = _readCodexPetManagedThemeMarker(themeId);
+  if (!marker) {
+    return { status: "error", message: "theme is not a managed Codex Pet" };
+  }
+  const petsRoot = path.resolve(codexPetImporter.getDefaultCodexPetsDir());
+  const packageDir = path.resolve(marker.sourcePackagePath || "");
+  if (!_isFsPathInsideDir(petsRoot, packageDir) || !_sameFsPath(path.dirname(packageDir), petsRoot)) {
+    return { status: "error", message: "managed Codex Pet source path is outside the pets folder" };
+  }
+  return {
+    status: "ok",
+    marker,
+    packageDir,
+    exists: fs.existsSync(packageDir),
+  };
+}
+function _extractClawdProtocolUrls(argv) {
+  if (!Array.isArray(argv)) return [];
+  return argv.filter((arg) => typeof arg === "string" && arg.toLowerCase().startsWith(`${CLAWD_PROTOCOL_SCHEME}:`));
+}
+function _enqueueCodexPetImportUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl) return;
+  _pendingCodexPetImportUrls.push(rawUrl);
+  if (app.isReady()) {
+    setImmediate(() => {
+      _flushPendingCodexPetImportUrls().catch((err) => {
+        console.warn("Clawd: Codex Pet import queue failed:", err && err.message);
+      });
+    });
+  }
+}
+function _enqueueCodexPetImportUrlsFromArgv(argv) {
+  for (const rawUrl of _extractClawdProtocolUrls(argv)) {
+    _enqueueCodexPetImportUrl(rawUrl);
+  }
+}
+function _registerClawdProtocolClient() {
+  try {
+    if (app.isPackaged) {
+      return app.setAsDefaultProtocolClient(CLAWD_PROTOCOL_SCHEME);
+    }
+    if (process.argv.includes(REGISTER_PROTOCOL_DEV_ARG) || process.env.CLAWD_REGISTER_PROTOCOL_DEV === "1") {
+      const appRoot = path.resolve(__dirname, "..");
+      return app.setAsDefaultProtocolClient(CLAWD_PROTOCOL_SCHEME, process.execPath, [appRoot]);
+    }
+  } catch (err) {
+    console.warn("Clawd: failed to register clawd:// protocol:", err && err.message);
+  }
+  return false;
+}
+async function _flushPendingCodexPetImportUrls() {
+  if (_codexPetImportFlushRunning) return;
+  _codexPetImportFlushRunning = true;
+  try {
+    while (_pendingCodexPetImportUrls.length > 0) {
+      const rawUrl = _pendingCodexPetImportUrls.shift();
+      await _handleCodexPetImportProtocolUrl(rawUrl);
+    }
+  } finally {
+    _codexPetImportFlushRunning = false;
+  }
+}
+function _getCodexPetImportDialogParent() {
+  if (settingsWindow && !settingsWindow.isDestroyed()) return settingsWindow;
+  if (win && !win.isDestroyed()) return win;
+  return null;
+}
+function _getCodexPetImportDialogStrings() {
+  const all = {
+    en: {
+      import: "Import",
+      cancel: "Cancel",
+      ok: "OK",
+      confirmMessage: (host) => `Import Codex Pet from ${host}?`,
+      confirmDetail: (url) => `Clawd will download, validate, and install this pet package before switching to it.\n\n${url}`,
+      replaceMessage: (name) => `Replace existing local pet "${name}"?`,
+      replaceDetail: "A Codex Pet package with the same id already exists locally and was not imported by Clawd. Replacing it will overwrite that local package.",
+      successMessage: (name) => `Imported "${name}"`,
+      successDetail: "The imported Codex Pet is now active.",
+      failedMessage: "Couldn't import Codex Pet",
+    },
+    zh: {
+      import: "导入",
+      cancel: "取消",
+      ok: "确定",
+      confirmMessage: (host) => `从 ${host} 导入 Codex Pet？`,
+      confirmDetail: (url) => `Clawd 会先下载、校验并安装这个宠物包，然后切换到它。\n\n${url}`,
+      replaceMessage: (name) => `替换已有本地宠物 "${name}"？`,
+      replaceDetail: "本地已经有同 id 的 Codex Pet 包，而且它不是由 Clawd 导入的。继续会覆盖这个本地包。",
+      successMessage: (name) => `已导入 "${name}"`,
+      successDetail: "导入的 Codex Pet 已设为当前主题。",
+      failedMessage: "导入 Codex Pet 失败",
+    },
+    ko: {
+      import: "가져오기",
+      cancel: "취소",
+      ok: "확인",
+      confirmMessage: (host) => `${host}에서 Codex Pet을 가져올까요?`,
+      confirmDetail: (url) => `Clawd가 이 펫 패키지를 다운로드, 검증, 설치한 뒤 전환합니다.\n\n${url}`,
+      replaceMessage: (name) => `기존 로컬 펫 "${name}"을(를) 교체할까요?`,
+      replaceDetail: "같은 id의 Codex Pet 패키지가 이미 로컬에 있으며 Clawd가 가져온 패키지가 아닙니다. 계속하면 해당 로컬 패키지를 덮어씁니다.",
+      successMessage: (name) => `"${name}"을(를) 가져왔습니다`,
+      successDetail: "가져온 Codex Pet이 활성 테마로 설정되었습니다.",
+      failedMessage: "Codex Pet을 가져오지 못했습니다",
+    },
+    ja: {
+      import: "インポート",
+      cancel: "キャンセル",
+      ok: "OK",
+      confirmMessage: (host) => `${host} から Codex Pet をインポートしますか？`,
+      confirmDetail: (url) => `Clawd はこのペットパッケージをダウンロード、検証、インストールしてから切り替えます。\n\n${url}`,
+      replaceMessage: (name) => `既存のローカルペット "${name}" を置き換えますか？`,
+      replaceDetail: "同じ id の Codex Pet パッケージがローカルにあり、Clawd がインポートしたものではありません。続行するとそのローカルパッケージを上書きします。",
+      successMessage: (name) => `"${name}" をインポートしました`,
+      successDetail: "インポートした Codex Pet を現在のテーマにしました。",
+      failedMessage: "Codex Pet をインポートできませんでした",
+    },
+  };
+  return all[lang] || all.en;
+}
+async function _showCodexPetImportError(message) {
+  const s = _getCodexPetImportDialogStrings();
+  try {
+    await dialog.showMessageBox(_getCodexPetImportDialogParent(), {
+      type: "error",
+      buttons: [s.ok],
+      message: s.failedMessage,
+      detail: message || "unknown error",
+      noLink: true,
+    });
+  } catch {}
+}
+async function _confirmReplaceExistingCodexPetPackage(payload) {
+  const s = _getCodexPetImportDialogStrings();
+  const existing = payload && payload.existingManifest;
+  const incoming = payload && payload.incomingManifest;
+  const displayName = (incoming && (incoming.displayName || incoming.id))
+    || (existing && (existing.displayName || existing.id))
+    || (payload && payload.packageName)
+    || "Codex Pet";
+  try {
+    const { response } = await dialog.showMessageBox(_getCodexPetImportDialogParent(), {
+      type: "warning",
+      buttons: [s.import, s.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      message: s.replaceMessage(displayName),
+      detail: s.replaceDetail,
+      noLink: true,
+    });
+    return response === 0;
+  } catch (err) {
+    console.warn("Clawd: Codex Pet replace confirmation failed:", err && err.message);
+    return false;
+  }
+}
+
+function _getCodexPetRemovalDialogStrings() {
+  const all = {
+    en: {
+      uninstall: "Uninstall",
+      cancel: "Cancel",
+      message: (name) => `Uninstall imported pet "${name}"?`,
+      detail: "Clawd will remove the source package from your Codex pets folder and clean up the generated theme. This cannot be undone.",
+    },
+    zh: {
+      uninstall: "卸载",
+      cancel: "取消",
+      message: (name) => `卸载导入宠物 "${name}"？`,
+      detail: "Clawd 会从 Codex pets 文件夹删除源包，并清理生成的主题。此操作不可撤销。",
+    },
+    ko: {
+      uninstall: "제거",
+      cancel: "취소",
+      message: (name) => `가져온 펫 "${name}"을(를) 제거할까요?`,
+      detail: "Clawd가 Codex pets 폴더의 원본 패키지를 제거하고 생성된 테마를 정리합니다. 이 작업은 되돌릴 수 없습니다.",
+    },
+    ja: {
+      uninstall: "アンインストール",
+      cancel: "キャンセル",
+      message: (name) => `インポート済みペット "${name}" をアンインストールしますか？`,
+      detail: "Clawd は Codex pets フォルダから元パッケージを削除し、生成されたテーマをクリーンアップします。この操作は元に戻せません。",
+    },
+  };
+  return all[lang] || all.en;
+}
+
+async function _confirmRemoveImportedCodexPetPackage(displayName) {
+  const s = _getCodexPetRemovalDialogStrings();
+  try {
+    const { response } = await dialog.showMessageBox(_getCodexPetImportDialogParent(), {
+      type: "warning",
+      buttons: [s.uninstall, s.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      message: s.message(displayName || "Codex Pet"),
+      detail: s.detail,
+      noLink: true,
+    });
+    return response === 0;
+  } catch (err) {
+    console.warn("Clawd: Codex Pet removal confirmation failed:", err && err.message);
+    return false;
+  }
+}
+
+async function _materializeAndActivateImportedCodexPet(imported) {
+  const activeId = activeTheme ? activeTheme._id : (_settingsController.get("theme") || "clawd");
+  const summary = _syncCodexPetThemesForMain(activeId);
+  if (summary.error) throw new Error(summary.error);
+  const generated = (summary.themes || []).find((theme) => _sameFsPath(theme.packageDir, imported.packageDir));
+  if (!generated || !generated.themeId) {
+    throw new Error("imported package did not materialize into a Clawd theme");
+  }
+  const result = await _settingsController.applyCommand("setThemeSelection", { themeId: generated.themeId });
+  if (!result || result.status !== "ok") {
+    throw new Error((result && result.message) || "failed to switch to imported theme");
+  }
+  try { rebuildAllMenus(); } catch {}
+  return { themeId: generated.themeId, summary };
+}
+async function _handleCodexPetImportProtocolUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = codexPetImporter.parseClawdImportUrl(rawUrl);
+  } catch (err) {
+    await _showCodexPetImportError(err && err.message);
+    return;
+  }
+
+  const s = _getCodexPetImportDialogStrings();
+  const parent = _getCodexPetImportDialogParent();
+  try {
+    const { response } = await dialog.showMessageBox(parent, {
+      type: "question",
+      buttons: [s.import, s.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      message: s.confirmMessage(parsed.asciiHostname),
+      detail: s.confirmDetail(parsed.url),
+      noLink: true,
+    });
+    if (response !== 0) return;
+  } catch (err) {
+    console.warn("Clawd: Codex Pet import confirmation failed:", err && err.message);
+    return;
+  }
+
+  try {
+    const imported = await codexPetImporter.importCodexPetFromUrl(parsed.url, {
+      confirmReplaceExistingPackage: _confirmReplaceExistingCodexPetPackage,
+    });
+    await _materializeAndActivateImportedCodexPet(imported);
+    await dialog.showMessageBox(parent, {
+      type: "info",
+      buttons: [s.ok],
+      message: s.successMessage(imported.packageInfo.displayName || imported.packageInfo.id),
+      detail: s.successDetail,
+      noLink: true,
+    });
+  } catch (err) {
+    if (err && err.code === codexPetImporter.ERR_REPLACE_DECLINED) return;
+    console.warn("Clawd: Codex Pet import failed:", err && err.message);
+    await _showCodexPetImportError(err && err.message);
+  }
+}
 
 // Lenient load so a missing/corrupt user-selected theme can't brick boot.
 // If lenient fell back to "clawd" OR the variant fell back to "default",
@@ -418,11 +875,36 @@ themeLoader.init(__dirname, app.getPath("userData"));
 // directly — not activateTheme (which requires ready windows) and not the
 // setThemeSelection command (which goes through activateTheme). The runtime
 // switch path via UI goes through setThemeSelection post-window-ready.
-const _requestedThemeId = _settingsController.get("theme") || "clawd";
+let _requestedThemeId = _settingsController.get("theme") || "clawd";
 const _initialVariantMap = _settingsController.get("themeVariant") || {};
-const _requestedVariantId = _initialVariantMap[_requestedThemeId] || "default";
+let _requestedVariantId = _initialVariantMap[_requestedThemeId] || "default";
 const _initialThemeOverrides = _settingsController.get("themeOverrides") || {};
-const _requestedThemeOverrides = _initialThemeOverrides[_requestedThemeId] || null;
+let _requestedThemeOverrides = _initialThemeOverrides[_requestedThemeId] || null;
+let _startupCodexPetSyncSummary = _syncCodexPetThemesForMain(_requestedThemeId);
+if (_summaryHasActiveCodexPetOrphan(_startupCodexPetSyncSummary, _requestedThemeId)) {
+  const orphanThemeId = _requestedThemeId;
+  const nextVariantMap = { ...(_settingsController.get("themeVariant") || {}) };
+  const nextOverrides = { ...(_settingsController.get("themeOverrides") || {}) };
+  delete nextVariantMap[orphanThemeId];
+  delete nextOverrides[orphanThemeId];
+
+  _requestedThemeId = "clawd";
+  _requestedVariantId = nextVariantMap[_requestedThemeId] || "default";
+  _requestedThemeOverrides = nextOverrides[_requestedThemeId] || null;
+  const result = _settingsController.hydrate({
+    theme: _requestedThemeId,
+    themeVariant: nextVariantMap,
+    themeOverrides: nextOverrides,
+  });
+  if (result && result.status === "error") {
+    console.warn("Clawd: Codex Pet active theme fallback hydrate failed:", result.message);
+  }
+  _startupCodexPetSyncSummary = _mergeCodexPetSyncSummaries(
+    _startupCodexPetSyncSummary,
+    _syncCodexPetThemesForMain(_requestedThemeId)
+  );
+  _lastCodexPetSyncSummary = _startupCodexPetSyncSummary;
+}
 let activeTheme = themeLoader.loadTheme(_requestedThemeId, {
   variant: _requestedVariantId,
   overrides: _requestedThemeOverrides,
@@ -451,6 +933,13 @@ function getObjRect(bounds) {
   const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
   return hitGeometry.getAssetRectScreen(activeTheme, bounds, state, file)
     || { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
+}
+
+function getAssetPointerPayload(bounds, point) {
+  if (!bounds || !point || !activeTheme) return null;
+  const state = _state.getCurrentState();
+  const file = _state.getCurrentSvg() || (activeTheme && activeTheme.states && activeTheme.states.idle[0]);
+  return hitGeometry.getAssetPointerPayload(activeTheme, bounds, state, file, point);
 }
 
 let win;
@@ -520,6 +1009,8 @@ let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
 let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
+let sessionHudShowElapsed = _settingsController.get("sessionHudShowElapsed");
+let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
 let soundMuted = _settingsController.get("soundMuted");
 let soundVolume = _settingsController.get("soundVolume");
 let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
@@ -1059,6 +1550,7 @@ const _stateCtx = {
     const entry = (stateMap && stateMap[stateKey]) || (themeMap && themeMap[stateKey]);
     return !!(entry && entry.disabled === true);
   },
+  get sessionHudCleanupDetached() { return sessionHudCleanupDetached; },
   getSessionAliases: () => _settingsController.get("sessionAliases"),
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
@@ -1123,6 +1615,13 @@ function getUpdateBubbleAnchorRect(bounds) {
   return getHitRectScreen(bounds);
 }
 
+function getSessionHudAnchorRect(bounds) {
+  if (!bounds || !activeTheme) return null;
+  const box = getThemeMarginBox(activeTheme);
+  if (!box) return null;
+  return computeThemeAnchorRect(activeTheme, bounds, { box });
+}
+
 function getVisibleContentMargins(bounds) {
   if (!bounds || !activeTheme) return { top: 0, bottom: 0 };
   const box = getThemeMarginBox(activeTheme);
@@ -1174,6 +1673,7 @@ const _tickCtx = {
   miniPeekOut: () => miniPeekOut(),
   getObjRect,
   getHitRectScreen,
+  getAssetPointerPayload,
 };
 const _tick = require("./tick")(_tickCtx);
 requestFastTick = (maxDelay) => _tick.scheduleSoon(maxDelay);
@@ -1189,6 +1689,16 @@ function focusDashboardSession(sessionId) {
   if (session && session.sourcePid) {
     focusTerminalWindow(session.sourcePid, session.cwd, session.editor, session.pidChain);
   }
+}
+
+function hideDashboardSession(sessionId) {
+  if (!_state || typeof _state.dismissSession !== "function") {
+    return { status: "error", message: "session state is not ready" };
+  }
+  const removed = _state.dismissSession(String(sessionId || ""));
+  return removed
+    ? { status: "ok" }
+    : { status: "not-found" };
 }
 
 const _dashboard = require("./dashboard")({
@@ -1208,12 +1718,14 @@ const _sessionHud = require("./session-hud")({
   get win() { return win; },
   get petHidden() { return petHidden; },
   get sessionHudEnabled() { return sessionHudEnabled; },
+  get sessionHudShowElapsed() { return sessionHudShowElapsed; },
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
   getSessionSnapshot: () => _state.buildSessionSnapshot(),
   getI18n: () => getDashboardI18nPayload(),
   getPetWindowBounds,
   getHitRectScreen,
+  getSessionHudAnchorRect,
   getNearestWorkArea,
   guardAlwaysOnTop,
   reapplyMacVisibility,
@@ -1241,6 +1753,7 @@ const _serverCtx = {
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   isCodexPermissionInterceptEnabled: () => _isCodexPermissionInterceptEnabled({ agents: _settingsController.get("agents") }),
+  codexSubagentClassifier: _codexSubagentClassifier,
   setState,
   updateSession: updateSessionFromServer,
   resolvePermissionEntry,
@@ -1502,6 +2015,8 @@ function wireSettingsSubscribers() {
     }
     if ("bubbleFollowPet" in changes) bubbleFollowPet = changes.bubbleFollowPet;
     if ("sessionHudEnabled" in changes) sessionHudEnabled = changes.sessionHudEnabled;
+    if ("sessionHudShowElapsed" in changes) sessionHudShowElapsed = changes.sessionHudShowElapsed;
+    if ("sessionHudCleanupDetached" in changes) sessionHudCleanupDetached = changes.sessionHudCleanupDetached;
     if ("soundMuted" in changes) soundMuted = changes.soundMuted;
     if ("soundVolume" in changes) soundVolume = changes.soundVolume;
     if ("lowPowerIdleMode" in changes) {
@@ -1590,12 +2105,26 @@ function wireSettingsSubscribers() {
         console.warn("Clawd: repositionFloatingBubbles failed:", err && err.message);
       }
     }
-    if ("sessionHudEnabled" in changes) {
+    if ("sessionHudEnabled" in changes || "sessionHudShowElapsed" in changes) {
       try {
         syncSessionHudVisibility();
         repositionFloatingBubbles();
       } catch (err) {
         console.warn("Clawd: session HUD setting sync failed:", err && err.message);
+      }
+    }
+    if ("sessionHudCleanupDetached" in changes && changes.sessionHudCleanupDetached === true) {
+      try {
+        _state.cleanStaleSessions();
+        _state.emitSessionSnapshot({ force: true });
+      } catch (err) {
+        console.warn("Clawd: detached session cleanup sweep failed:", err && err.message);
+      }
+    } else if ("sessionHudCleanupDetached" in changes) {
+      try {
+        _state.emitSessionSnapshot({ force: true });
+      } catch (err) {
+        console.warn("Clawd: detached session cleanup snapshot refresh failed:", err && err.message);
       }
     }
     if ("allowEdgePinning" in changes) {
@@ -1652,7 +2181,17 @@ _settingsController.subscribeKey("shortcuts", (_value, snapshot) => {
 });
 
 const ANIMATION_OVERRIDE_ASSET_EXTS = new Set([".svg", ".gif", ".apng", ".png", ".webp", ".jpg", ".jpeg"]);
+const ANIMATION_OVERRIDE_PREVIEW_POSTER_SIZE = { width: 176, height: 144 };
+const ANIMATION_OVERRIDE_PREVIEW_POSTER_VERSION = 2;
+const ANIMATION_OVERRIDE_PREVIEW_POSTER_CACHE_MAX = 192;
+const ANIMATION_OVERRIDE_PREVIEW_POSTER_TIMEOUT_MS = 30000;
 let animationOverridePreviewTimer = null;
+let animationOverridePreviewPosterWindow = null;
+let animationOverridePreviewPosterReady = null;
+let animationOverridePreviewPosterQueue = Promise.resolve();
+const animationOverridePreviewPosterCache = new Map();
+const animationOverridePreviewPosterPendingKeys = new Set();
+let animationOverridePreviewPosterGenerationId = 0;
 // Tasks queued while activateTheme()'s reload is in progress. Anything that
 // needs to talk to the renderer after a fresh theme load (e.g. the preview
 // animation triggered right after a setAnimationOverride) lands here and fires
@@ -1671,10 +2210,12 @@ function _buildFileUrl(absPath) {
   catch { return null; }
 }
 
-function _resolveAnimationAssetAbsPath(filename) {
-  if (!filename || !activeTheme) return null;
+function _resolveAnimationAssetAbsPath(filename, theme = activeTheme) {
+  if (!filename || !theme) return null;
   try {
-    const absPath = themeLoader.getAssetPath(filename);
+    const absPath = typeof themeLoader._resolveAssetPath === "function"
+      ? themeLoader._resolveAssetPath(theme, filename)
+      : themeLoader.getAssetPath(filename);
     return absPath && fs.existsSync(absPath) ? absPath : null;
   } catch {
     return null;
@@ -1766,13 +2307,319 @@ function _resolveOpenableFsPath(absPath) {
   return fs.existsSync(unpackedPath) ? unpackedPath : absPath;
 }
 
-function _buildAnimationAssetUrl(filename) {
-  const absPath = _resolveAnimationAssetAbsPath(filename);
+function _buildAnimationAssetUrl(filename, theme = activeTheme) {
+  const absPath = _resolveAnimationAssetAbsPath(filename, theme);
   return absPath ? _buildFileUrl(absPath) : null;
 }
 
-function _buildAnimationAssetProbe(file) {
-  const absPath = _resolveAnimationAssetAbsPath(file);
+function _isTrustedScriptedAnimationFile(filename, theme = activeTheme) {
+  if (!filename || !theme || !theme._builtin || !theme.trustedRuntime) return false;
+  const scriptedFiles = Array.isArray(theme.trustedRuntime.scriptedSvgFiles)
+    ? theme.trustedRuntime.scriptedSvgFiles
+    : [];
+  const base = path.basename(filename);
+  return scriptedFiles.includes(base);
+}
+
+function _isObjectChannelSvgAnimationFile(filename, theme = activeTheme) {
+  return !!(
+    filename
+    && theme
+    && theme.rendering
+    && theme.rendering.svgChannel === "object"
+    && path.extname(filename).toLowerCase() === ".svg"
+  );
+}
+
+function _needsScriptedAnimationPreviewPoster(filename, theme = activeTheme) {
+  return _isTrustedScriptedAnimationFile(filename, theme)
+    || _isObjectChannelSvgAnimationFile(filename, theme);
+}
+
+function _getTrustedScriptedAnimationCycleMs(filename, theme = activeTheme) {
+  if (!_isTrustedScriptedAnimationFile(filename, theme)) return null;
+  const cycleMap = theme && theme.trustedRuntime && theme.trustedRuntime.scriptedSvgCycleMs;
+  const ms = cycleMap && cycleMap[path.basename(filename)];
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+function _rememberAnimationPreviewPosterCache(cacheKey, dataUrl) {
+  if (!cacheKey || !dataUrl) return;
+  if (animationOverridePreviewPosterCache.has(cacheKey)) {
+    animationOverridePreviewPosterCache.delete(cacheKey);
+  }
+  animationOverridePreviewPosterCache.set(cacheKey, dataUrl);
+  while (animationOverridePreviewPosterCache.size > ANIMATION_OVERRIDE_PREVIEW_POSTER_CACHE_MAX) {
+    const oldestKey = animationOverridePreviewPosterCache.keys().next().value;
+    if (!oldestKey) break;
+    animationOverridePreviewPosterCache.delete(oldestKey);
+  }
+}
+
+function _readAnimationPreviewPosterCache(cacheKey) {
+  if (!cacheKey || !animationOverridePreviewPosterCache.has(cacheKey)) return null;
+  const dataUrl = animationOverridePreviewPosterCache.get(cacheKey);
+  animationOverridePreviewPosterCache.delete(cacheKey);
+  animationOverridePreviewPosterCache.set(cacheKey, dataUrl);
+  return dataUrl;
+}
+
+function _buildAnimationPreviewPosterDescriptor(filename, theme, absPath) {
+  if (!filename || !theme || !absPath) return null;
+  try {
+    const stat = fs.statSync(absPath);
+    const themeId = theme && theme._id ? theme._id : "theme";
+    const safeFilename = path.basename(filename);
+    return {
+      themeId,
+      filename: safeFilename,
+      absPath,
+      fileUrl: _buildFileUrl(absPath),
+      posterVersion: ANIMATION_OVERRIDE_PREVIEW_POSTER_VERSION,
+      size: stat.size,
+      mtime: Math.round(stat.mtimeMs),
+      cacheKey: `${ANIMATION_OVERRIDE_PREVIEW_POSTER_VERSION}|${themeId}|${safeFilename}|${stat.size}|${Math.round(stat.mtimeMs)}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function _buildAnimationAssetPreview(filename, theme = activeTheme, resolvedAbsPath = null) {
+  const absPath = resolvedAbsPath || _resolveAnimationAssetAbsPath(filename, theme);
+  const fileUrl = absPath ? _buildFileUrl(absPath) : null;
+  const needsPoster = _needsScriptedAnimationPreviewPoster(filename, theme);
+  if (!needsPoster) {
+    return {
+      fileUrl,
+      previewImageUrl: fileUrl,
+      needsScriptedPreviewPoster: false,
+      previewPosterCacheKey: null,
+      previewPosterPending: false,
+    };
+  }
+
+  const descriptor = _buildAnimationPreviewPosterDescriptor(filename, theme, absPath);
+  const cachedPoster = descriptor ? _readAnimationPreviewPosterCache(descriptor.cacheKey) : null;
+  return {
+    fileUrl,
+    previewImageUrl: cachedPoster,
+    needsScriptedPreviewPoster: true,
+    previewPosterCacheKey: descriptor ? descriptor.cacheKey : null,
+    previewPosterPending: !!(descriptor && !cachedPoster),
+  };
+}
+
+function _animationPreviewDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function _getAnimationPreviewPosterWindow() {
+  if (animationOverridePreviewPosterWindow && !animationOverridePreviewPosterWindow.isDestroyed()) {
+    return animationOverridePreviewPosterWindow;
+  }
+  animationOverridePreviewPosterReady = null;
+  animationOverridePreviewPosterWindow = new BrowserWindow({
+    width: ANIMATION_OVERRIDE_PREVIEW_POSTER_SIZE.width,
+    height: ANIMATION_OVERRIDE_PREVIEW_POSTER_SIZE.height,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    skipTaskbar: true,
+    webPreferences: {
+      offscreen: true,
+      backgroundThrottling: false,
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
+  animationOverridePreviewPosterWindow.on("closed", () => {
+    animationOverridePreviewPosterWindow = null;
+    animationOverridePreviewPosterReady = null;
+  });
+  return animationOverridePreviewPosterWindow;
+}
+
+async function _ensureAnimationPreviewPosterPage() {
+  const posterWindow = _getAnimationPreviewPosterWindow();
+  if (!animationOverridePreviewPosterReady) {
+    animationOverridePreviewPosterReady = posterWindow.loadFile(path.join(__dirname, "settings-animation-preview.html"))
+      .catch((err) => {
+        animationOverridePreviewPosterReady = null;
+        throw err;
+      });
+  }
+  await animationOverridePreviewPosterReady;
+  return posterWindow;
+}
+
+function _withAnimationPreviewPosterTimeout(promise) {
+  let timer = null;
+  return new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error("animation preview poster capture timed out");
+      err.code = "ANIMATION_PREVIEW_POSTER_TIMEOUT";
+      reject(err);
+    }, ANIMATION_OVERRIDE_PREVIEW_POSTER_TIMEOUT_MS);
+    Promise.resolve(promise).then(resolve, reject);
+  }).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function _destroyAnimationPreviewPosterWindow() {
+  if (animationOverridePreviewPosterWindow && !animationOverridePreviewPosterWindow.isDestroyed()) {
+    animationOverridePreviewPosterWindow.destroy();
+  }
+  animationOverridePreviewPosterWindow = null;
+  animationOverridePreviewPosterReady = null;
+}
+
+async function _captureAnimationPreviewPosterDataUrl(fileUrl) {
+  if (!fileUrl) return null;
+  const capture = async () => {
+    const posterWindow = await _ensureAnimationPreviewPosterPage();
+    if (!posterWindow || posterWindow.isDestroyed()) return null;
+    const webContents = posterWindow.webContents;
+    if (!webContents || webContents.isDestroyed()) return null;
+    await webContents.executeJavaScript(`window.renderAnimationPreviewPoster(${JSON.stringify(fileUrl)})`, true);
+    await _animationPreviewDelay(20);
+    const image = await webContents.capturePage({
+      x: 0,
+      y: 0,
+      width: ANIMATION_OVERRIDE_PREVIEW_POSTER_SIZE.width,
+      height: ANIMATION_OVERRIDE_PREVIEW_POSTER_SIZE.height,
+    });
+    return image && typeof image.toDataURL === "function" ? image.toDataURL() : null;
+  };
+
+  try {
+    return await _withAnimationPreviewPosterTimeout(capture());
+  } catch (err) {
+    if (err && err.code === "ANIMATION_PREVIEW_POSTER_TIMEOUT") {
+      _destroyAnimationPreviewPosterWindow();
+    }
+    throw err;
+  }
+}
+
+function _getLiveSettingsWebContents() {
+  if (
+    !settingsWindow
+    || settingsWindow.isDestroyed()
+    || !settingsWindow.webContents
+    || settingsWindow.webContents.isDestroyed()
+  ) {
+    return null;
+  }
+  return settingsWindow.webContents;
+}
+
+function _bumpAnimationPreviewPosterGeneration() {
+  animationOverridePreviewPosterGenerationId += 1;
+  return animationOverridePreviewPosterGenerationId;
+}
+
+function _maybeDestroyIdleAnimationPreviewPosterWindow() {
+  if (animationOverridePreviewPosterPendingKeys.size > 0) return;
+  if (_getLiveSettingsWebContents()) return;
+  _destroyAnimationPreviewPosterWindow();
+}
+
+function _sendAnimationPreviewPosterReady(job, previewImageUrl) {
+  if (!job || !previewImageUrl) return;
+  const webContents = _getLiveSettingsWebContents();
+  if (!webContents) return;
+  webContents.send("settings:animation-preview-poster-ready", {
+    themeId: job.themeId,
+    filename: job.filename,
+    previewImageUrl,
+    previewPosterCacheKey: job.previewPosterCacheKey,
+  });
+}
+
+async function _runAnimationPreviewPosterJob(job) {
+  try {
+    if (!job || !job.previewPosterCacheKey || !job.fileUrl) return;
+    if (job.generationId !== animationOverridePreviewPosterGenerationId) return;
+    if (!_getLiveSettingsWebContents()) return;
+
+    // Current in-memory scheduling usually prevents this from hitting, but it
+    // keeps queued jobs cheap if a later cache layer fills the key first.
+    const cached = _readAnimationPreviewPosterCache(job.previewPosterCacheKey);
+    if (cached) {
+      _sendAnimationPreviewPosterReady(job, cached);
+      return;
+    }
+
+    const previewImageUrl = await _captureAnimationPreviewPosterDataUrl(job.fileUrl);
+    if (!previewImageUrl) return;
+    _rememberAnimationPreviewPosterCache(job.previewPosterCacheKey, previewImageUrl);
+    _sendAnimationPreviewPosterReady(job, previewImageUrl);
+  } catch (err) {
+    const message = err && err.message;
+    if (err && err.code === "ANIMATION_PREVIEW_POSTER_TIMEOUT") {
+      console.warn("Clawd: animation preview poster capture timed out:", message);
+    } else {
+      console.warn("Clawd: failed to capture animation preview poster:", message);
+    }
+  } finally {
+    if (job && job.previewPosterCacheKey) {
+      animationOverridePreviewPosterPendingKeys.delete(job.previewPosterCacheKey);
+    }
+    _maybeDestroyIdleAnimationPreviewPosterWindow();
+  }
+}
+
+function _enqueueAnimationPreviewPosterJob(job) {
+  if (!job || !job.previewPosterCacheKey || !job.fileUrl) return;
+  if (animationOverridePreviewPosterCache.has(job.previewPosterCacheKey)) return;
+  if (animationOverridePreviewPosterPendingKeys.has(job.previewPosterCacheKey)) return;
+  animationOverridePreviewPosterPendingKeys.add(job.previewPosterCacheKey);
+  const run = () => _runAnimationPreviewPosterJob(job);
+  animationOverridePreviewPosterQueue = animationOverridePreviewPosterQueue.then(run, run);
+}
+
+function _scheduleAnimationPreviewPosters(data) {
+  const webContents = _getLiveSettingsWebContents();
+  if (!webContents || !data || !data.theme || !data.theme.id) return;
+  const themeId = data.theme.id;
+  const generationId = animationOverridePreviewPosterGenerationId;
+  const enqueue = (filename, fileUrl, previewPosterCacheKey, previewPosterPending) => {
+    if (previewPosterPending !== true) return;
+    if (!filename || !fileUrl || !previewPosterCacheKey) return;
+    _enqueueAnimationPreviewPosterJob({
+      themeId,
+      filename: path.basename(filename),
+      fileUrl,
+      previewPosterCacheKey,
+      generationId,
+    });
+  };
+  for (const asset of data.assets || []) {
+    enqueue(asset && asset.name, asset && asset.fileUrl, asset && asset.previewPosterCacheKey, asset && asset.previewPosterPending);
+  }
+  for (const card of data.cards || []) {
+    enqueue(
+      card && card.currentFile,
+      card && card.currentFileUrl,
+      card && card.currentFilePreviewPosterCacheKey,
+      card && card.previewPosterPending
+    );
+  }
+}
+
+function _buildAnimationAssetProbe(file, theme = activeTheme, resolvedAbsPath = null) {
+  const trustedCycleMs = _getTrustedScriptedAnimationCycleMs(file, theme);
+  if (trustedCycleMs != null) {
+    return {
+      assetCycleMs: trustedCycleMs,
+      assetCycleStatus: "exact",
+      assetCycleSource: "trusted-runtime",
+    };
+  }
+  const absPath = resolvedAbsPath || _resolveAnimationAssetAbsPath(file, theme);
   if (!absPath) {
     return {
       assetCycleMs: null,
@@ -1835,16 +2682,20 @@ function _listAnimationOverrideAssets(theme = activeTheme) {
       const ext = path.extname(entry.name).toLowerCase();
       if (!ANIMATION_OVERRIDE_ASSET_EXTS.has(ext)) continue;
       if (seen.has(entry.name)) continue;
-      const absPath = _resolveAnimationAssetAbsPath(entry.name) || path.join(dir, entry.name);
-      const previewUrl = _buildFileUrl(absPath);
-      const probe = animationCycle.probeAssetCycle(absPath);
+      const absPath = _resolveAnimationAssetAbsPath(entry.name, theme) || path.join(dir, entry.name);
+      const preview = _buildAnimationAssetPreview(entry.name, theme, absPath);
+      const probe = _buildAnimationAssetProbe(entry.name, theme, absPath);
       assets.push({
         name: entry.name,
-        fileUrl: previewUrl,
+        fileUrl: preview.fileUrl,
+        previewImageUrl: preview.previewImageUrl,
+        needsScriptedPreviewPoster: preview.needsScriptedPreviewPoster,
+        previewPosterCacheKey: preview.previewPosterCacheKey,
+        previewPosterPending: preview.previewPosterPending,
         ext,
-        cycleMs: Number.isFinite(probe && probe.ms) && probe.ms > 0 ? probe.ms : null,
-        cycleStatus: (probe && probe.status) || "unavailable",
-        cycleSource: (probe && probe.source) || null,
+        cycleMs: Number.isFinite(probe && probe.assetCycleMs) && probe.assetCycleMs > 0 ? probe.assetCycleMs : null,
+        cycleStatus: (probe && probe.assetCycleStatus) || "unavailable",
+        cycleSource: (probe && probe.assetCycleSource) || null,
       });
       seen.add(entry.name);
     }
@@ -1882,6 +2733,7 @@ function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, b
     const maxSessions = higherTier ? Math.max(tier.minSessions, higherTier.minSessions - 1) : null;
     const hintTarget = baseHintMap && baseHintMap[originalFile];
     const timingHint = _buildTimingHint(tier.file);
+    const preview = _buildAnimationAssetPreview(tier.file);
     return {
       id: `${tierGroup}:${originalFile}`,
       slotType: "tier",
@@ -1893,7 +2745,11 @@ function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, b
       minSessions: tier.minSessions,
       maxSessions,
       currentFile: tier.file,
-      currentFileUrl: _buildAnimationAssetUrl(tier.file),
+      currentFileUrl: preview.fileUrl,
+      currentFilePreviewUrl: preview.previewImageUrl,
+      needsScriptedPreviewPoster: preview.needsScriptedPreviewPoster,
+      currentFilePreviewPosterCacheKey: preview.previewPosterCacheKey,
+      previewPosterPending: preview.previewPosterPending,
       bindingLabel: `${tierGroup}[${originalFile}]`,
       transition: _readResolvedTransition(tier.file),
       supportsAutoReturn: false,
@@ -1953,6 +2809,7 @@ function _buildStateCard(stateKey, triggerKind, themeOverrideMap, options = {}) 
   const resolvedAutoReturnMs = supportsAutoReturn ? autoReturnMap[stateKey] : null;
   const timingHint = _buildTimingHint(currentFile, resolvedAutoReturnMs);
   const fallbackTargetState = resolved.fallbackTargetState;
+  const preview = _buildAnimationAssetPreview(currentFile);
   const bindingMap = options.bindingMap || (
     options.bindingPathPrefix === "miniMode.states"
       ? ((activeTheme._bindingBase && activeTheme._bindingBase.miniStates) || {})
@@ -1969,7 +2826,11 @@ function _buildStateCard(stateKey, triggerKind, themeOverrideMap, options = {}) 
     resolvedState: resolved.resolvedState,
     fallbackTargetState,
     baseFile: bindingMap[stateKey] || currentFile,
-    currentFileUrl: _buildAnimationAssetUrl(currentFile),
+    currentFileUrl: preview.fileUrl,
+    currentFilePreviewUrl: preview.previewImageUrl,
+    needsScriptedPreviewPoster: preview.needsScriptedPreviewPoster,
+    currentFilePreviewPosterCacheKey: preview.previewPosterCacheKey,
+    previewPosterPending: preview.previewPosterPending,
     bindingLabel: fallbackTargetState
       ? `${bindingPathPrefix}.${stateKey}.fallbackTo -> ${fallbackTargetState}`
       : `${bindingPathPrefix}.${stateKey}[0]`,
@@ -1996,6 +2857,7 @@ function _buildIdleAnimationCards(themeOverrideMap) {
       const originalFile = (baseEntry && baseEntry.originalFile) || entry.file;
       const durationMs = Number.isFinite(entry.duration) ? entry.duration : null;
       const timingHint = _buildTimingHint(entry.file, durationMs);
+      const preview = _buildAnimationAssetPreview(entry.file);
       const hasDurationOverride = !!(overrideMap
         && overrideMap[originalFile]
         && Object.prototype.hasOwnProperty.call(overrideMap[originalFile], "durationMs"));
@@ -2008,7 +2870,11 @@ function _buildIdleAnimationCards(themeOverrideMap) {
         originalFile,
         baseFile: originalFile,
         currentFile: entry.file,
-        currentFileUrl: _buildAnimationAssetUrl(entry.file),
+        currentFileUrl: preview.fileUrl,
+        currentFilePreviewUrl: preview.previewImageUrl,
+        needsScriptedPreviewPoster: preview.needsScriptedPreviewPoster,
+        currentFilePreviewPosterCacheKey: preview.previewPosterCacheKey,
+        previewPosterPending: preview.previewPosterPending,
         bindingLabel: `idleAnimations[${index}] (${originalFile})`,
         transition: _readResolvedTransition(entry.file),
         supportsAutoReturn: false,
@@ -2052,6 +2918,7 @@ function _buildReactionCards(themeOverrideMap) {
       ? reactionEntry.duration
       : null;
     const timingHint = _buildTimingHint(currentFile, durationMs);
+    const preview = _buildAnimationAssetPreview(currentFile);
     const overrideEntry = overrideMap && overrideMap[spec.key];
     const hasDurationOverride = !!(overrideEntry
       && Object.prototype.hasOwnProperty.call(overrideEntry, "durationMs"));
@@ -2063,7 +2930,11 @@ function _buildReactionCards(themeOverrideMap) {
       triggerKind: spec.triggerKind,
       currentFile,
       baseFile: currentFile,
-      currentFileUrl: _buildAnimationAssetUrl(currentFile),
+      currentFileUrl: preview.fileUrl,
+      currentFilePreviewUrl: preview.previewImageUrl,
+      needsScriptedPreviewPoster: preview.needsScriptedPreviewPoster,
+      currentFilePreviewPosterCacheKey: preview.previewPosterCacheKey,
+      previewPosterPending: preview.previewPosterPending,
       bindingLabel: `reactions.${spec.key}`,
       transition: _readResolvedTransition(currentFile),
       supportsAutoReturn: false,
@@ -2264,7 +3135,7 @@ function _buildAnimationOverrideData() {
   if (!activeTheme) return null;
   const meta = themeLoader.getThemeMetadata(activeTheme._id) || {};
   const sections = _buildAnimationOverrideSections();
-  return {
+  const data = {
     theme: {
       id: activeTheme._id,
       name: meta.name || activeTheme._id,
@@ -2277,6 +3148,8 @@ function _buildAnimationOverrideData() {
     cards: sections.flatMap((section) => section.cards || []),
     sounds: _buildSoundOverrideSlots(),
   };
+  _scheduleAnimationPreviewPosters(data);
+  return data;
 }
 
 function _previewAnimationOverride(payload) {
@@ -2306,15 +3179,19 @@ function _previewAnimationOverride(payload) {
   return _runAnimationOverridePreview(stateKey, file, durationMs);
 }
 
-// Preview is a quick peek at the asset, not a full-length playback. Hard clamp
+// Preview is a quick peek at the asset, not an unbounded playback. Hard clamp
 // the hold duration:
 //   · some assets have extremely long cycleMs (a SMIL animation with dur="60s"
 //     or an indefinite loop that the cycle probe estimates high) — without a
 //     ceiling the pet would be stuck on the preview SVG for that full duration
+//   · trusted scripted SVGs can publish an explicit cycle in theme metadata;
+//     those need enough room to show a complete Cloudling cycle while still
+//     staying bounded
 //   · the floor prevents sub-flash previews that finish before the renderer
 //     has even painted the new SVG
 const PREVIEW_HOLD_MIN_MS = 800;
 const PREVIEW_HOLD_MAX_MS = 3500;
+const TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS = 15000;
 
 function _runAnimationOverridePreview(stateKey, file, durationMs) {
   if (animationOverridePreviewTimer) {
@@ -2326,17 +3203,21 @@ function _runAnimationOverridePreview(stateKey, file, durationMs) {
   } catch (err) {
     return { status: "error", message: `previewAnimationOverride: ${err && err.message}` };
   }
+  const trustedScriptedCycleMs = _getTrustedScriptedAnimationCycleMs(file);
+  const previewMaxMs = _isTrustedScriptedAnimationFile(file)
+    ? TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS
+    : PREVIEW_HOLD_MAX_MS;
   const requested = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0)
     ? durationMs
-    : PREVIEW_HOLD_MIN_MS;
-  const holdMs = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(PREVIEW_HOLD_MAX_MS, requested));
+    : (trustedScriptedCycleMs != null ? trustedScriptedCycleMs : PREVIEW_HOLD_MIN_MS);
+  const holdMs = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(previewMaxMs, requested));
   animationOverridePreviewTimer = setTimeout(() => {
     animationOverridePreviewTimer = null;
     try {
       // Unconditionally release back to idle at the end of the preview. Rationale:
       //   · continuous states (working/thinking/juggling) would otherwise stay
       //     latched on the preview SVG until the live session stales out (5 min)
-      //   · oneshot states have their own autoReturn, but clamping to 3.5s means
+      //   · oneshot states have their own autoReturn, but clamping preview duration means
       //     we'll usually beat it — forcing idle here keeps the exit consistent
       //   · if a hook event fires mid-preview and a live session is still active,
       //     the next event will re-upgrade state naturally — a brief idle flash
@@ -2353,6 +3234,7 @@ function _runAnimationOverridePreview(stateKey, file, durationMs) {
 ipcMain.handle("dashboard:get-snapshot", () => _state.buildSessionSnapshot());
 ipcMain.handle("dashboard:get-i18n", () => getDashboardI18nPayload());
 ipcMain.on("dashboard:focus-session", (_event, sessionId) => focusDashboardSession(sessionId));
+ipcMain.handle("dashboard:hide-session", (_event, sessionId) => hideDashboardSession(sessionId));
 ipcMain.handle("dashboard:set-session-alias", async (_event, payload) => {
   return _settingsController.applyCommand("setSessionAlias", payload);
 });
@@ -2710,13 +3592,125 @@ ipcMain.handle("settings:import-animation-overrides", async (event) => {
 ipcMain.handle("settings:list-themes", () => {
   try {
     const activeId = activeTheme ? activeTheme._id : "clawd";
-    return themeLoader.listThemesWithMetadata().map((t) => ({
-      ...t,
-      active: t.id === activeId,
-    }));
+    return themeLoader.listThemesWithMetadata().map((t) =>
+      _decorateCodexPetThemeMetadata({
+        ...t,
+        active: t.id === activeId,
+      })
+    );
   } catch (err) {
     console.warn("Clawd: settings:list-themes failed:", err && err.message);
     return [];
+  }
+});
+
+ipcMain.handle("settings:refresh-codex-pets", () => _refreshCodexPetThemesFromSettings());
+
+ipcMain.handle("settings:open-codex-pets-dir", async () => {
+  try {
+    const dir = codexPetImporter.getDefaultCodexPetsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const message = await shell.openPath(dir);
+    if (message) return { status: "error", message };
+    return { status: "ok", path: dir };
+  } catch (err) {
+    console.warn("Clawd: settings:open-codex-pets-dir failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || String(err) };
+  }
+});
+
+ipcMain.handle("settings:import-codex-pet-zip", async (event) => {
+  const parent = BrowserWindow.fromWebContents(event.sender) || settingsWindow || null;
+  let picked;
+  try {
+    picked = await dialog.showOpenDialog(parent, {
+      properties: ["openFile"],
+      filters: [
+        { name: "Codex Pet zip", extensions: ["zip"] },
+      ],
+    });
+  } catch (err) {
+    console.warn("Clawd: Codex Pet zip picker failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || String(err) };
+  }
+  if (!picked || picked.canceled || !Array.isArray(picked.filePaths) || !picked.filePaths[0]) {
+    return { status: "cancel" };
+  }
+
+  try {
+    const zipPath = picked.filePaths[0];
+    const stat = await fs.promises.stat(zipPath);
+    if (stat.size > codexPetImporter.MAX_ZIP_BYTES) {
+      throw new Error(`zip package exceeds ${codexPetImporter.MAX_ZIP_BYTES} bytes`);
+    }
+    const imported = await codexPetImporter.importCodexPetFromZipBuffer(await fs.promises.readFile(zipPath), {
+      confirmReplaceExistingPackage: _confirmReplaceExistingCodexPetPackage,
+    });
+    const activated = await _materializeAndActivateImportedCodexPet(imported);
+    return {
+      status: "ok",
+      themeId: activated.themeId,
+      summary: activated.summary,
+      imported: {
+        id: imported.packageInfo.id,
+        displayName: imported.packageInfo.displayName,
+      },
+    };
+  } catch (err) {
+    if (err && err.code === codexPetImporter.ERR_REPLACE_DECLINED) return { status: "cancel" };
+    console.warn("Clawd: Codex Pet zip import failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || String(err) };
+  }
+});
+
+ipcMain.handle("settings:remove-codex-pet", async (_event, themeId) => {
+  if (typeof themeId !== "string" || !themeId) return { status: "error", message: "themeId is required" };
+  const target = _resolveCodexPetRemovalTarget(themeId);
+  if (!target || target.status !== "ok") {
+    return { status: "error", message: (target && target.message) || "could not resolve imported pet" };
+  }
+
+  const meta = themeLoader.getThemeMetadata(themeId) || {};
+  const displayName = typeof meta.name === "string" && meta.name
+    ? meta.name
+    : (target.marker.sourcePetId || themeId);
+
+  try {
+    if (target.exists) {
+      const stat = await fs.promises.lstat(target.packageDir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error("managed Codex Pet source is not a plain directory");
+      }
+      try {
+        await fs.promises.access(path.join(target.packageDir, "pet.json"), fs.constants.F_OK);
+      } catch {
+        throw new Error("managed Codex Pet source no longer contains pet.json; refresh imported pets instead");
+      }
+      const confirmed = await _confirmRemoveImportedCodexPetPackage(displayName);
+      if (!confirmed) return { status: "cancel" };
+      await fs.promises.rm(target.packageDir, { recursive: true, force: true });
+    }
+
+    const refresh = await _refreshCodexPetThemesFromSettings();
+    if (!refresh || refresh.status !== "ok") {
+      return {
+        status: "error",
+        message: (refresh && refresh.message) || "removed package but failed to refresh imported pets",
+        summary: refresh && refresh.summary,
+      };
+    }
+    return {
+      status: "ok",
+      removed: {
+        id: target.marker.sourcePetId || "",
+        displayName,
+      },
+      summary: refresh.summary,
+      switchedToFallback: !!refresh.switchedToFallback,
+    };
+  } catch (err) {
+    console.warn("Clawd: Codex Pet removal failed:", err && err.message);
+    return { status: "error", message: (err && err.message) || String(err) };
   }
 });
 
@@ -2804,10 +3798,9 @@ const _updater = require("./updater")(_updaterCtx);
 const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel } = _updater;
 
 // ── About tab IPC ──
-// Hero SVG is inlined (not file URL) because settings.html CSP is
-// `default-src 'none'` with no `object-src`/`frame-src` — <object>/<iframe>
-// loads are blocked. Inlining keeps CSP strict while letting the renderer
-// access #shake-slot to drive the click reaction.
+// Hero SVG is inlined so the Settings renderer can access #shake-slot to
+// drive the click reaction. Animation override posters are captured in a
+// hidden renderer, so they cannot expose SVG internals to Settings either.
 ipcMain.handle("settings:get-about-info", () => {
   const heroSvgAbsPath = path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg");
   let heroSvgContent = "";
@@ -3087,6 +4080,7 @@ function openSettingsWindow() {
     },
   };
   if (iconPath) opts.icon = iconPath;
+  _bumpAnimationPreviewPosterGeneration();
   settingsWindow = new BrowserWindow(opts);
   if (isWin && typeof settingsWindow.setAppDetails === "function") {
     const taskbarDetails = getSettingsWindowTaskbarDetails();
@@ -3101,9 +4095,11 @@ function openSettingsWindow() {
     settingsWindow.focus();
   });
   settingsWindow.on("closed", () => {
+    _bumpAnimationPreviewPosterGeneration();
     stopShortcutRecording();
     void settingsSizePreviewSession.cleanup();
     settingsWindow = null;
+    _maybeDestroyIdleAnimationPreviewPosterWindow();
   });
 }
 
@@ -3334,7 +4330,7 @@ function createWindow() {
 
     // Crash recovery for hitWin
     hitWin.webContents.on("render-process-gone", (_event, details) => {
-      console.error("hitWin renderer crashed:", details.reason);
+      safeConsoleError("hitWin renderer crashed:", details.reason);
       hitWin.webContents.reload();
     });
   }
@@ -3442,7 +4438,7 @@ function createWindow() {
 
   // ── Crash recovery: renderer process can die from <object> churn ──
   win.webContents.on("render-process-gone", (_event, details) => {
-    console.error("Renderer crashed:", details.reason);
+    safeConsoleError("Renderer crashed:", details.reason);
     dragLocked = false;
     idlePaused = false;
     mouseOverPet = false;
@@ -3566,7 +4562,7 @@ function clampToScreenVisual(x, y, w, h, options = {}) {
   const clampMargins = getRestClampMargins({
     height: h,
     visibleMargins: margins,
-    allowEdgePinning: allowEdgePinningCached,
+    allowEdgePinning: "allowEdgePinning" in options ? options.allowEdgePinning : allowEdgePinningCached,
     bottomInset,
   });
   return {
@@ -3593,6 +4589,7 @@ const _miniCtx = {
   SIZES,
   getCurrentPixelSize,
   getEffectiveCurrentPixelSize,
+  getPixelSizeFor,
   isProportionalMode,
   sendToRenderer,
   sendToHitWin,
@@ -3675,6 +4672,9 @@ function activateTheme(themeId, variantId) {
     clearTimeout(animationOverridePreviewTimer);
     animationOverridePreviewTimer = null;
   }
+  if (!activeTheme || activeTheme._id !== newTheme._id) {
+    _bumpAnimationPreviewPosterGeneration();
+  }
   let preservedVirtualBounds = getPetWindowBounds();
 
   _state.cleanup();
@@ -3742,6 +4742,7 @@ function _deferredGetThemeInfo(themeId) {
   return {
     builtin: !!entry.builtin,
     active: activeTheme && activeTheme._id === themeId,
+    managedCodexPet: !!_readCodexPetManagedThemeMarker(themeId),
   };
 }
 function _deferredRemoveThemeDir(themeId) {
@@ -3809,8 +4810,17 @@ function installTerminalFocusExtension() {
 }
 
 // ── Single instance lock ──
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  _enqueueCodexPetImportUrl(url);
+});
+
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
+  if (process.argv.includes(REGISTER_PROTOCOL_DEV_ARG)) {
+    const protocolRegistered = _registerClawdProtocolClient();
+    console.log(`Clawd: clawd:// dev protocol registration ${protocolRegistered ? "succeeded" : "failed"}`);
+  }
   // Another instance is already running — quit silently
   app.quit();
 } else {
@@ -3826,6 +4836,7 @@ if (!gotTheLock) {
     if (shouldOpenSettingsWindowFromArgv(commandLine)) {
       openSettingsWindowWhenReady();
     }
+    _enqueueCodexPetImportUrlsFromArgv(commandLine);
     reapplyMacVisibility();
   });
 
@@ -3837,6 +4848,13 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(() => {
+    const protocolRegistered = _registerClawdProtocolClient();
+    if (process.argv.includes(REGISTER_PROTOCOL_DEV_ARG)) {
+      console.log(`Clawd: clawd:// dev protocol registration ${protocolRegistered ? "succeeded" : "failed"}`);
+      app.quit();
+      return;
+    }
+
     // Import system-backed settings (openAtLogin) into prefs on first run.
     // Must run before createWindow() so the first menu draw sees the
     // hydrated value rather than the schema default.
@@ -3849,6 +4867,10 @@ if (!gotTheLock) {
     if (shouldOpenSettingsWindowFromArgv(process.argv)) {
       openSettingsWindow();
     }
+    _enqueueCodexPetImportUrlsFromArgv(process.argv);
+    _flushPendingCodexPetImportUrls().catch((err) => {
+      console.warn("Clawd: Codex Pet import queue failed:", err && err.message);
+    });
 
     // Register persistent global shortcuts from the validated prefs snapshot.
     registerPersistentShortcutsFromSettings();
@@ -3863,46 +4885,26 @@ if (!gotTheLock) {
       const codexAgent = require("../agents/codex");
       _codexMonitor = new CodexLogMonitor(codexAgent, (sid, state, event, extra) => {
         if (shouldSuppressCodexLogEvent(sid, state, event)) return;
-        if (state === "codex-permission") {
-          updateSession(sid, "notification", event, {
-            cwd: extra.cwd,
-            agentId: "codex",
-            sessionTitle: extra.sessionTitle,
-          });
+        if (isCodexMonitorPermissionEvent(state)) {
+          updateSession(sid, "notification", event, buildCodexMonitorUpdateOptions(extra, {
+            includeHeadless: false,
+          }));
           showCodexNotifyBubble({
             sessionId: sid,
-            command: extra.permissionDetail?.command || "",
+            command: (extra && extra.permissionDetail && extra.permissionDetail.command) || "",
           });
           return;
         }
         clearCodexNotifyBubbles(sid, `codex-state-transition:${state}`);
-        updateSession(sid, state, event, {
-          cwd: extra.cwd,
-          agentId: "codex",
-          sessionTitle: extra.sessionTitle,
-        });
-      });
+        updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
+          includeHeadless: true,
+        }));
+      }, { classifier: _codexSubagentClassifier });
       if (_isAgentEnabled(_settingsController.getSnapshot(), "codex")) {
         _codexMonitor.start();
       }
     } catch (err) {
       console.warn("Clawd: Codex log monitor not started:", err.message);
-    }
-
-    try {
-      const GeminiLogMonitor = require("../agents/gemini-log-monitor");
-      const geminiAgent = require("../agents/gemini-cli");
-      _geminiMonitor = new GeminiLogMonitor(geminiAgent, (sid, state, event, extra) => {
-        updateSession(sid, state, event, {
-          cwd: extra.cwd,
-          agentId: "gemini-cli",
-        });
-      });
-      if (_isAgentEnabled(_settingsController.getSnapshot(), "gemini-cli")) {
-        _geminiMonitor.start();
-      }
-    } catch (err) {
-      console.warn("Clawd: Gemini log monitor not started:", err.message);
     }
 
     // Auto-install VS Code/Cursor terminal-focus extension
@@ -3927,10 +4929,11 @@ if (!gotTheLock) {
     _mini.cleanup();
     _sessionHud.cleanup();
     if (_codexMonitor) _codexMonitor.stop();
-    if (_geminiMonitor) _geminiMonitor.stop();
     stopTopmostWatchdog();
     if (hwndRecoveryTimer) { clearTimeout(hwndRecoveryTimer); hwndRecoveryTimer = null; }
     _focus.cleanup();
+    _bumpAnimationPreviewPosterGeneration();
+    _destroyAnimationPreviewPosterWindow();
     if (hitWin && !hitWin.isDestroyed()) hitWin.destroy();
   });
 

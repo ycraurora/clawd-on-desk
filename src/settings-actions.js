@@ -89,6 +89,7 @@ const AUTO_REPAIRABLE_AGENT_IDS = new Set([
   "kimi-cli",
   "opencode",
 ]);
+const CLAUDE_HOOKS_LOCK_KEY = "claude-hooks";
 
 // ── Validator helpers ──
 
@@ -310,6 +311,8 @@ const updateRegistry = {
   lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
   sessionHudEnabled: requireBoolean("sessionHudEnabled"),
+  sessionHudShowElapsed: requireBoolean("sessionHudShowElapsed"),
+  sessionHudCleanupDetached: requireBoolean("sessionHudCleanupDetached"),
   hideBubbles: requireBoolean("hideBubbles"),
   permissionBubblesEnabled: requireBoolean("permissionBubblesEnabled"),
   notificationBubbleAutoCloseSeconds: requireIntegerInRange(
@@ -332,6 +335,7 @@ const updateRegistry = {
   //   (permission denied, disk full, corrupt JSON) MUST prevent the prefs
   //   commit so the UI never shows "on" while the file is unchanged.
   autoStartWithClaude: {
+    lockKey: CLAUDE_HOOKS_LOCK_KEY,
     validate: requireBoolean("autoStartWithClaude"),
     effect(value, deps) {
       if (deps && deps.snapshot && deps.snapshot.manageClaudeHooksAutomatically === false) {
@@ -357,6 +361,7 @@ const updateRegistry = {
   },
 
   manageClaudeHooksAutomatically: {
+    lockKey: CLAUDE_HOOKS_LOCK_KEY,
     validate: requireBoolean("manageClaudeHooksAutomatically"),
     effect(value, deps) {
       if (
@@ -370,23 +375,30 @@ const updateRegistry = {
           message: "manageClaudeHooksAutomatically effect requires syncClaudeHooksNow/startClaudeSettingsWatcher/stopClaudeSettingsWatcher deps",
         };
       }
-      try {
-        if (value) {
-          if (!isAgentEnabled(deps.snapshot, "claude-code")) {
-            return { status: "ok" };
-          }
-          deps.syncClaudeHooksNow();
-          deps.startClaudeSettingsWatcher();
-        } else {
+      if (!value) {
+        try {
           deps.stopClaudeSettingsWatcher();
+          return { status: "ok" };
+        } catch (err) {
+          return {
+            status: "error",
+            message: `manageClaudeHooksAutomatically: ${err && err.message}`,
+          };
         }
+      }
+      if (!isAgentEnabled(deps.snapshot, "claude-code")) {
         return { status: "ok" };
-      } catch (err) {
-        return {
+      }
+      return Promise.resolve()
+        .then(() => deps.syncClaudeHooksNow())
+        .then(() => {
+          deps.startClaudeSettingsWatcher();
+          return { status: "ok" };
+        })
+        .catch((err) => ({
           status: "error",
           message: `manageClaudeHooksAutomatically: ${err && err.message}`,
-        };
-      }
+        }));
     },
   },
 
@@ -1046,6 +1058,12 @@ async function removeTheme(payload, deps) {
       message: `removeTheme: cannot delete active theme "${themeId}" — switch to another theme first`,
     };
   }
+  if (info.managedCodexPet) {
+    return {
+      status: "error",
+      message: `removeTheme: cannot delete managed Codex Pet theme "${themeId}" — remove it from Petdex instead`,
+    };
+  }
 
   try {
     await deps.removeThemeDir(themeId);
@@ -1613,7 +1631,7 @@ function resetThemeOverrides(payload, deps) {
   return { status: "ok", commit: { themeOverrides: nextOverrides } };
 }
 
-function installHooks(_payload, deps) {
+async function installHooks(_payload, deps) {
   if (!deps || typeof deps.syncClaudeHooksNow !== "function") {
     return {
       status: "error",
@@ -1621,14 +1639,14 @@ function installHooks(_payload, deps) {
     };
   }
   try {
-    deps.syncClaudeHooksNow();
+    await deps.syncClaudeHooksNow();
     return { status: "ok" };
   } catch (err) {
     return { status: "error", message: `installHooks: ${err && err.message}` };
   }
 }
 
-function uninstallHooks(_payload, deps) {
+async function uninstallHooks(_payload, deps) {
   if (
     !deps
     || typeof deps.uninstallClaudeHooksNow !== "function"
@@ -1643,7 +1661,7 @@ function uninstallHooks(_payload, deps) {
   const shouldRestoreWatcher = !!(deps.snapshot && deps.snapshot.manageClaudeHooksAutomatically);
   try {
     deps.stopClaudeSettingsWatcher();
-    deps.uninstallClaudeHooksNow();
+    await deps.uninstallClaudeHooksNow();
     return { status: "ok", commit: { manageClaudeHooksAutomatically: false } };
   } catch (err) {
     if (shouldRestoreWatcher && typeof deps.startClaudeSettingsWatcher === "function") {
@@ -1822,6 +1840,9 @@ function resizePet(payload, deps) {
     return { status: "error", message: `resizePet: ${err && err.message}` };
   }
 }
+
+installHooks.lockKey = CLAUDE_HOOKS_LOCK_KEY;
+uninstallHooks.lockKey = CLAUDE_HOOKS_LOCK_KEY;
 
 const commandRegistry = {
   removeTheme,

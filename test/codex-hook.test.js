@@ -1,5 +1,7 @@
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert");
+const fs = require("fs");
+const os = require("os");
 const { spawnSync } = require("child_process");
 const path = require("path");
 const {
@@ -10,8 +12,10 @@ const {
   buildToolInputFingerprint,
   extractCodexSessionIdFromTranscriptPath,
   normalizeCodexSessionId,
+  readFirstSessionMeta,
   sanitizeCodexPermissionOutput,
 } = require("../hooks/codex-hook");
+const { readCodexThreadName } = require("../hooks/codex-session-index");
 
 const mockResolve = () => ({
   stablePid: 123,
@@ -19,6 +23,27 @@ const mockResolve = () => ({
   detectedEditor: "code",
   pidChain: [789, 456, 123],
 });
+
+function withTempTranscript(lines, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hook-"));
+  const file = path.join(dir, "rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl");
+  fs.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+  try {
+    return fn(file);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function withTempCodexIndex(lines, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-index-"));
+  fs.writeFileSync(path.join(dir, "session_index.jsonl"), lines.join("\n") + "\n", "utf8");
+  try {
+    return fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 describe("Codex official hook", () => {
   it("normalizes session ids with the codex prefix", () => {
@@ -68,6 +93,40 @@ describe("Codex official hook", () => {
     assert.deepStrictEqual(body.pid_chain, [789, 456, 123]);
   });
 
+  it("reads Codex /rename thread_name from session_index.jsonl", () => {
+    withTempCodexIndex([
+      JSON.stringify({ id: "019d23d4-f1a9-7633-b9c7-758327137228", thread_name: "Old Name" }),
+      JSON.stringify({ id: "other", thread_name: "Other" }),
+      JSON.stringify({ id: "019d23d4-f1a9-7633-b9c7-758327137228", thread_name: "요구사항개선" }),
+    ], (codexDir) => {
+      assert.strictEqual(
+        readCodexThreadName("codex:019d23d4-f1a9-7633-b9c7-758327137228", { codexDir }),
+        "요구사항개선"
+      );
+    });
+  });
+
+  it("sends Codex /rename thread_name as session_title", () => {
+    withTempCodexIndex([
+      JSON.stringify({ id: "019d23d4-f1a9-7633-b9c7-758327137228", thread_name: "요구사항개선" }),
+    ], (codexDir) => {
+      const oldCodexHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = codexDir;
+      try {
+        const body = buildStateBody({
+          hook_event_name: "SessionStart",
+          session_id: "official-session",
+          transcript_path: "/tmp/rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl",
+        }, mockResolve);
+
+        assert.strictEqual(body.session_title, "요구사항개선");
+      } finally {
+        if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = oldCodexHome;
+      }
+    });
+  });
+
   it("passes through tool metadata without raw tool_input", () => {
     const toolInput = { command: "npm test", description: "Run tests" };
     const body = buildStateBody({
@@ -97,6 +156,86 @@ describe("Codex official hook", () => {
     assert.strictEqual(body.state, "idle");
     assert.strictEqual(body.event, "Stop");
     assert.strictEqual(body.stop_hook_active, false);
+  });
+
+  it("reads long first-line session_meta and marks subagent state payloads", () => {
+    withTempTranscript([
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "explorer" } } },
+          agent_role: "explorer",
+          base_instructions: { text: "x".repeat(12000) },
+        },
+      }),
+    ], (transcriptPath) => {
+      const meta = readFirstSessionMeta(transcriptPath);
+      assert.strictEqual(meta.agent_role, "explorer");
+
+      const body = buildStateBody({
+        hook_event_name: "SessionStart",
+        session_id: "official-session",
+        transcript_path: transcriptPath,
+      }, mockResolve);
+
+      assert.strictEqual(body.session_id, "codex:019d23d4-f1a9-7633-b9c7-758327137228");
+      assert.strictEqual(body.agent_id, "codex");
+      assert.strictEqual(body.codex_session_role, "subagent");
+    });
+  });
+
+  it("scans early transcript records until session_meta is found", () => {
+    withTempTranscript([
+      JSON.stringify({ type: "turn_context", payload: { cwd: "/repo" } }),
+      "{not json",
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "worker" } } },
+          agent_id: "upstream-agent-id",
+          agent_type: "worker",
+        },
+      }),
+    ], (transcriptPath) => {
+      const meta = readFirstSessionMeta(transcriptPath);
+      assert.strictEqual(meta.agent_type, "worker");
+
+      const body = buildStateBody({
+        hook_event_name: "SessionStart",
+        session_id: "official-session",
+        transcript_path: transcriptPath,
+      }, mockResolve);
+
+      assert.strictEqual(body.codex_session_role, "subagent");
+      assert.strictEqual(body.codex_subagent_id, "upstream-agent-id");
+      assert.strictEqual(body.codex_agent_type, "worker");
+    });
+  });
+
+  it("renames upstream Codex agent fields without polluting Clawd agent_id", () => {
+    const body = buildStateBody({
+      hook_event_name: "PreToolUse",
+      session_id: "s1",
+      agent_id: "upstream-subagent-id",
+      agent_type: "explorer",
+      source: { subagent: { thread_spawn: { agent_role: "explorer" } } },
+    }, mockResolve);
+
+    assert.strictEqual(body.agent_id, "codex");
+    assert.strictEqual(body.codex_subagent_id, "upstream-subagent-id");
+    assert.strictEqual(body.codex_agent_type, "explorer");
+    assert.strictEqual(body.codex_session_role, "subagent");
+  });
+
+  it("fails open when transcript_path cannot be read", () => {
+    const body = buildStateBody({
+      hook_event_name: "SessionStart",
+      session_id: "s1",
+      transcript_path: path.join(os.tmpdir(), "missing-codex-transcript.jsonl"),
+    }, mockResolve);
+
+    assert.strictEqual(body.agent_id, "codex");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(body, "codex_session_role"), false);
   });
 
   it("no-ops stop_hook_active continuations", () => {
@@ -139,6 +278,30 @@ describe("Codex official hook", () => {
     assert.strictEqual(body.turn_id, "turn-1");
     assert.strictEqual(body.permission_mode, "default");
     assert.strictEqual(body.source_pid, 123);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(body, "codex_session_role"), false);
+  });
+
+  it("does not classify PermissionRequest payloads even when the transcript is subagent", () => {
+    withTempTranscript([
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          source: { subagent: { thread_spawn: { agent_role: "worker" } } },
+          agent_role: "worker",
+        },
+      }),
+    ], (transcriptPath) => {
+      const body = buildPermissionBody({
+        hook_event_name: "PermissionRequest",
+        session_id: "s1",
+        transcript_path: transcriptPath,
+        tool_name: "Bash",
+        tool_input: { command: "npm test" },
+      }, mockResolve);
+
+      assert.strictEqual(body.agent_id, "codex");
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(body, "codex_session_role"), false);
+    });
   });
 
   it("does not build a state payload for PermissionRequest", () => {

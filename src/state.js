@@ -8,6 +8,7 @@ const fs = require("fs");
 const { pathToFileURL } = require("url");
 const { VISUAL_FALLBACK_STATES } = require("./theme-loader");
 const { sessionAliasKey } = require("./session-alias");
+const { readCodexThreadName } = require("../hooks/codex-session-index");
 
 // ── Agent icons (official logos from assets/icons/agents/) ──
 const AGENT_ICON_DIR = path.join(__dirname, "..", "assets", "icons", "agents");
@@ -49,6 +50,8 @@ let DEEP_SLEEP_TIMEOUT = 0;
 let YAWN_DURATION = 0;
 let WAKE_DURATION = 0;
 let DND_SKIP_YAWN = false;
+let DND_SLEEP_TRANSITION_SVG = null;
+let DND_SLEEP_TRANSITION_DURATION = 0;
 let COLLAPSE_DURATION = 0;
 let SLEEP_MODE = "full";
 const SLEEP_SEQUENCE = new Set(["yawning", "dozing", "collapsing", "sleeping", "waking"]);
@@ -75,10 +78,12 @@ const EVENT_LABEL_KEYS = {
   PreToolUse: "eventLabelPreToolUse",
   PostToolUse: "eventLabelPostToolUse",
   PostToolUseFailure: "eventLabelPostToolUseFailure",
+  AfterAgent: "eventLabelAfterAgent",
   Stop: "eventLabelStop",
   StopFailure: "eventLabelStopFailure",
   SubagentStart: "eventLabelSubagentStart",
   SubagentStop: "eventLabelSubagentStop",
+  PreCompress: "eventLabelPreCompress",
   PreCompact: "eventLabelPreCompact",
   PostCompact: "eventLabelPostCompact",
   Notification: "eventLabelNotification",
@@ -95,14 +100,18 @@ const sessions = new Map();
 const MAX_SESSIONS = 20;
 const SESSION_STALE_MS = 600000;
 const WORKING_STALE_MS = 300000;
+const DETACHED_IDLE_STALE_MS = 30000;
+const CODEX_EXIT_PROBE_DELAYS_MS = [1000, 3000, 8000, 15000];
 let lastSessionSnapshotSignature = null;
 let lastSessionSnapshot = null;
 let startupRecoveryActive = false;
 let startupRecoveryTimer = null;
 const STARTUP_RECOVERY_MAX_MS = 300000;
+const codexExitProbes = new Map();
 
 // ── Hit-test bounding boxes (from theme) ──
 let HIT_BOXES = {};
+let FILE_HIT_BOXES = {};
 let WIDE_SVGS = new Set();
 let SLEEPING_SVGS = new Set();
 let currentHitBox = HIT_BOXES.default;
@@ -224,6 +233,13 @@ function buildStateBindings(nextTheme) {
   return bindings;
 }
 
+function resolveHitBoxForSvg(svg) {
+  if (svg && FILE_HIT_BOXES[svg]) return FILE_HIT_BOXES[svg];
+  if (svg && SLEEPING_SVGS.has(svg)) return HIT_BOXES.sleeping;
+  if (svg && WIDE_SVGS.has(svg)) return HIT_BOXES.wide;
+  return HIT_BOXES.default;
+}
+
 function refreshTheme() {
   theme = ctx.theme;
   SVG_IDLE_FOLLOW = theme.states.idle[0];
@@ -238,20 +254,21 @@ function refreshTheme() {
   YAWN_DURATION = theme.timings.yawnDuration;
   WAKE_DURATION = theme.timings.wakeDuration;
   DND_SKIP_YAWN = !!theme.timings.dndSkipYawn;
+  DND_SLEEP_TRANSITION_SVG = typeof theme.timings.dndSleepTransitionSvg === "string" && theme.timings.dndSleepTransitionSvg
+    ? theme.timings.dndSleepTransitionSvg.split(/[\\/]/).pop()
+    : null;
+  DND_SLEEP_TRANSITION_DURATION = Number.isFinite(theme.timings.dndSleepTransitionDuration) && theme.timings.dndSleepTransitionDuration > 0
+    ? Math.floor(theme.timings.dndSleepTransitionDuration)
+    : 0;
   COLLAPSE_DURATION = theme.timings.collapseDuration || 0;
   SLEEP_MODE = theme.sleepSequence && theme.sleepSequence.mode === "direct" ? "direct" : "full";
   DISPLAY_HINT_MAP = theme.displayHintMap || {};
   HIT_BOXES = theme.hitBoxes;
+  FILE_HIT_BOXES = theme.fileHitBoxes || {};
   WIDE_SVGS = new Set(theme.wideHitboxFiles || []);
   SLEEPING_SVGS = new Set(theme.sleepingHitboxFiles || []);
 
-  if (currentSvg && SLEEPING_SVGS.has(currentSvg)) {
-    currentHitBox = HIT_BOXES.sleeping;
-  } else if (currentSvg && WIDE_SVGS.has(currentSvg)) {
-    currentHitBox = HIT_BOXES.wide;
-  } else {
-    currentHitBox = HIT_BOXES.default;
-  }
+  currentHitBox = resolveHitBoxForSvg(currentSvg);
   refreshUpdateVisualOverride();
 }
 
@@ -384,17 +401,13 @@ function playWakeTransitionOrResolve() {
   applyState("waking");
 }
 
-function queueSleepState() {
-  if (SLEEP_MODE === "direct") {
-    setState("sleeping");
-    return;
-  }
-  setState("yawning");
-}
-
 function applyDndSleepState() {
   if (SLEEP_MODE === "direct") {
     applyState("sleeping");
+    return;
+  }
+  if (DND_SLEEP_TRANSITION_SVG) {
+    applyState("collapsing", DND_SLEEP_TRANSITION_SVG);
     return;
   }
   applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
@@ -459,14 +472,7 @@ function applyState(state, svgOverride) {
     eyeResendTimer = setTimeout(() => { eyeResendTimer = null; ctx.forceEyeResend = true; }, delay);
   }
 
-  // Update hit box based on SVG
-  if (SLEEPING_SVGS.has(svg)) {
-    currentHitBox = HIT_BOXES.sleeping;
-  } else if (WIDE_SVGS.has(svg)) {
-    currentHitBox = HIT_BOXES.wide;
-  } else {
-    currentHitBox = HIT_BOXES.default;
-  }
+  currentHitBox = resolveHitBoxForSvg(svg);
 
   ctx.sendToRenderer("state-change", state, svg);
   ctx.syncHitWin();
@@ -491,11 +497,22 @@ function applyState(state, svgOverride) {
       autoReturnTimer = null;
       applyState(ctx.doNotDisturb ? "collapsing" : "dozing");
     }, YAWN_DURATION);
-  } else if (state === "collapsing" && COLLAPSE_DURATION > 0) {
-    autoReturnTimer = setTimeout(() => {
-      autoReturnTimer = null;
-      applyState("sleeping");
-    }, COLLAPSE_DURATION);
+  } else if (state === "collapsing") {
+    const dndCollapseDuration = (
+      ctx.doNotDisturb
+      && DND_SLEEP_TRANSITION_SVG
+      && svg === DND_SLEEP_TRANSITION_SVG
+      && DND_SLEEP_TRANSITION_DURATION > 0
+    )
+      ? DND_SLEEP_TRANSITION_DURATION
+      : 0;
+    const collapseDuration = dndCollapseDuration || COLLAPSE_DURATION;
+    if (collapseDuration > 0) {
+      autoReturnTimer = setTimeout(() => {
+        autoReturnTimer = null;
+        applyState("sleeping");
+      }, collapseDuration);
+    }
   } else if (state === "waking") {
     autoReturnTimer = setTimeout(() => {
       autoReturnTimer = null;
@@ -582,6 +599,136 @@ function debugSession(msg) {
   try { ctx.debugLog(msg); } catch {}
 }
 
+function formatPidChain(pidChain) {
+  return Array.isArray(pidChain) && pidChain.length
+    ? `[${pidChain.join(">")}]`
+    : "[]";
+}
+
+function clearCodexExitProbe(sessionId) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const existing = codexExitProbes.get(id);
+  if (!existing) return false;
+  for (const timer of existing.timers || []) clearTimeout(timer);
+  codexExitProbes.delete(id);
+  return true;
+}
+
+function cancelCodexExitProbe(sessionId, reason) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const removed = clearCodexExitProbe(id);
+  if (removed) debugSession(`codex-exit-probe cancel sid=${id} reason=${reason || "-"}`);
+  return removed;
+}
+
+function runCodexExitProbe(sessionId, token, delayMs) {
+  const entry = codexExitProbes.get(sessionId);
+  if (!entry || entry.token !== token) return;
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    clearCodexExitProbe(sessionId);
+    debugSession(`codex-exit-probe finish sid=${sessionId} reason=no-session delay=${delayMs}`);
+    return;
+  }
+
+  if (session.agentId !== "codex" || session.headless || session.host || !session.agentPid || !session.pidReachable) {
+    clearCodexExitProbe(sessionId);
+    debugSession(
+      `codex-exit-probe finish ${describeSession(sessionId, session)} reason=not-probeable ` +
+      `delay=${delayMs} host=${session.host || "-"} chain=${formatPidChain(session.pidChain)}`
+    );
+    return;
+  }
+
+  const agentAlive = isProcessAlive(session.agentPid);
+  const sourceAlive = session.sourcePid ? isProcessAlive(session.sourcePid) : null;
+  const final = delayMs === entry.finalDelay;
+  debugSession(
+    `codex-exit-probe check ${describeSession(sessionId, session)} delay=${delayMs} ` +
+    `agentAlive=${agentAlive ? 1 : 0} sourceAlive=${sourceAlive == null ? "-" : (sourceAlive ? 1 : 0)} ` +
+    `final=${final ? 1 : 0} chain=${formatPidChain(session.pidChain)}`
+  );
+
+  if (!agentAlive) {
+    clearCodexExitProbe(sessionId);
+    debugSession(
+      `codex-exit-probe delete reason=agent-exit delay=${delayMs} ` +
+      `${describeSession(sessionId, session)} chain=${formatPidChain(session.pidChain)}`
+    );
+    cleanStaleSessions();
+    return;
+  }
+
+  if (final) {
+    clearCodexExitProbe(sessionId);
+    debugSession(
+      `codex-exit-probe keep reason=agent-alive ${describeSession(sessionId, session)} ` +
+      `chain=${formatPidChain(session.pidChain)}`
+    );
+  }
+}
+
+function scheduleCodexExitProbe(sessionId) {
+  const session = sessions.get(sessionId);
+  clearCodexExitProbe(sessionId);
+
+  if (!session) {
+    debugSession(`codex-exit-probe skip sid=${sessionId} reason=no-session`);
+    return;
+  }
+  if (session.agentId !== "codex") return;
+  if (session.headless) {
+    debugSession(`codex-exit-probe skip ${describeSession(sessionId, session)} reason=headless`);
+    return;
+  }
+  if (session.host) {
+    debugSession(`codex-exit-probe skip ${describeSession(sessionId, session)} reason=remote-host host=${session.host}`);
+    return;
+  }
+  if (!session.agentPid) {
+    debugSession(
+      `codex-exit-probe skip ${describeSession(sessionId, session)} reason=no-agent-pid ` +
+      `chain=${formatPidChain(session.pidChain)}`
+    );
+    return;
+  }
+  if (!session.pidReachable) {
+    debugSession(
+      `codex-exit-probe skip ${describeSession(sessionId, session)} reason=pid-unreachable ` +
+      `chain=${formatPidChain(session.pidChain)}`
+    );
+    return;
+  }
+
+  const token = Symbol(sessionId);
+  const entry = {
+    token,
+    timers: [],
+    finalDelay: CODEX_EXIT_PROBE_DELAYS_MS[CODEX_EXIT_PROBE_DELAYS_MS.length - 1],
+  };
+  codexExitProbes.set(sessionId, entry);
+  debugSession(
+    `codex-exit-probe schedule ${describeSession(sessionId, session)} ` +
+    `delays=${CODEX_EXIT_PROBE_DELAYS_MS.join(",")} chain=${formatPidChain(session.pidChain)}`
+  );
+  for (const delayMs of CODEX_EXIT_PROBE_DELAYS_MS) {
+    const timer = setTimeout(() => runCodexExitProbe(sessionId, token, delayMs), delayMs);
+    entry.timers.push(timer);
+  }
+}
+
+function updateCodexExitProbe(sessionId, agentId, event) {
+  if (agentId !== "codex") return;
+  if (event === "Stop") {
+    scheduleCodexExitProbe(sessionId);
+  } else {
+    cancelCodexExitProbe(sessionId, event || "state-update");
+  }
+}
+
 // Append an event to a session's rolling recentEvents list, dropping the
 // oldest when over RECENT_EVENT_LIMIT. Returned list is a new array —
 // caller assigns it to session.recentEvents.
@@ -619,6 +766,18 @@ function deriveSessionBadge(session) {
   if (latestEvent === "StopFailure" || latestEvent === "PostToolUseFailure") return "interrupted";
   if (latestEvent === "Stop" || latestEvent === "PostCompact") return "done";
   return "idle";
+}
+
+function isEndedSessionBadge(badge) {
+  return badge === "done" || badge === "interrupted";
+}
+
+function shouldAutoClearDetachedSession(session, badge) {
+  if (ctx.sessionHudCleanupDetached !== true) return false;
+  if (!session || session.headless || session.state !== "idle" || session.agentPid) return false;
+  if (!session.pidReachable || !session.sourcePid) return false;
+  if (!isEndedSessionBadge(badge)) return false;
+  return !isProcessAlive(session.sourcePid);
 }
 
 // Local title normalizer (trim, strip control chars, clamp, empty → null).
@@ -674,11 +833,19 @@ function getSessionAliasEntry(id, sessionLike, sessionAliases = {}) {
 function sessionDisplayTitle(id, sessionLike, sessionAliases = {}) {
   const alias = getSessionAliasEntry(id, sessionLike, sessionAliases);
   if (alias && typeof alias.title === "string" && alias.title) return alias.title;
-  const title = normalizeTitle(sessionLike && sessionLike.sessionTitle);
+  const title = getEffectiveSessionTitle(id, sessionLike);
   if (title) return title;
   const cwd = sessionLike && sessionLike.cwd;
   if (cwd) return path.basename(cwd);
   return id && id.length > 6 ? `${id.slice(0, 6)}..` : id;
+}
+
+function getEffectiveSessionTitle(id, sessionLike) {
+  if (sessionLike && sessionLike.agentId === "codex" && !sessionLike.host) {
+    const threadName = normalizeTitle(readCodexThreadName(id));
+    if (threadName) return threadName;
+  }
+  return normalizeTitle(sessionLike && sessionLike.sessionTitle);
 }
 
 function sessionMenuComparator(a, b) {
@@ -702,14 +869,16 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}) {
   const latestEvent = recentEvents.length ? recentEvents[recentEvents.length - 1] : null;
   const rawEvent = latestEvent && latestEvent.event ? latestEvent.event : null;
   const eventAt = Number(latestEvent && latestEvent.at);
+  const badge = deriveSessionBadge(session);
   return {
     id,
     agentId: (session && session.agentId) || null,
     iconUrl: getAgentIconUrl(session && session.agentId),
     state: (session && session.state) || "idle",
-    badge: deriveSessionBadge(session),
+    badge,
+    hiddenFromHud: shouldAutoClearDetachedSession(session, badge),
     hasAlias: !!(alias && typeof alias.title === "string" && alias.title),
-    sessionTitle: normalizeTitle(session && session.sessionTitle),
+    sessionTitle: getEffectiveSessionTitle(id, session),
     displayTitle: sessionDisplayTitle(id, session, sessionAliases),
     cwd: (session && session.cwd) || "",
     updatedAt: sessionUpdatedAt(session),
@@ -736,7 +905,7 @@ function buildSessionSnapshot() {
   const orderedIds = dashboardEntries.map((entry) => entry.id);
   const menuOrderedIds = menuEntries.map((entry) => entry.id);
   const hudEntries = dashboardEntries.filter((entry) =>
-    !entry.headless && entry.state !== "sleeping"
+    !entry.headless && entry.state !== "sleeping" && !entry.hiddenFromHud
   );
 
   const groupMap = new Map();
@@ -802,6 +971,7 @@ function sessionSnapshotSignature(snapshot) {
       agentId: entry.agentId,
       sourcePid: entry.sourcePid,
       headless: entry.headless,
+      hiddenFromHud: !!entry.hiddenFromHud,
       host: entry.host,
       lastEventLabelKey: entry.lastEvent ? entry.lastEvent.labelKey : null,
       lastEventRawEvent: entry.lastEvent ? entry.lastEvent.rawEvent : null,
@@ -842,8 +1012,15 @@ function describeSession(sessionId, session) {
     `agent=${session.agentId || "-"}`,
     `agentPid=${session.agentPid || "-"}`,
     `sourcePid=${session.sourcePid || "-"}`,
+    `pidReachable=${session.pidReachable ? 1 : 0}`,
     `headless=${session.headless ? 1 : 0}`,
   ].join(" ");
+}
+
+function resolvePidReachable(existing, agentPid, sourcePid) {
+  if (agentPid && isProcessAlive(agentPid)) return true;
+  if (sourcePid && isProcessAlive(sourcePid)) return true;
+  return existing ? !!existing.pidReachable : false;
 }
 
 // ── Session management ──
@@ -864,6 +1041,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     displayHint = undefined,
     sessionTitle = null,
     permissionSuspect = false,
+    preserveState = false,
     hookSource = null,
   } = opts;
   if (startupRecoveryActive) {
@@ -875,6 +1053,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const permAgentId = agentId || (sessionForPerm && sessionForPerm.agentId) || null;
 
   if (event === "PermissionRequest") {
+    if (permAgentId === "codex") cancelCodexExitProbe(sessionId, "PermissionRequest");
     // Kimi-only gate: startKimiPermissionPoll suppresses the passive bubble
     // when the user disabled Kimi permissions in Settings, but the setState
     // ran first and flashed notification anyway — leaving a silent animation
@@ -906,13 +1085,13 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcResumeState = (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
+  const preservedState = preserveState && existing ? existing.state : null;
 
   debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"} source=${hookSource || "-"}`);
 
-  const pidReachable = existing ? existing.pidReachable :
-    (srcAgentPid ? isProcessAlive(srcAgentPid) : (srcPid ? isProcessAlive(srcPid) : false));
+  const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
-  const recentEvents = pushRecentEvent(existing, state, event);
+  const recentEvents = pushRecentEvent(existing, preservedState || state, event);
   const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
 
   if (event === "codex-permission") {
@@ -934,6 +1113,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   }
 
   if (isSubagentStop) {
+    updateCodexExitProbe(sessionId, srcAgentId, event);
     if (!existing) {
       debugSession(`subagent-stop ignore sid=${sessionId} reason=no-session`);
       cleanStaleSessions();
@@ -966,29 +1146,31 @@ function updateSession(sessionId, state, event, opts = {}) {
 
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);
+    cancelCodexExitProbe(sessionId, "SessionEnd");
     sessions.delete(sessionId);
     debugSession(`session-end delete ${describeSession(sessionId, endingSession)}`);
     cleanStaleSessions();
     if (srcAgentId === "kimi-cli") stopKimiPermissionPoll(sessionId);
     if (!endingSession || !endingSession.headless) {
-      let hasLiveInteractive = false;
-      for (const s of sessions.values()) {
-        if (!s.headless) { hasLiveInteractive = true; break; }
-      }
       // /clear sends sweeping — play it even if other sessions are active
       // (sweeping is ONESHOT and auto-returns, so it won't interfere)
       if (state === "sweeping") {
         setState("sweeping");
         return;
       }
-      if (!hasLiveInteractive) {
-        setState("sleeping");
-        return;
-      }
     }
     const displayState = resolveDisplayState();
     setState(displayState, getSvgOverride(displayState));
     return;
+  } else if (preservedState) {
+    const dh = pickDisplayHint(preservedState, existing, displayHint);
+    sessions.set(sessionId, {
+      state: preservedState,
+      updatedAt: Date.now(),
+      displayHint: dh,
+      ...base,
+      resumeState: srcResumeState,
+    });
   } else if (state === "attention" || state === "notification" || SLEEP_SEQUENCE.has(state)) {
     sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
   } else if (ONESHOT_STATES.has(state)) {
@@ -1017,6 +1199,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     }
   }
   cleanStaleSessions();
+  updateCodexExitProbe(sessionId, srcAgentId, event);
   // Any Kimi event other than the PreToolUse that originally opened the hold
   // means the user already answered (Approve / Reject / Reject-and-tell-model)
   // and the agent loop has moved on. We must NOT keep the pet stuck on the
@@ -1101,43 +1284,37 @@ function isProcessAlive(pid) {
 function cleanStaleSessions() {
   const now = Date.now();
   let changed = false;
-  let removedNonHeadless = false;
-  // Helper: when a Kimi session is removed by stale cleanup, drop any
-  // hold/suspect timer attached to it. Otherwise the pet would stay locked
-  // on `notification` even after the Kimi process is gone (the
-  // event-driven release paths can never fire post-mortem).
-  const disposeKimiTimers = (id) => {
-    const hadSuspect = cancelPermissionSuspect(id);
-    const hold = kimiPermissionHolds.get(id);
-    if (hold) {
-      if (hold.timer) clearTimeout(hold.timer);
-      kimiPermissionHolds.delete(id);
-    }
-    // Bubble cleanup: stopKimiPermissionPoll() is the normal release path and
-    // already calls clearKimiNotifyBubbles(). When the session dies under us
-    // (PID exit / unreachable / source-exit) we bypass that path, so the
-    // passive "Check Kimi terminal" bubble would otherwise stay forever.
-    if ((hold || hadSuspect) && typeof ctx.clearKimiNotifyBubbles === "function") {
-      ctx.clearKimiNotifyBubbles(id, "kimi-session-disposed");
-    }
-  };
+  let snapshotRefreshNeeded = false;
   for (const [id, s] of sessions) {
     const age = now - s.updatedAt;
 
     if (s.pidReachable && s.agentPid && !isProcessAlive(s.agentPid)) {
       debugSession(`stale-delete agent-exit ${describeSession(id, s)}`);
-      if (!s.headless) removedNonHeadless = true;
-      if (s && s.agentId === "kimi-cli") disposeKimiTimers(id);
+      if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-agent-exit");
+      if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
       sessions.delete(id); changed = true;
       continue;
+    }
+
+    const badge = deriveSessionBadge(s);
+    const autoClearDetached = shouldAutoClearDetachedSession(s, badge);
+    if (autoClearDetached) {
+      if (age > DETACHED_IDLE_STALE_MS) {
+        debugSession(`stale-delete detached-ended ${describeSession(id, s)} badge=${badge}`);
+        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-detached-ended");
+        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
+        sessions.delete(id); changed = true;
+        continue;
+      }
+      snapshotRefreshNeeded = true;
     }
 
     if (age > SESSION_STALE_MS) {
       if (s.pidReachable && s.sourcePid) {
         if (!isProcessAlive(s.sourcePid)) {
           debugSession(`stale-delete source-exit ${describeSession(id, s)}`);
-          if (!s.headless) removedNonHeadless = true;
-          if (s && s.agentId === "kimi-cli") disposeKimiTimers(id);
+          if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-source-exit");
+          if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
           sessions.delete(id); changed = true;
         } else if (s.state !== "idle") {
           debugSession(`stale-idle session-timeout ${describeSession(id, s)}`);
@@ -1145,20 +1322,20 @@ function cleanStaleSessions() {
         }
       } else if (!s.pidReachable) {
         debugSession(`stale-delete unreachable ${describeSession(id, s)}`);
-        if (!s.headless) removedNonHeadless = true;
-        if (s && s.agentId === "kimi-cli") disposeKimiTimers(id);
+        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-unreachable");
+        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
         sessions.delete(id); changed = true;
       } else {
         debugSession(`stale-delete no-source ${describeSession(id, s)}`);
-        if (!s.headless) removedNonHeadless = true;
-        if (s && s.agentId === "kimi-cli") disposeKimiTimers(id);
+        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-no-source");
+        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
         sessions.delete(id); changed = true;
       }
     } else if (age > WORKING_STALE_MS) {
       if (s.pidReachable && s.sourcePid && !isProcessAlive(s.sourcePid)) {
         debugSession(`stale-delete working-source-exit ${describeSession(id, s)}`);
-        if (!s.headless) removedNonHeadless = true;
-        if (s && s.agentId === "kimi-cli") disposeKimiTimers(id);
+        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-working-source-exit");
+        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
         sessions.delete(id); changed = true;
       } else if (s.state === "working" || s.state === "juggling" || s.state === "thinking") {
         debugSession(`stale-idle working-timeout ${describeSession(id, s)}`);
@@ -1167,16 +1344,12 @@ function cleanStaleSessions() {
     }
   }
   if (changed && sessions.size === 0) {
-    if (removedNonHeadless) {
-      queueSleepState();
-    } else {
-      setState("idle", SVG_IDLE_FOLLOW);
-    }
+    setState("idle", SVG_IDLE_FOLLOW);
   } else if (changed) {
     const resolved = resolveDisplayState();
     setState(resolved, getSvgOverride(resolved));
   }
-  if (changed) emitSessionSnapshot();
+  if (changed || snapshotRefreshNeeded) emitSessionSnapshot();
 
   if (startupRecoveryActive && sessions.size === 0) {
     detectRunningAgentProcesses((found) => {
@@ -1188,30 +1361,43 @@ function cleanStaleSessions() {
   }
 }
 
-// setState() respects minDisplay timings, so the visible pet finishes
-// its current animation before settling to the resolved state.
+// Session removal helpers. Kimi has extra animation/bubble bookkeeping because
+// its approval prompt is terminal-driven rather than an HTTP permission roundtrip.
+function disposeKimiSessionState(id, reason) {
+  const hadSuspect = cancelPermissionSuspect(id);
+  const hold = kimiPermissionHolds.get(id);
+  if (hold) {
+    if (hold.timer) clearTimeout(hold.timer);
+    kimiPermissionHolds.delete(id);
+  }
+  if ((hold || hadSuspect) && typeof ctx.clearKimiNotifyBubbles === "function") {
+    ctx.clearKimiNotifyBubbles(id, reason || "kimi-session-disposed");
+  }
+  return !!(hold || hadSuspect);
+}
+
+function dismissSession(sessionId) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  if (session.agentId === "codex") cancelCodexExitProbe(id, "session-hidden");
+  sessions.delete(id);
+  if (session.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-hidden");
+  const resolved = resolveDisplayState();
+  setState(resolved, getSvgOverride(resolved));
+  emitSessionSnapshot({ force: true });
+  return true;
+}
+
 function clearSessionsByAgent(agentId) {
   if (!agentId) return 0;
   let removed = 0;
   for (const [id, s] of sessions) {
     if (s && s.agentId === agentId) {
+      if (agentId === "codex") cancelCodexExitProbe(id, "clear-sessions");
       sessions.delete(id);
-      if (agentId === "kimi-cli") {
-        const hadSuspect = cancelPermissionSuspect(id);
-        const hold = kimiPermissionHolds.get(id);
-        if (hold) {
-          if (hold.timer) clearTimeout(hold.timer);
-          kimiPermissionHolds.delete(id);
-        }
-        // Defense in depth: callers SHOULD pair this with
-        // dismissPermissionsByAgent("kimi-cli") (settings-actions does), but
-        // direct callers of clearSessionsByAgent shouldn't strand the
-        // passive bubble. clearKimiNotifyBubbles is a no-op when nothing
-        // matches.
-        if ((hold || hadSuspect) && typeof ctx.clearKimiNotifyBubbles === "function") {
-          ctx.clearKimiNotifyBubbles(id, "kimi-clear-sessions");
-        }
-      }
+      if (agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-clear-sessions");
       removed++;
     }
   }
@@ -1596,6 +1782,7 @@ function cleanup() {
   kimiPermissionHolds.clear();
   for (const { timer } of kimiPermissionSuspectTimers.values()) clearTimeout(timer);
   kimiPermissionSuspectTimers.clear();
+  for (const id of [...codexExitProbes.keys()]) clearCodexExitProbe(id);
   stopStaleCleanup();
 }
 
@@ -1608,6 +1795,7 @@ return {
   detectRunningAgentProcesses, buildSessionSnapshot,
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
+  dismissSession,
   clearSessionsByAgent,
   disposeAllKimiPermissionState,
   deriveSessionBadge,
@@ -1615,6 +1803,7 @@ return {
   sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
   get STATE_SVGS() { return STATE_SVGS; },
   get HIT_BOXES() { return HIT_BOXES; },
+  get FILE_HIT_BOXES() { return FILE_HIT_BOXES; },
   get WIDE_SVGS() { return WIDE_SVGS; },
   cleanup,
 };

@@ -25,6 +25,12 @@
     throw new Error("settings-i18n.js failed to load before settings-ui-core.js");
   }
 
+  const animMergeApi = root.ClawdSettingsAnimOverridesMerge || {};
+  const mergePosterCacheIntoAnimationData = animMergeApi.mergePosterCacheIntoAnimationData
+    || ((data) => data);
+  const applyAnimationPosterPayloadToRuntime = animMergeApi.applyAnimationPosterPayload
+    || (() => ({ valid: false, stored: false, applied: false }));
+
   const shortcutApi = root.ClawdShortcutActions || {};
   const SHORTCUT_ACTIONS = shortcutApi.SHORTCUT_ACTIONS || {};
   const SHORTCUT_ACTION_IDS = shortcutApi.SHORTCUT_ACTION_IDS || Object.keys(SHORTCUT_ACTIONS);
@@ -45,6 +51,7 @@
     transientUiState: {
       generalSwitches: new Map(),
       agentSwitches: new Map(),
+      animMapSwitches: new Map(),
       size: {
         draftUi: null,
         dragging: false,
@@ -57,6 +64,9 @@
       bubblePolicyControls: new Map(),
       agentSwitches: new Map(),
       agentPermissionModes: new Map(),
+      animMapSwitches: new Map(),
+      animMapReset: null,
+      animOverrideTimingSliders: new Map(),
       bubblePolicySummary: null,
       size: null,
       soundVolume: null,
@@ -70,7 +80,16 @@
   const runtime = {
     agentMetadata: null,
     themeList: null,
+    codexPetsRefreshPending: false,
+    codexPetZipImportPending: false,
+    codexPetRemovalPendingThemeId: null,
     animationOverridesData: null,
+    animationOverridesFetchSeq: 0,
+    animationPosterRenderPending: false,
+    animationPosterRenderFlags: null,
+    animationPreviewPosterCache: new Map(),
+    pendingAnimationOverrideEdits: new Map(),
+    nextAnimationOverrideEditSeq: 1,
     animOverridesSubtab: "animations",
     expandedOverrideRowIds: new Set(),
     assetPicker: {
@@ -84,6 +103,7 @@
       clickCount: 0,
       contributorsExpanded: false,
     },
+    languageTransition: null,
   };
 
   const renderHooks = {
@@ -233,7 +253,7 @@
             showToast(t("toastSaveFailed") + msg, { error: true });
             return;
           }
-          setTransientState({ visualOn: nextVisual, pending: false, seq });
+          clearTransientState(seq);
           setSwitchVisual(sw, nextVisual, { pending: false });
         })
         .catch((err) => {
@@ -352,6 +372,10 @@
       return `${body.scrollHeight}px`;
     }
 
+    function isGroupConnected() {
+      return !!(document.body && document.body.contains(group));
+    }
+
     function setExpandedBodyHeight() {
       body.style.setProperty("--collapsible-body-height", measureCollapsibleBodyHeight());
     }
@@ -391,7 +415,16 @@
       if (!animate) {
         group.classList.toggle("collapsed", collapsed);
         setBodyInteractivity(collapsed);
-        body.style.setProperty("--collapsible-body-height", collapsed ? "0px" : measureCollapsibleBodyHeight());
+        if (collapsed) {
+          body.style.setProperty("--collapsible-body-height", "0px");
+        } else {
+          // Detached groups report scrollHeight=0 in some engines. Keep the
+          // body fully expanded until the post-mount RAF can measure a real height.
+          body.style.setProperty(
+            "--collapsible-body-height",
+            isGroupConnected() ? measureCollapsibleBodyHeight() : "none"
+          );
+        }
         return;
       }
 
@@ -578,6 +611,9 @@
     state.mountedControls.bubblePolicyControls.clear();
     state.mountedControls.agentSwitches.clear();
     state.mountedControls.agentPermissionModes.clear();
+    state.mountedControls.animMapSwitches.clear();
+    state.mountedControls.animMapReset = null;
+    state.mountedControls.animOverrideTimingSliders.clear();
     state.mountedControls.bubblePolicySummary = null;
     state.mountedControls.size = null;
     state.mountedControls.soundVolume = null;
@@ -645,18 +681,56 @@
     });
   }
 
+  function emptyAnimationOverridesData() {
+    return { theme: null, assets: [], sections: [], cards: [], sounds: [] };
+  }
+
   function fetchAnimationOverridesData() {
+    const seq = runtime.animationOverridesFetchSeq + 1;
+    runtime.animationOverridesFetchSeq = seq;
     if (!window.settingsAPI || typeof window.settingsAPI.getAnimationOverridesData !== "function") {
-      runtime.animationOverridesData = { theme: null, assets: [], cards: [] };
+      runtime.animationOverridesData = emptyAnimationOverridesData();
       return Promise.resolve(runtime.animationOverridesData);
     }
     return window.settingsAPI.getAnimationOverridesData().then((data) => {
-      runtime.animationOverridesData = data || { theme: null, assets: [], cards: [] };
+      if (seq !== runtime.animationOverridesFetchSeq) return runtime.animationOverridesData;
+      runtime.animationOverridesData = mergePosterCacheIntoAnimationData(
+        data || emptyAnimationOverridesData(),
+        runtime.animationPreviewPosterCache
+      );
       return runtime.animationOverridesData;
     }).catch((err) => {
+      if (seq !== runtime.animationOverridesFetchSeq) return runtime.animationOverridesData;
       console.warn("settings: getAnimationOverridesData failed", err);
-      runtime.animationOverridesData = { theme: null, assets: [], cards: [] };
+      if (!runtime.animationOverridesData) runtime.animationOverridesData = emptyAnimationOverridesData();
       return runtime.animationOverridesData;
+    });
+  }
+
+  function requestAnimationPosterRender({ content = false, modal = false } = {}) {
+    if (!content && !modal) return;
+    runtime.animationPosterRenderFlags = {
+      content: !!(content || (runtime.animationPosterRenderFlags && runtime.animationPosterRenderFlags.content)),
+      modal: !!(modal || (runtime.animationPosterRenderFlags && runtime.animationPosterRenderFlags.modal)),
+    };
+    if (runtime.animationPosterRenderPending) return;
+    runtime.animationPosterRenderPending = true;
+    requestAnimationFrame(() => {
+      const flags = runtime.animationPosterRenderFlags || {};
+      runtime.animationPosterRenderPending = false;
+      runtime.animationPosterRenderFlags = null;
+      requestRender({ content: !!flags.content, modal: !!flags.modal });
+    });
+  }
+
+  function applyAnimationPreviewPoster(payload) {
+    const result = applyAnimationPosterPayloadToRuntime(runtime, payload, {
+      warn: (message, value) => console.warn(message, value),
+    });
+    if (!result || !result.valid || !result.applied) return;
+    requestAnimationPosterRender({
+      content: state.activeTab === "animOverrides" && runtime.animOverridesSubtab === "animations",
+      modal: !!runtime.assetPicker.state,
     });
   }
 
@@ -787,7 +861,22 @@
     if (state.activeTab === "shortcuts") requestRender({ content: true });
   }
 
+  function clearTransientStateForChanges(changes) {
+    if (!changes || typeof changes !== "object") return;
+    for (const key of Object.keys(changes)) {
+      state.transientUiState.generalSwitches.delete(key);
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "agents")) {
+      state.transientUiState.agentSwitches.clear();
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "themeOverrides")) {
+      state.transientUiState.animMapSwitches.clear();
+    }
+  }
+
   function applyChanges(payload) {
+    const previousLang = getLang();
+    const previousSnapshot = state.snapshot;
     if (payload && payload.snapshot) {
       state.snapshot = payload.snapshot;
     } else if (payload && payload.changes && state.snapshot) {
@@ -796,10 +885,41 @@
     if (!state.snapshot) return;
 
     const changes = payload && payload.changes;
+    if (changes && Object.prototype.hasOwnProperty.call(changes, "lang")) {
+      const nextLang = getLang();
+      runtime.languageTransition = state.activeTab === "general" && previousLang !== nextLang
+        ? { from: previousLang, to: nextLang }
+        : null;
+    }
+    clearTransientStateForChanges(changes);
     const needsAnimOverridesRefresh = !!(changes && (
       "theme" in changes || "themeVariant" in changes || "themeOverrides" in changes
     ));
-    if (needsAnimOverridesRefresh) runtime.animationOverridesData = null;
+    if (changes && (
+      Object.prototype.hasOwnProperty.call(changes, "theme")
+      || Object.prototype.hasOwnProperty.call(changes, "themeVariant")
+    )) {
+      if (runtime.pendingAnimationOverrideEdits && typeof runtime.pendingAnimationOverrideEdits.clear === "function") {
+        runtime.pendingAnimationOverrideEdits.clear();
+      }
+      if (state.mountedControls.animOverrideTimingSliders
+        && typeof state.mountedControls.animOverrideTimingSliders.clear === "function") {
+        state.mountedControls.animOverrideTimingSliders.clear();
+      }
+    }
+    const shouldPreserveAnimOverridesData = !!(
+      needsAnimOverridesRefresh
+      && (state.activeTab === "animOverrides" || runtime.assetPicker.state)
+    );
+    if (needsAnimOverridesRefresh && !shouldPreserveAnimOverridesData) {
+      runtime.animationOverridesData = null;
+    }
+
+    const activeTab = tabs[state.activeTab];
+    if (activeTab && typeof activeTab.patchInPlace === "function"
+      && activeTab.patchInPlace(changes, { previousSnapshot, snapshot: state.snapshot })) {
+      return;
+    }
 
     if (changes && "themeOverrides" in changes) {
       if (state.activeTab === "theme") {
@@ -815,8 +935,10 @@
         });
         return;
       }
-      requestRender({ sidebar: true, content: true });
-      return;
+      if (state.activeTab !== "animMap") {
+        requestRender({ sidebar: true, content: true });
+        return;
+      }
     }
 
     if (needsAnimOverridesRefresh && (state.activeTab === "animOverrides" || runtime.assetPicker.state)) {
@@ -834,10 +956,6 @@
       }));
     }
 
-    const activeTab = tabs[state.activeTab];
-    if (activeTab && typeof activeTab.patchInPlace === "function" && activeTab.patchInPlace(changes)) {
-      return;
-    }
     requestRender({ sidebar: true, content: true });
   }
 
@@ -902,6 +1020,7 @@
     applyShortcutFailures,
     fetchThemes,
     fetchAnimationOverridesData,
+    applyAnimationPreviewPoster,
     stopAssetPickerPolling,
     closeAssetPicker,
     normalizeAssetPickerSelection,

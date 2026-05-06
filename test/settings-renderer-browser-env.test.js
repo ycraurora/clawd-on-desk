@@ -4,13 +4,16 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const SRC_DIR = path.join(__dirname, "..", "src");
 const SETTINGS_HTML = path.join(SRC_DIR, "settings.html");
 const SETTINGS_RENDERER = path.join(SRC_DIR, "settings-renderer.js");
 const SETTINGS_UI_CORE = path.join(SRC_DIR, "settings-ui-core.js");
+const SETTINGS_ANIM_OVERRIDES_MERGE = path.join(SRC_DIR, "settings-anim-overrides-merge.js");
 const SETTINGS_I18N = path.join(SRC_DIR, "settings-i18n.js");
 const SETTINGS_DOCTOR_MODAL = path.join(SRC_DIR, "settings-doctor-modal.js");
+const SETTINGS_ANIMATION_PREVIEW = path.join(SRC_DIR, "settings-animation-preview.html");
 const PRELOAD_SETTINGS = path.join(SRC_DIR, "preload-settings.js");
 const MAIN_PROCESS = path.join(SRC_DIR, "main.js");
 const DOCTOR_IPC = path.join(SRC_DIR, "doctor-ipc.js");
@@ -24,6 +27,689 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-about.js"),
 ];
 
+function createDeferred() {
+  const deferred = {};
+  deferred.promise = new Promise((resolve, reject) => {
+    deferred.resolve = resolve;
+    deferred.reject = reject;
+  });
+  return deferred;
+}
+
+function loadSettingsI18nForTest() {
+  const context = { globalThis: null };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_I18N, "utf8"), context);
+  return context.ClawdSettingsI18n.STRINGS;
+}
+
+function loadSettingsCoreForTest(settingsAPI) {
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    document: {
+      body: { contains: () => false },
+      getElementById: () => null,
+    },
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    window: null,
+    globalThis: null,
+    settingsAPI,
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: { en: {} },
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  return context.ClawdSettingsCore;
+}
+
+function createQueuedRaf() {
+  const queue = [];
+  return {
+    requestAnimationFrame(cb) {
+      queue.push(cb);
+      return queue.length;
+    },
+    flush() {
+      while (queue.length) {
+        const cb = queue.shift();
+        cb();
+      }
+    },
+  };
+}
+
+class FakeClassList {
+  constructor(el) {
+    this.el = el;
+  }
+
+  _set(values) {
+    this.el.className = [...values].join(" ");
+  }
+
+  _values() {
+    return new Set(String(this.el.className || "").split(/\s+/).filter(Boolean));
+  }
+
+  add(...names) {
+    const values = this._values();
+    for (const name of names) values.add(name);
+    this._set(values);
+  }
+
+  remove(...names) {
+    const values = this._values();
+    for (const name of names) values.delete(name);
+    this._set(values);
+  }
+
+  contains(name) {
+    return this._values().has(name);
+  }
+
+  toggle(name, force) {
+    const values = this._values();
+    const shouldAdd = force === undefined ? !values.has(name) : !!force;
+    if (shouldAdd) values.add(name);
+    else values.delete(name);
+    this._set(values);
+    return shouldAdd;
+  }
+}
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = String(tagName || "").toUpperCase();
+    this.children = [];
+    this.attributes = {};
+    this.dataset = {};
+    this.eventListeners = {};
+    this.className = "";
+    this.textContent = "";
+    this.title = "";
+    this.type = "";
+    this.disabled = false;
+    this.open = false;
+    this.parentNode = null;
+    this.scrollTop = 0;
+    this.style = {
+      _values: {},
+      setProperty(name, value) {
+        this._values[name] = String(value);
+      },
+      getPropertyValue(name) {
+        return this._values[name] || "";
+      },
+    };
+    this.classList = new FakeClassList(this);
+  }
+
+  appendChild(child) {
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+    if (name === "class") this.className = String(value);
+    if (name === "id") this.id = String(value);
+    if (name === "type") this.type = String(value);
+    if (name === "tabindex") this.tabIndex = Number(value);
+    if (name.startsWith("data-")) {
+      const key = name.slice(5).replace(/-([a-z])/g, (_m, ch) => ch.toUpperCase());
+      this.dataset[key] = String(value);
+    }
+  }
+
+  removeAttribute(name) {
+    delete this.attributes[name];
+    if (name === "class") this.className = "";
+    if (name === "id") delete this.id;
+  }
+
+  addEventListener(type, cb) {
+    if (!this.eventListeners[type]) this.eventListeners[type] = [];
+    this.eventListeners[type].push(cb);
+  }
+
+  set innerHTML(_value) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    const html = String(_value || "");
+    const stack = [this];
+    const tagRe = /<\/?([a-zA-Z][\w-]*)([^>]*)>/g;
+    let match;
+    while ((match = tagRe.exec(html)) !== null) {
+      const full = match[0];
+      const tagName = match[1];
+      const attrSource = match[2] || "";
+      if (full.startsWith("</")) {
+        if (stack.length > 1) stack.pop();
+        continue;
+      }
+      const child = new FakeElement(tagName);
+      const attrRe = /([:\w-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+      let attrMatch;
+      while ((attrMatch = attrRe.exec(attrSource)) !== null) {
+        const attrName = attrMatch[1];
+        if (attrName === "/") continue;
+        const attrValue = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? "";
+        child.setAttribute(attrName, attrValue);
+      }
+      stack[stack.length - 1].appendChild(child);
+      const voidTag = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tagName);
+      if (!full.endsWith("/>") && !voidTag) stack.push(child);
+    }
+  }
+
+  get innerHTML() {
+    return "";
+  }
+
+  _matches(selector) {
+    if (selector.startsWith(".")) return this.classList.contains(selector.slice(1));
+    return this.tagName.toLowerCase() === selector.toLowerCase();
+  }
+
+  querySelectorAll(selector) {
+    const parts = String(selector || "").trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return [];
+    const matches = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (child._matchesSelectorParts(parts)) matches.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return matches;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  contains(target) {
+    if (target === this) return true;
+    return this.children.some((child) => child.contains(target));
+  }
+
+  getBoundingClientRect() {
+    return { top: 0, left: 0, width: 0, height: 0, right: 0, bottom: 0 };
+  }
+
+  _matchesSelectorParts(parts) {
+    if (!this._matches(parts[parts.length - 1])) return false;
+    let current = this.parentNode;
+    for (let i = parts.length - 2; i >= 0; i--) {
+      while (current && !current._matches(parts[i])) current = current.parentNode;
+      if (!current) return false;
+      current = current.parentNode;
+    }
+    return true;
+  }
+
+  get isConnected() {
+    let current = this;
+    while (current) {
+      if (current.tagName === "BODY") return true;
+      current = current.parentNode;
+    }
+    return false;
+  }
+
+  get scrollHeight() {
+    if (!this.isConnected) return 0;
+    return Math.max(40, this.children.length * 40);
+  }
+}
+
+function loadGeneralLanguageRowForTest({
+  snapshot,
+} = {}) {
+  const raf = createQueuedRaf();
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+
+  const settingsAPI = {
+    update: () => Promise.resolve({ status: "ok" }),
+  };
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    document,
+    requestAnimationFrame: (cb) => raf.requestAnimationFrame(cb),
+    window: null,
+    globalThis: null,
+    settingsAPI,
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: {
+        en: {
+          rowLanguage: "Language",
+          rowLanguageDesc: "Language desc",
+          langEnglish: "English",
+          langChinese: "Chinese",
+          langKorean: "Korean",
+          langJapanese: "Japanese",
+          toastSaveFailed: "Failed: ",
+        },
+        zh: {
+          rowLanguage: "Language",
+          rowLanguageDesc: "Language desc",
+          langEnglish: "English",
+          langChinese: "Chinese",
+          langKorean: "Korean",
+          langJapanese: "Japanese",
+          toastSaveFailed: "Failed: ",
+        },
+      },
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8")
+    .replace(
+      "root.ClawdSettingsTabGeneral = { init };",
+      "root.ClawdSettingsTabGeneral = { init, __test: { buildLanguageRow } };"
+    );
+  vm.runInContext(generalSource, context);
+
+  const core = context.ClawdSettingsCore;
+  core.state.snapshot = snapshot || { lang: "en" };
+  core.state.activeTab = "general";
+  context.ClawdSettingsTabGeneral.init(core);
+
+  let contentRenderCount = 0;
+  let languageTransitionSeenByRender = null;
+  function renderLanguageOnly() {
+    contentRenderCount++;
+    core.ops.clearMountedControls();
+    content.innerHTML = "";
+    languageTransitionSeenByRender = core.runtime.languageTransition
+      ? { ...core.runtime.languageTransition }
+      : null;
+    content.appendChild(context.ClawdSettingsTabGeneral.__test.buildLanguageRow());
+  }
+  core.ops.installRenderHooks({ content: renderLanguageOnly });
+
+  return {
+    core,
+    content,
+    raf,
+    getContentRenderCount: () => contentRenderCount,
+    getLanguageTransitionSeenByRender: () => languageTransitionSeenByRender,
+    getSegmented: () => content.querySelector(".language-segmented"),
+  };
+}
+
+function loadAgentsTabForTest({
+  snapshot,
+  agentMetadata,
+  collapsedGroups = {},
+} = {}) {
+  const raf = createQueuedRaf();
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+
+  const localStorageData = {
+    "clawd.settings.collapsedGroups.v1": JSON.stringify(collapsedGroups),
+  };
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: (key) => (Object.prototype.hasOwnProperty.call(localStorageData, key) ? localStorageData[key] : null),
+      setItem: (key, value) => {
+        localStorageData[key] = String(value);
+      },
+    },
+    document,
+    requestAnimationFrame: (cb) => raf.requestAnimationFrame(cb),
+    window: null,
+    globalThis: null,
+    settingsAPI: {
+      command: () => Promise.resolve({ status: "ok" }),
+    },
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: {
+        en: {
+          agentsTitle: "Agents",
+          agentsSubtitle: "subtitle",
+          agentsEmpty: "empty",
+          rowAgentIdleAlerts: "Idle alerts",
+          rowAgentIdleAlertsDesc: "Idle alert desc",
+          rowAgentPermissions: "Permissions",
+          rowAgentPermissionsDesc: "Permissions desc",
+          rowCodexPermissionMode: "Permission mode",
+          rowCodexPermissionModeDesc: "Permission mode desc",
+          codexPermissionModeNative: "Native",
+          codexPermissionModeIntercept: "Intercept",
+          badgePermissionBubble: "Permission bubble",
+          eventSourceHook: "Hook",
+          eventSourceLogPoll: "Log poll",
+          eventSourcePlugin: "Plugin",
+          collapsibleExpand: "Expand",
+          collapsibleCollapse: "Collapse",
+          toastSaveFailed: "Failed: ",
+        },
+      },
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-agent-order.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8"), context);
+
+  const core = context.ClawdSettingsCore;
+  core.state.snapshot = snapshot || { agents: {} };
+  core.state.activeTab = "agents";
+  core.runtime.agentMetadata = Array.isArray(agentMetadata) ? agentMetadata : [];
+  context.ClawdSettingsTabAgents.init(core);
+
+  let contentRenderCount = 0;
+  function renderContent() {
+    contentRenderCount++;
+    core.ops.clearMountedControls();
+    content.innerHTML = "";
+    core.tabs.agents.render(content, core);
+  }
+  core.ops.installRenderHooks({ content: renderContent });
+
+  return {
+    core,
+    content,
+    raf,
+    getContentRenderCount: () => contentRenderCount,
+  };
+}
+
+function loadAnimMapTabForTest({
+  snapshot,
+} = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  body.appendChild(content);
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    window: null,
+    globalThis: null,
+    settingsAPI: {
+      command: () => Promise.resolve({ status: "ok" }),
+    },
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: { en: {} },
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-map.js"), "utf8"), context);
+
+  const core = context.ClawdSettingsCore;
+  core.state.snapshot = snapshot || { theme: "clawd", themeOverrides: {} };
+  core.state.activeTab = "animMap";
+  context.ClawdSettingsTabAnimMap.init(core);
+
+  let contentRenderCount = 0;
+  core.ops.installRenderHooks({
+    content: () => {
+      contentRenderCount++;
+    },
+  });
+
+  return {
+    core,
+    content,
+    getContentRenderCount: () => contentRenderCount,
+  };
+}
+
+function loadAnimOverridesTabForTest({
+  runtime,
+  modalRoot,
+  settingsAPI = {},
+  opsOverrides = {},
+  readersOverrides = {},
+}) {
+  const document = {
+    body: new FakeElement("body"),
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById: (id) => (id === "modalRoot" ? modalRoot : null),
+    querySelector: () => null,
+  };
+  const context = {
+    console,
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    setInterval: () => 1,
+    clearInterval: () => {},
+    URL,
+    window: {
+      settingsAPI: {
+        openThemeAssetsDir: () => Promise.resolve({ status: "ok" }),
+        command: () => Promise.resolve({ status: "ok" }),
+        exportAnimationOverrides: () => Promise.resolve({ status: "empty" }),
+        importAnimationOverrides: () => Promise.resolve({ status: "cancel" }),
+        previewAnimationOverride: () => Promise.resolve({ status: "ok" }),
+        previewReaction: () => Promise.resolve({ status: "ok" }),
+        ...settingsAPI,
+      },
+    },
+    globalThis: null,
+    ClawdSettingsAnimOverridesMerge: require(SETTINGS_ANIM_OVERRIDES_MERGE),
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8"), context);
+  const core = {
+    state: { activeTab: "animOverrides" },
+    runtime,
+    helpers: {
+      t: (key) => key,
+      attachActivation: (el, invoke) => {
+        if (typeof invoke === "function") el.addEventListener("click", () => invoke());
+        return el;
+      },
+    },
+    ops: {
+      selectTab: () => {},
+      requestRender: ({ modal = false } = {}) => {
+        if (modal && typeof core.renderHooks.modal === "function") core.renderHooks.modal();
+      },
+      fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      stopAssetPickerPolling: () => {},
+      closeAssetPicker: () => {},
+      normalizeAssetPickerSelection: () => {},
+      showToast: () => {},
+      ...opsOverrides,
+    },
+    i18n: {
+      STRINGS: { en: {} },
+    },
+    readers: {
+      hasAnyThemeOverride: () => false,
+      readThemeOverrideMap: () => null,
+      getLang: () => "en",
+      ...readersOverrides,
+    },
+    renderHooks: {},
+    tabs: {},
+  };
+  context.ClawdSettingsTabAnimOverrides.init(core);
+  return { core, document };
+}
+
+function createAnimOverrideCard(overrides = {}) {
+  return {
+    id: "state:thinking",
+    slotType: "state",
+    stateKey: "thinking",
+    triggerKind: "thinking",
+    currentFile: "cloudling-thinking.svg",
+    currentFileUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+    currentFilePreviewUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+    bindingLabel: "states.thinking[0]",
+    transition: { in: 120, out: 180 },
+    supportsAutoReturn: false,
+    supportsDuration: false,
+    assetCycleMs: 1000,
+    assetCycleStatus: "ok",
+    suggestedDurationMs: null,
+    suggestedDurationStatus: "unavailable",
+    previewDurationMs: 1000,
+    displayHintWarning: false,
+    displayHintTarget: null,
+    fallbackTargetState: null,
+    wideHitboxEnabled: false,
+    wideHitboxOverridden: false,
+    aspectRatioWarning: null,
+    ...overrides,
+  };
+}
+
+function createAnimOverridesRuntime(card, overrides = {}) {
+  return {
+    animationOverridesData: {
+      theme: { id: "cloudling", name: "Cloudling" },
+      assets: [],
+      sections: [{ id: "work", cards: [card] }],
+      cards: [card],
+      sounds: [],
+    },
+    animOverridesSubtab: "animations",
+    expandedOverrideRowIds: new Set([card.id]),
+    assetPicker: {
+      state: null,
+      pollTimer: null,
+    },
+    ...overrides,
+  };
+}
+
 describe("settings renderer browser environment", () => {
   it("loads browser scripts in dependency order and keeps CommonJS helpers out of settings.html", () => {
     const html = fs.readFileSync(SETTINGS_HTML, "utf8");
@@ -31,6 +717,7 @@ describe("settings renderer browser environment", () => {
       "shortcut-actions.js",
       "settings-size-slider.js",
       "settings-i18n.js",
+      "settings-anim-overrides-merge.js",
       "settings-ui-core.js",
       "settings-agent-order.js",
       "settings-tab-general.js",
@@ -122,6 +809,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(!doctorModalSource.includes("core.helpers.showToast"));
     assert.ok(doctorModalSource.includes("agentDetailText"));
     assert.ok(doctorModalSource.includes("startConnectionTest"));
+    assert.ok(doctorModalSource.includes("stopConnectionCountdown();"));
     assert.ok(html.includes(".doctor-agent-detail"));
     assert.ok(html.includes(".doctor-connection-panel"));
     assert.ok(html.includes(".doctor-fix-button"));
@@ -148,12 +836,16 @@ describe("settings renderer browser environment", () => {
     assert.ok(doctorIpcSource.includes('ipcMain.handle("doctor:test-connection"'));
     assert.ok(doctorIpcSource.includes('ipcMain.handle("doctor:open-clawd-log"'));
     assert.ok(doctorIpcSource.includes("createConnectionTestDeduper"));
+    assert.ok(doctorIpcSource.includes("createDoctorRunChecksDeduper"));
+    assert.ok(doctorIpcSource.includes("runDedupedDoctorChecks"));
     assert.ok(doctorIpcSource.includes("runDedupedDoctorConnectionTest"));
+    assert.ok(doctorIpcSource.includes("normalizeDoctorConnectionTestPayload"));
+    assert.ok(doctorIpcSource.includes("normalizeDoctorOpenLogPayload"));
     assert.ok(doctorIpcSource.includes("runConnectionTest"));
     assert.ok(doctorIpcSource.includes("openClawdLog"));
     assert.ok(doctorIpcSource.includes("formatDiagnosticReport"));
     assert.ok(doctorIpcSource.includes("getDoctorRedactionOptions"));
-    assert.ok(doctorIpcSource.includes("redactDoctorResult(buildDoctorResult(), getDoctorRedactionOptions(app))"));
+    assert.ok(doctorIpcSource.includes("redactDoctorResult(await runDedupedDoctorChecks(), getDoctorRedactionOptions(app))"));
     assert.ok(i18nSource.includes("doctorRunFailed"));
     assert.ok(i18nSource.includes("doctorFixApplied"));
     assert.ok(i18nSource.includes("doctorFixConfirmCodexDetail"));
@@ -182,6 +874,103 @@ describe("settings renderer browser environment", () => {
     assert.ok(/\.size-bubble::before\s*\{[\s\S]*top:\s*calc\(100%\s*\+\s*var\(--size-bubble-tail-gap\)\);[\s\S]*border-top:\s*var\(--size-bubble-tail-size\)\s+solid\s+var\(--accent\);[\s\S]*\}/.test(html));
     assert.ok(/\.size-bubble::after\s*\{[\s\S]*top:\s*calc\(100%\s*\+\s*var\(--size-bubble-tail-gap\)\);[\s\S]*border-top:\s*var\(--size-bubble-tail-inner-size\)\s+solid\s+var\(--panel-bg\);[\s\S]*\}/.test(html));
     assert.ok(!/\.size-bubble::after\s*\{[\s\S]*margin-top:\s*-1px;/.test(html));
+  });
+
+  it("uses transform-based Settings switch motion with a calmer shared timing", () => {
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    const switchRule = html.match(/\.switch\s*\{([\s\S]*?)\n\}/);
+    const knobRule = html.match(/\.switch::after\s*\{([\s\S]*?)\n\}/);
+    const onKnobRule = html.match(/\.switch\.on::after\s*\{([\s\S]*?)\n\}/);
+    assert.ok(switchRule, "settings.html should define the switch track");
+    assert.ok(knobRule, "settings.html should define the switch knob");
+    assert.ok(onKnobRule, "settings.html should define the on-state knob transform");
+    assert.ok(/transition:\s*background 0\.26s ease,\s*box-shadow 0\.26s ease,\s*transform 0\.16s ease;/.test(switchRule[1]));
+    assert.ok(/transform:\s*translateX\(0\)\s+scale\(1\);/.test(knobRule[1]));
+    assert.ok(!/transition:\s*left\b/.test(knobRule[1]));
+    assert.ok(/transition:\s*transform 0\.28s cubic-bezier\(0\.2,\s*0\.8,\s*0\.2,\s*1\),\s*box-shadow 0\.2s ease;/.test(knobRule[1]));
+    assert.ok(/transform:\s*translateX\(16px\)\s+scale\(1\);/.test(onKnobRule[1]));
+    assert.ok(!html.includes(".switch.on::after { left: 18px; }"));
+    assert.ok(/\.switch:not\(\.disabled\):active::after\s*\{[\s\S]*transform:\s*translateX\(var\(--switch-knob-x,\s*0\)\)\s+scale\(0\.94\);/.test(html));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.switch,[\s\S]*\.switch::after\s*\{[\s\S]*transition:\s*none;/.test(html));
+  });
+
+  it("animates the Settings language segmented control with a sliding active pill", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+
+    assert.ok(generalSource.includes("const LANGUAGE_OPTIONS = [\"en\", \"zh\", \"ko\", \"ja\"];"));
+    assert.ok(generalSource.includes("language-segmented"));
+    assert.ok(generalSource.includes("runtime.languageTransition"));
+    assert.ok(!generalSource.includes("language-segmented-transitioning"));
+    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(fromIndex));'));
+    assert.ok(generalSource.includes("requestAnimationFrame(() => {"));
+    assert.ok(generalSource.includes("segmented.getBoundingClientRect();"));
+    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(currentIndex));'));
+    assert.ok(coreSource.includes("languageTransition: null"));
+    assert.ok(coreSource.includes("const previousLang = getLang();"));
+    assert.ok(coreSource.includes('Object.prototype.hasOwnProperty.call(changes, "lang")'));
+    assert.ok(coreSource.includes('runtime.languageTransition = state.activeTab === "general" && previousLang !== nextLang'));
+    assert.ok(/\.language-segmented\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\);/.test(html));
+    assert.ok(html.includes("language-segmented intentionally overrides .segmented display"));
+    assert.ok(/\.language-segmented::before\s*\{[\s\S]*transform:\s*translateX\(calc\(var\(--language-active-index\)\s*\*\s*100%\)\);[\s\S]*transition:\s*transform 0\.24s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\);/.test(html));
+    assert.ok(/\.language-segmented button\.active\s*\{[\s\S]*background:\s*transparent;[\s\S]*box-shadow:\s*none;/.test(html));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-segmented::before\s*\{[\s\S]*transition:\s*none;/.test(html));
+  });
+
+  it("uses and clears the General tab language slide transition during render", () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.getContentRenderCount(), 1);
+    assert.strictEqual(harness.getSegmented().style.getPropertyValue("--language-active-index"), "0");
+
+    harness.core.ops.applyChanges({
+      changes: { lang: "zh" },
+      snapshot: { lang: "zh" },
+    });
+
+    const segmented = harness.getSegmented();
+    assert.strictEqual(harness.getContentRenderCount(), 2);
+    assert.deepStrictEqual(
+      harness.getLanguageTransitionSeenByRender(),
+      { from: "en", to: "zh" },
+      "General render should consume the previous and next language pair"
+    );
+    assert.strictEqual(
+      segmented.style.getPropertyValue("--language-active-index"),
+      "0",
+      "language pill should start at the previous language before rAF"
+    );
+    assert.strictEqual(harness.core.runtime.languageTransition, null);
+    const buttons = segmented.querySelectorAll("button");
+    assert.strictEqual(buttons[1].classList.contains("active"), true);
+
+    harness.raf.flush();
+    assert.strictEqual(
+      segmented.style.getPropertyValue("--language-active-index"),
+      "1",
+      "language pill should move to the new language on rAF"
+    );
+  });
+
+  it("does not keep a stale language slide transition when language changes off the General tab", () => {
+    const core = loadSettingsCoreForTest({});
+    core.state.activeTab = "agents";
+    core.state.snapshot = { lang: "en" };
+
+    core.ops.applyChanges({
+      changes: { lang: "zh" },
+      snapshot: { lang: "zh" },
+    });
+
+    assert.strictEqual(
+      core.runtime.languageTransition,
+      null,
+      "language changes outside General should not animate later when returning to General"
+    );
   });
 
   it("exposes aggregate and split bubble controls in the General tab", () => {
@@ -290,6 +1079,43 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("claudeHooksDisconnectConfirmKeep"));
   });
 
+  it("clears successful switch transient state so rerenders do not keep wait cursors", () => {
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    assert.ok(
+      /clearTransientState\(seq\);\s*setSwitchVisual\(sw,\s*nextVisual,\s*\{\s*pending:\s*false\s*\}\);/.test(coreSource),
+      "successful switch actions must delete transient pending state before any later rerender"
+    );
+    assert.ok(
+      !coreSource.includes("setTransientState({ visualOn: nextVisual, pending: false, seq });"),
+      "leaving a non-pending transient row lets rerendered controls inherit stale pending state"
+    );
+  });
+
+  it("clears settings-broadcast transient state before patching or rerendering", () => {
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    assert.ok(coreSource.includes("function clearTransientStateForChanges(changes)"));
+    assert.ok(coreSource.includes("state.transientUiState.generalSwitches.delete(key);"));
+    assert.ok(coreSource.includes('Object.prototype.hasOwnProperty.call(changes, "agents")'));
+    assert.ok(coreSource.includes("state.transientUiState.agentSwitches.clear();"));
+    const clearIndex = coreSource.indexOf("clearTransientStateForChanges(changes);");
+    const patchIndex = coreSource.indexOf("activeTab.patchInPlace(changes");
+    const renderIndex = coreSource.indexOf("requestRender({ sidebar: true, content: true });", patchIndex);
+    assert.notStrictEqual(clearIndex, -1);
+    assert.notStrictEqual(patchIndex, -1);
+    assert.notStrictEqual(renderIndex, -1);
+    assert.ok(clearIndex < patchIndex, "broadcast cleanup must happen before in-place patching");
+    assert.ok(clearIndex < renderIndex, "broadcast cleanup must happen before full rerender");
+  });
+
+  it("rerenders general tab when the Session HUD parent switch changes", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const match = generalSource.match(/const GENERAL_IN_PLACE_KEYS = new Set\(\[([\s\S]*?)\]\);/);
+    assert.ok(match, "general in-place key list must be present");
+    assert.ok(!match[1].includes('"sessionHudEnabled"'));
+    assert.ok(match[1].includes('"sessionHudShowElapsed"'));
+    assert.ok(match[1].includes('"sessionHudCleanupDetached"'));
+  });
+
   it("uses a roomier grid layout for Settings confirmation buttons", () => {
     const html = fs.readFileSync(SETTINGS_HTML, "utf8");
     assert.ok(/\.settings-confirm-modal\s*\{[\s\S]*width:\s*min\(480px,\s*100%\);/.test(html));
@@ -312,6 +1138,37 @@ describe("settings renderer browser environment", () => {
     assert.ok(html.includes(".collapsible-group-chevron"));
     assert.ok(i18nSource.includes("collapsibleExpand"));
     assert.ok(i18nSource.includes("collapsibleCollapse"));
+  });
+
+  it("groups Theme cards and exposes Codex Pet import actions in Settings", () => {
+    const tabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8");
+    const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
+    const mainSource = fs.readFileSync(MAIN_PROCESS, "utf8");
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+
+    assert.ok(tabSource.includes("function getThemeSections(themes)"));
+    assert.ok(tabSource.includes("themeGroupBuiltIn"));
+    assert.ok(tabSource.includes("themeGroupImportedCodexPets"));
+    assert.ok(tabSource.includes("themeGroupUserThemes"));
+    assert.ok(tabSource.includes("handleImportCodexPetZip"));
+    assert.ok(tabSource.includes("handleOpenCodexPetsFolder"));
+    assert.ok(tabSource.includes("handleRemoveCodexPet"));
+    assert.ok(tabSource.includes("themeUninstallPetLabel"));
+    assert.ok(coreSource.includes("codexPetZipImportPending"));
+    assert.ok(coreSource.includes("codexPetRemovalPendingThemeId"));
+    assert.ok(preloadSource.includes("openCodexPetsDir"));
+    assert.ok(preloadSource.includes("importCodexPetZip"));
+    assert.ok(preloadSource.includes("removeCodexPet"));
+    assert.ok(mainSource.includes('ipcMain.handle("settings:open-codex-pets-dir"'));
+    assert.ok(mainSource.includes('ipcMain.handle("settings:import-codex-pet-zip"'));
+    assert.ok(mainSource.includes('ipcMain.handle("settings:remove-codex-pet"'));
+    assert.ok(html.includes(".theme-section-title"));
+    assert.ok(html.includes(".theme-uninstall-btn"));
+    assert.ok(i18nSource.includes("themeImportPetZip"));
+    assert.ok(i18nSource.includes("toastCodexPetZipImportOk"));
+    assert.ok(i18nSource.includes("toastCodexPetRemoveOk"));
   });
 
   it("animates collapsible Settings groups with measured height instead of instant hidden jumps", () => {
@@ -378,12 +1235,685 @@ describe("settings renderer browser environment", () => {
     assert.ok(agentsSource.includes("sortAgentMetadataForSettings(runtime.agentMetadata"));
   });
 
+  it("keeps Agent management capability-driven for Gemini wait-for-input alerts", () => {
+    const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
+    assert.ok(agentsSource.includes("if (caps.notificationHook) {"));
+    assert.ok(agentsSource.includes('flag: "notificationHookEnabled"'));
+    assert.ok(!agentsSource.includes('agent.id === "gemini-cli"'));
+    assert.ok(!agentsSource.includes('agent.id !== "gemini-cli"'));
+    assert.ok(!agentsSource.includes("Gemini CLI"));
+    assert.ok(!agentsSource.includes("if (disabled || btn.classList.contains(\"active\")) return;"));
+    assert.ok(agentsSource.includes("if (btn.disabled || btn.classList.contains(\"active\")) return;"));
+    assert.ok(!agentsSource.includes("codex-permission-mode-transitioning"));
+  });
+
+  it("keeps Agent management switch broadcasts in place even when Codex permission rows are mounted", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codex": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    const before = harness.getContentRenderCount();
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: {
+            enabled: false,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: false,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(
+      harness.getContentRenderCount(),
+      before,
+      "Codex agent broadcasts should patch mounted switches instead of rebuilding and truncating switch motion"
+    );
+  });
+
+  it("disables the Codex Permissions switch in place when Permission mode changes to Native", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codex": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    const before = harness.getContentRenderCount();
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+          },
+        },
+      },
+    });
+
+    const permissionsSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "codex" && meta.flag === "permissionsEnabled");
+    assert.ok(permissionsSwitch, "Codex Permissions switch should stay mounted");
+    assert.strictEqual(harness.getContentRenderCount(), before);
+    assert.strictEqual(permissionsSwitch.element.classList.contains("disabled"), true);
+    assert.strictEqual(permissionsSwitch.element.attributes["aria-disabled"], "true");
+    assert.strictEqual(permissionsSwitch.element.attributes.tabindex, "-1");
+  });
+
+  it("slides the Codex permission mode pill when mode broadcasts patch in place", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codex": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    const segmented = harness.content.querySelector(".codex-permission-mode-segmented");
+    assert.ok(segmented, "Codex permission mode should use the sliding segmented control");
+    assert.strictEqual(segmented.style.getPropertyValue("--codex-permission-mode-active-index"), "1");
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(segmented.style.getPropertyValue("--codex-permission-mode-active-index"), "1");
+    harness.raf.flush();
+    assert.strictEqual(segmented.style.getPropertyValue("--codex-permission-mode-active-index"), "0");
+  });
+
+  it("patches agent-only broadcasts in place without requiring Codex-specific rows", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "gemini-cli": {
+            enabled: true,
+            notificationHookEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "gemini-cli",
+        name: "Gemini CLI",
+        eventSource: "hook",
+        capabilities: {
+          notificationHook: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:gemini-cli": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    const before = harness.getContentRenderCount();
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          "gemini-cli": {
+            enabled: true,
+            notificationHookEnabled: false,
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          "gemini-cli": {
+            enabled: true,
+            notificationHookEnabled: false,
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(
+      harness.getContentRenderCount(),
+      before,
+      "agent-only broadcasts should update mounted controls in place instead of rebuilding the expanded group"
+    );
+  });
+
+  it("does not initialize an expanded agent group at 0px height during rerender", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "gemini-cli": {
+            enabled: true,
+            notificationHookEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "gemini-cli",
+        name: "Gemini CLI",
+        eventSource: "hook",
+        capabilities: {
+          notificationHook: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:gemini-cli": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    const expandedBody = harness.content.querySelector(".collapsible-group-body");
+    assert.ok(expandedBody, "agent group body should render");
+    assert.notStrictEqual(
+      expandedBody.style.getPropertyValue("--collapsible-body-height"),
+      "0px",
+      "expanded groups should not paint one frame at 0px height before the next animation frame runs"
+    );
+  });
+
+  it("uses animated switches and local theme override patching in Animation Map", () => {
+    const animMapSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-map.js"), "utf8");
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    assert.ok(animMapSource.includes("state.transientUiState.animMapSwitches"));
+    assert.ok(animMapSource.includes("state.mountedControls.animMapSwitches"));
+    assert.ok(animMapSource.includes("helpers.attachAnimatedSwitch(sw, {"));
+    assert.ok(animMapSource.includes('command("setThemeOverrideDisabled"'));
+    assert.ok(!animMapSource.includes("helpers.attachActivation(sw"));
+    assert.ok(animMapSource.includes("function patchInPlace(changes)"));
+    assert.ok(animMapSource.includes('Object.prototype.hasOwnProperty.call(changes, "themeOverrides")'));
+    assert.ok(animMapSource.includes("helpers.setSwitchVisual(meta.element, readAnimMapVisualOn(meta.themeId, meta.stateKey), { pending: false });"));
+    assert.ok(animMapSource.includes("patchInPlace,"));
+    assert.ok(coreSource.includes('if (state.activeTab !== "animMap") {'));
+    assert.ok(coreSource.includes("activeTab.patchInPlace(changes"));
+  });
+
+  it("keeps Animation Map theme override broadcasts in place and syncs the mounted switch", () => {
+    const harness = loadAnimMapTabForTest({
+      snapshot: {
+        theme: "clawd",
+        themeOverrides: {
+          clawd: {
+            states: {
+              error: { disabled: false },
+            },
+          },
+        },
+      },
+    });
+    const sw = new FakeElement("div");
+    sw.className = "switch on";
+    harness.content.appendChild(sw);
+    harness.core.state.mountedControls.animMapSwitches.set("clawd:error", {
+      element: sw,
+      themeId: "clawd",
+      stateKey: "error",
+    });
+    const before = harness.getContentRenderCount();
+
+    harness.core.ops.applyChanges({
+      changes: {
+        themeOverrides: {
+          clawd: {
+            states: {
+              error: { disabled: true },
+            },
+          },
+        },
+      },
+      snapshot: {
+        theme: "clawd",
+        themeOverrides: {
+          clawd: {
+            states: {
+              error: { disabled: true },
+            },
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(harness.getContentRenderCount(), before);
+    assert.strictEqual(sw.classList.contains("on"), false);
+    assert.strictEqual(sw.attributes["aria-checked"], "false");
+  });
+
+  it("rebuilds Animation Map instead of patching with stale theme ids when the theme changes", () => {
+    const harness = loadAnimMapTabForTest({
+      snapshot: {
+        theme: "clawd",
+        themeOverrides: {},
+      },
+    });
+    const sw = new FakeElement("div");
+    sw.className = "switch on";
+    harness.content.appendChild(sw);
+    harness.core.state.mountedControls.animMapSwitches.set("clawd:error", {
+      element: sw,
+      themeId: "clawd",
+      stateKey: "error",
+    });
+    const before = harness.getContentRenderCount();
+
+    harness.core.ops.applyChanges({
+      changes: {
+        theme: "calico",
+        themeOverrides: {
+          calico: {
+            states: {
+              error: { disabled: true },
+            },
+          },
+        },
+      },
+      snapshot: {
+        theme: "calico",
+        themeOverrides: {
+          calico: {
+            states: {
+              error: { disabled: true },
+            },
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(
+      harness.getContentRenderCount(),
+      before + 1,
+      "theme changes should force a rebuild so Animation Map switches use the new theme id"
+    );
+  });
+
   it("keeps stale sound override prefs resettable from the settings UI", () => {
     const overridesSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8");
     assert.ok(
       overridesSource.includes("resetBtn.disabled = !slot.hasStoredOverride;"),
       "sound override row reset must stay enabled when prefs still contain a stale sound override entry"
     );
+  });
+
+  it("uses captured poster previews for trusted scripted animation override SVGs", () => {
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    const previewHtml = fs.readFileSync(SETTINGS_ANIMATION_PREVIEW, "utf8");
+    const overridesSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8");
+    const mainSource = fs.readFileSync(MAIN_PROCESS, "utf8");
+    const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
+    const rendererSource = fs.readFileSync(SETTINGS_RENDERER, "utf8");
+
+    assert.ok(html.includes("img-src 'self' data: file:"));
+    assert.ok(!html.includes("frame-src"));
+    assert.ok(html.includes("settings-anim-overrides-merge.js"));
+    const themeTabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8");
+    assert.ok(!html.includes("object-src"));
+    assert.ok(html.includes(".theme-thumb-atlas-frame"));
+    assert.ok(html.includes("width: 800%;"));
+    assert.ok(themeTabSource.includes("getCodexPetPreviewAtlasUrl"));
+    assert.ok(themeTabSource.includes("theme-thumb-atlas-frame"));
+    assert.ok(themeTabSource.includes("theme.codexPet.previewAtlasUrl"));
+    assert.ok(!themeTabSource.includes('document.createElement("object")'));
+    assert.ok(previewHtml.includes("default-src 'self' file:"));
+    assert.ok(previewHtml.includes("object-src 'self' file:"));
+    assert.ok(previewHtml.includes("script-src 'unsafe-inline'"));
+    assert.ok(previewHtml.includes("window.renderAnimationPreviewPoster"));
+    assert.ok(previewHtml.includes("width: 285%;"));
+    assert.ok(mainSource.includes("ANIMATION_OVERRIDE_PREVIEW_POSTER_VERSION"));
+    assert.ok(!overridesSource.includes('document.createElement("iframe")'));
+    assert.ok(overridesSource.includes('if (url.protocol === "data:" || url.protocol === "blob:") return fileUrl;'));
+    assert.ok(overridesSource.includes("getCardPreviewUrl(card)"));
+    assert.ok(overridesSource.includes("getAssetPreviewUrl(selected)"));
+    assert.ok(mainSource.includes("function _needsScriptedAnimationPreviewPoster"));
+    assert.ok(mainSource.includes("function _isObjectChannelSvgAnimationFile"));
+    assert.ok(mainSource.includes('theme.rendering.svgChannel === "object"'));
+    assert.ok(mainSource.includes("function _captureAnimationPreviewPosterDataUrl"));
+    assert.ok(mainSource.includes("function _scheduleAnimationPreviewPosters"));
+    assert.ok(mainSource.includes("capturePage"));
+    assert.ok(mainSource.includes("settings:animation-preview-poster-ready"));
+    assert.ok(preloadSource.includes("onAnimationPreviewPosterReady"));
+    assert.ok(rendererSource.includes("onAnimationPreviewPosterReady"));
+    assert.ok(mainSource.includes("theme._builtin"));
+    assert.ok(mainSource.includes("trustedRuntime.scriptedSvgFiles"));
+    assert.ok(mainSource.includes("currentFilePreviewUrl: preview.previewImageUrl"));
+    assert.ok(mainSource.includes("previewPosterPending: preview.previewPosterPending"));
+    assert.ok(!mainSource.includes("function _hydrateAnimationPreviewPosters"));
+  });
+
+  it("merges pushed animation preview posters without accepting stale cache keys", () => {
+    const merge = require(SETTINGS_ANIM_OVERRIDES_MERGE);
+    const cache = new Map();
+    merge.rememberAnimationPreviewPoster(cache, {
+      themeId: "cloudling",
+      filename: "cloudling-thinking.svg",
+      previewImageUrl: "data:image/png;base64,poster-k1",
+      previewPosterCacheKey: "K1",
+    });
+
+    const data = {
+      theme: { id: "cloudling" },
+      assets: [{
+        name: "cloudling-thinking.svg",
+        previewImageUrl: null,
+        previewPosterCacheKey: "K1",
+        previewPosterPending: true,
+      }],
+      sections: [{
+        cards: [{
+          currentFile: "cloudling-thinking.svg",
+          currentFilePreviewUrl: null,
+          currentFilePreviewPosterCacheKey: "K1",
+          previewPosterPending: true,
+        }],
+      }],
+      cards: [{
+        currentFile: "cloudling-thinking.svg",
+        currentFilePreviewUrl: null,
+        currentFilePreviewPosterCacheKey: "K1",
+        previewPosterPending: true,
+      }],
+    };
+    merge.mergePosterCacheIntoAnimationData(data, cache);
+    assert.strictEqual(data.assets[0].previewImageUrl, "data:image/png;base64,poster-k1");
+    assert.strictEqual(data.assets[0].previewPosterPending, false);
+    assert.strictEqual(data.sections[0].cards[0].currentFilePreviewUrl, "data:image/png;base64,poster-k1");
+    assert.strictEqual(data.cards[0].currentFilePreviewUrl, "data:image/png;base64,poster-k1");
+
+    const mismatch = {
+      theme: { id: "cloudling" },
+      assets: [{
+        name: "cloudling-thinking.svg",
+        previewImageUrl: null,
+        previewPosterCacheKey: "K2",
+        previewPosterPending: true,
+      }],
+      sections: [{
+        cards: [{
+          currentFile: "cloudling-thinking.svg",
+          currentFilePreviewUrl: null,
+          currentFilePreviewPosterCacheKey: "K2",
+          previewPosterPending: true,
+        }],
+      }],
+      cards: [{
+        currentFile: "cloudling-thinking.svg",
+        currentFilePreviewUrl: null,
+        currentFilePreviewPosterCacheKey: "K2",
+        previewPosterPending: true,
+      }],
+    };
+    merge.mergePosterCacheIntoAnimationData(mismatch, cache);
+    assert.strictEqual(mismatch.assets[0].previewImageUrl, null);
+    assert.strictEqual(mismatch.sections[0].cards[0].currentFilePreviewUrl, null);
+    assert.strictEqual(mismatch.cards[0].currentFilePreviewUrl, null);
+  });
+
+  it("keeps poster-ready pushes across an overlapping animation overrides fetch", async () => {
+    const deferred = createDeferred();
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => deferred.promise,
+    });
+    const fetchPromise = core.ops.fetchAnimationOverridesData();
+    core.ops.applyAnimationPreviewPoster({
+      themeId: "cloudling",
+      filename: "cloudling-thinking.svg",
+      previewImageUrl: "data:image/png;base64,pushed",
+      previewPosterCacheKey: "K1",
+    });
+    deferred.resolve({
+      theme: { id: "cloudling" },
+      assets: [{
+        name: "cloudling-thinking.svg",
+        previewImageUrl: null,
+        previewPosterCacheKey: "K1",
+        previewPosterPending: true,
+      }],
+      sections: [{
+        cards: [{
+          currentFile: "cloudling-thinking.svg",
+          currentFilePreviewUrl: null,
+          currentFilePreviewPosterCacheKey: "K1",
+          previewPosterPending: true,
+        }],
+      }],
+      cards: [{
+        currentFile: "cloudling-thinking.svg",
+        currentFilePreviewUrl: null,
+        currentFilePreviewPosterCacheKey: "K1",
+        previewPosterPending: true,
+      }],
+    });
+    await fetchPromise;
+
+    assert.strictEqual(core.runtime.animationOverridesData.assets[0].previewImageUrl, "data:image/png;base64,pushed");
+    assert.strictEqual(core.runtime.animationOverridesData.sections[0].cards[0].currentFilePreviewUrl, "data:image/png;base64,pushed");
+    assert.strictEqual(core.runtime.animationOverridesData.cards[0].currentFilePreviewUrl, "data:image/png;base64,pushed");
+  });
+
+  it("patches pending animation override data when a poster push arrives after fetch", async () => {
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => Promise.resolve({
+        theme: { id: "cloudling" },
+        assets: [{
+          name: "cloudling-thinking.svg",
+          previewImageUrl: null,
+          previewPosterCacheKey: "K1",
+          previewPosterPending: true,
+        }],
+        sections: [{
+          cards: [{
+            currentFile: "cloudling-thinking.svg",
+            currentFilePreviewUrl: null,
+            currentFilePreviewPosterCacheKey: "K1",
+            previewPosterPending: true,
+          }],
+        }],
+        cards: [{
+          currentFile: "cloudling-thinking.svg",
+          currentFilePreviewUrl: null,
+          currentFilePreviewPosterCacheKey: "K1",
+          previewPosterPending: true,
+        }],
+      }),
+    });
+
+    await core.ops.fetchAnimationOverridesData();
+    core.ops.applyAnimationPreviewPoster({
+      themeId: "cloudling",
+      filename: "cloudling-thinking.svg",
+      previewImageUrl: "data:image/png;base64,late-push",
+      previewPosterCacheKey: "K1",
+    });
+
+    assert.strictEqual(core.runtime.animationOverridesData.assets[0].previewImageUrl, "data:image/png;base64,late-push");
+    assert.strictEqual(core.runtime.animationOverridesData.assets[0].previewPosterPending, false);
+    assert.strictEqual(core.runtime.animationOverridesData.sections[0].cards[0].currentFilePreviewUrl, "data:image/png;base64,late-push");
+    assert.strictEqual(core.runtime.animationOverridesData.cards[0].currentFilePreviewUrl, "data:image/png;base64,late-push");
+  });
+
+  it("does not let a stale rejected animation overrides fetch clear newer data", async () => {
+    const oldFetch = createDeferred();
+    const newFetch = createDeferred();
+    const fetches = [oldFetch, newFetch];
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => fetches.shift().promise,
+    });
+
+    const oldPromise = core.ops.fetchAnimationOverridesData();
+    const newPromise = core.ops.fetchAnimationOverridesData();
+    newFetch.resolve({ theme: { id: "calico" }, assets: [{ name: "calico-idle.png" }], sections: [], cards: [] });
+    await newPromise;
+    oldFetch.reject(new Error("old failed"));
+    await oldPromise;
+
+    assert.strictEqual(core.runtime.animationOverridesData.theme.id, "calico");
+    assert.strictEqual(core.runtime.animationOverridesData.assets[0].name, "calico-idle.png");
+  });
+
+  it("renders pending scripted animation previews as placeholders instead of SVG images", () => {
+    const merge = require(SETTINGS_ANIM_OVERRIDES_MERGE);
+    const asset = {
+      name: "cloudling-thinking.svg",
+      fileUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      previewImageUrl: null,
+      needsScriptedPreviewPoster: true,
+      previewPosterCacheKey: "K1",
+      previewPosterPending: true,
+      cycleMs: null,
+      cycleStatus: "unavailable",
+    };
+    const card = {
+      id: "state:thinking",
+      slotType: "state",
+      sectionId: "work",
+      stateKey: "thinking",
+      triggerKind: "thinking",
+      currentFile: asset.name,
+      currentFileUrl: asset.fileUrl,
+      currentFilePreviewUrl: null,
+      currentFilePreviewPosterCacheKey: "K1",
+      needsScriptedPreviewPoster: true,
+      previewPosterPending: true,
+      bindingLabel: "states.thinking[0]",
+      transition: { in: 150, out: 150 },
+      supportsAutoReturn: false,
+      supportsDuration: false,
+      autoReturnMs: null,
+      durationMs: null,
+      assetCycleMs: null,
+      assetCycleStatus: "unavailable",
+      suggestedDurationMs: null,
+      suggestedDurationStatus: "unavailable",
+      previewDurationMs: null,
+      displayHintWarning: false,
+      displayHintTarget: null,
+      fallbackTargetState: null,
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      aspectRatioWarning: null,
+    };
+    assert.strictEqual(merge.getAssetPreviewUrl(asset), null);
+    assert.strictEqual(merge.getCardPreviewUrl(card), null);
+
+    const runtime = {
+      animationOverridesData: {
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [asset],
+        sections: [{ id: "work", cards: [card] }],
+        cards: [card],
+        sounds: [],
+      },
+      animOverridesSubtab: "animations",
+      expandedOverrideRowIds: new Set(["state:thinking"]),
+      assetPicker: {
+        state: null,
+        pollTimer: null,
+      },
+    };
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    runtime.assetPicker.state = { cardId: card.id, selectedFile: asset.name };
+    core.renderHooks.modal();
+
+    const svgImages = [
+      ...parent.querySelectorAll("img"),
+      ...modalRoot.querySelectorAll("img"),
+    ].filter((img) => String(img.src || "").includes(".svg"));
+    assert.strictEqual(svgImages.length, 0);
+    assert.ok(parent.querySelectorAll(".anim-override-preview-pending").length >= 2);
+    assert.ok(modalRoot.querySelectorAll(".anim-override-preview-pending").length >= 1);
   });
 
   it("keeps localized shortcut labels from collapsing into vertical CJK text", () => {
@@ -404,6 +1934,723 @@ describe("settings renderer browser environment", () => {
       coreSource.includes("...(map.sounds ? Object.keys(map.sounds) : []),"),
       "sound overrides must participate in the global reset-all gate"
     );
+  });
+
+  it("keeps current Animation Overrides data visible while theme override refresh is pending", () => {
+    const deferred = createDeferred();
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => deferred.promise,
+    });
+    const previousData = {
+      theme: { id: "cloudling", name: "Cloudling" },
+      assets: [],
+      sections: [{ id: "work", cards: [] }],
+      cards: [],
+      sounds: [],
+    };
+    core.state.activeTab = "animOverrides";
+    core.state.snapshot = {
+      theme: "cloudling",
+      themeOverrides: {
+        cloudling: {
+          states: {
+            thinking: {
+              transition: { in: 120, out: 180 },
+            },
+          },
+        },
+      },
+    };
+    core.runtime.animationOverridesData = previousData;
+
+    let renderCount = 0;
+    core.ops.installRenderHooks({
+      sidebar: () => {},
+      content: () => {
+        renderCount++;
+      },
+      modal: () => {},
+    });
+    core.ops.applyChanges({
+      changes: {
+        themeOverrides: {
+          cloudling: {
+            states: {
+              thinking: {
+                transition: { in: 220, out: 180 },
+              },
+            },
+          },
+        },
+      },
+      snapshot: core.state.snapshot,
+    });
+
+    assert.strictEqual(
+      core.runtime.animationOverridesData,
+      previousData,
+      "Animation Overrides should keep the last rendered data while the async refresh is pending"
+    );
+    assert.strictEqual(renderCount, 0, "pending refresh should not immediately rerender into an empty loading page");
+  });
+
+  it("lets Animation Overrides patch theme override broadcasts before a full content render", () => {
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => Promise.resolve({ cards: [], sections: [], sounds: [] }),
+    });
+    core.state.activeTab = "animOverrides";
+    core.state.snapshot = {
+      theme: "cloudling",
+      themeOverrides: {},
+    };
+    core.runtime.animationOverridesData = {
+      theme: { id: "cloudling", name: "Cloudling" },
+      assets: [],
+      sections: [],
+      cards: [],
+      sounds: [],
+    };
+
+    let patchCount = 0;
+    let contentRenderCount = 0;
+    core.tabs.animOverrides = {
+      patchInPlace(changes) {
+        patchCount++;
+        assert.ok(changes && Object.prototype.hasOwnProperty.call(changes, "themeOverrides"));
+        return true;
+      },
+    };
+    core.ops.installRenderHooks({
+      sidebar: () => {},
+      content: () => {
+        contentRenderCount++;
+      },
+      modal: () => {},
+    });
+
+    core.ops.applyChanges({
+      changes: { themeOverrides: { cloudling: { states: {} } } },
+      snapshot: core.state.snapshot,
+    });
+
+    assert.strictEqual(patchCount, 1);
+    assert.strictEqual(contentRenderCount, 0);
+  });
+
+  it("renders visible loading text for the initial Animation Overrides fetch", () => {
+    const runtime = {
+      animationOverridesData: null,
+      animOverridesSubtab: "animations",
+      expandedOverrideRowIds: new Set(),
+      assetPicker: {
+        state: null,
+        pollTimer: null,
+      },
+    };
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+
+    core.tabs.animOverrides.render(parent, core);
+
+    const placeholders = parent.querySelectorAll(".placeholder-desc");
+    assert.ok(placeholders.length > 0);
+    assert.strictEqual(placeholders[0].textContent, "animOverridesLoading");
+  });
+
+  it("uses specific fade timing labels and gives the slider label enough room", () => {
+    const strings = loadSettingsI18nForTest();
+    assert.strictEqual(strings.en.animOverridesFadeIn, "Fade in on enter");
+    assert.strictEqual(strings.en.animOverridesFadeOut, "Fade out on exit");
+    assert.strictEqual(strings.zh.animOverridesFadeIn, "进入时淡入");
+    assert.strictEqual(strings.zh.animOverridesFadeOut, "退出时淡出");
+    assert.strictEqual(strings.ko.animOverridesFadeIn, "진입 시 페이드 인");
+    assert.strictEqual(strings.ko.animOverridesFadeOut, "종료 시 페이드 아웃");
+    assert.strictEqual(strings.ja.animOverridesFadeIn, "開始時フェードイン");
+    assert.strictEqual(strings.ja.animOverridesFadeOut, "終了時フェードアウト");
+
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    assert.match(
+      html,
+      /\.anim-override-slider-row\s*\{[\s\S]*grid-template-columns:\s*96px minmax\(0,\s*1fr\) 100px;/
+    );
+    assert.match(
+      html,
+      /\.anim-override-number-field\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*white-space:\s*nowrap;/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="number"\]\s*\{[\s\S]*width:\s*76px;[\s\S]*text-align:\s*center;/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]\s*\{[\s\S]*--anim-override-fill:\s*0%;/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]::-webkit-slider-runnable-track\s*\{[\s\S]*var\(--accent\) var\(--anim-override-fill\)/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]::-webkit-slider-runnable-track\s*\{[\s\S]*var\(--row-border\) var\(--anim-override-fill\)/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]::-webkit-slider-thumb\s*\{[\s\S]*-webkit-appearance:\s*none;[\s\S]*box-shadow:/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]::-webkit-slider-thumb\s*\{[\s\S]*color-mix\(in srgb,\s*var\(--accent\)/
+    );
+    assert.match(
+      html,
+      /\.anim-override-slider-row input\[type="range"\]:hover::-webkit-slider-thumb\s*\{[\s\S]*transform:\s*scale\(1\.08\);/
+    );
+    assert.match(
+      html,
+      /@media \(forced-colors:\s*active\)\s*\{[\s\S]*accent-color:\s*Highlight;/
+    );
+  });
+
+  it("keeps committed slider timing visible across a stale animation override refresh", async () => {
+    const card = {
+      id: "state:thinking",
+      slotType: "state",
+      stateKey: "thinking",
+      triggerKind: "thinking",
+      currentFile: "cloudling-thinking.svg",
+      currentFileUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      currentFilePreviewUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      bindingLabel: "states.thinking[0]",
+      transition: { in: 120, out: 180 },
+      supportsAutoReturn: false,
+      supportsDuration: false,
+      assetCycleMs: 1000,
+      assetCycleStatus: "ok",
+      suggestedDurationMs: null,
+      suggestedDurationStatus: "unavailable",
+      previewDurationMs: 1000,
+      displayHintWarning: false,
+      displayHintTarget: null,
+      fallbackTargetState: null,
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      aspectRatioWarning: null,
+    };
+    const runtime = {
+      animationOverridesData: {
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [],
+        sections: [{ id: "work", cards: [card] }],
+        cards: [card],
+        sounds: [],
+      },
+      animOverridesSubtab: "animations",
+      expandedOverrideRowIds: new Set(["state:thinking"]),
+      assetPicker: {
+        state: null,
+        pollTimer: null,
+      },
+    };
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => Promise.resolve({ status: "ok" }),
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      },
+    });
+    const parent = new FakeElement("main");
+    let contentRenderCount = 0;
+    const renderContent = () => {
+      contentRenderCount++;
+      parent.innerHTML = "";
+      core.tabs.animOverrides.render(parent, core);
+    };
+    core.ops.requestRender = ({ content = false, modal = false } = {}) => {
+      if (content) renderContent();
+      if (modal && typeof core.renderHooks.modal === "function") core.renderHooks.modal();
+    };
+    renderContent();
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    assert.ok(range, "expanded animation override row should render a fade-in range input");
+    assert.strictEqual(range.style.getPropertyValue("--anim-override-fill"), "12%");
+    range.value = "260";
+    for (const listener of range.eventListeners.input || []) listener();
+    assert.strictEqual(range.style.getPropertyValue("--anim-override-fill"), "26%");
+    for (const listener of range.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const nextRange = parent.querySelectorAll("input").find((input) => input.type === "range");
+    assert.strictEqual(contentRenderCount, 1, "timing slider commits should not rebuild the content pane");
+    assert.strictEqual(nextRange, range, "timing slider commits should keep the mounted range control in place");
+    assert.strictEqual(
+      nextRange.value,
+      "260",
+      "stale refreshes should not flash the slider back to the old committed timing"
+    );
+  });
+
+  it("keeps sequential fade timing commits from reverting the previous side", async () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const payloads = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (_name, payload) => {
+          payloads.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const ranges = parent.querySelectorAll("input").filter((input) => input.type === "range");
+    assert.ok(ranges.length >= 2, "expanded row should render fade in and fade out sliders");
+
+    ranges[0].value = "260";
+    for (const listener of ranges[0].eventListeners.input || []) listener();
+    for (const listener of ranges[0].eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    ranges[1].value = "300";
+    for (const listener of ranges[1].eventListeners.input || []) listener();
+    for (const listener of ranges[1].eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(payloads.length, 2);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(payloads[0].transition)), { in: 260, out: 180 });
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(payloads[1].transition)),
+      { in: 260, out: 300 },
+      "second fade commit should use the pending/latest fade-in value, not the stale rendered card"
+    );
+  });
+
+  it("does not submit duplicate animation timing commands on number change followed by blur", async () => {
+    const card = {
+      id: "state:thinking",
+      slotType: "state",
+      stateKey: "thinking",
+      triggerKind: "thinking",
+      currentFile: "cloudling-thinking.svg",
+      currentFileUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      currentFilePreviewUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      bindingLabel: "states.thinking[0]",
+      transition: { in: 120, out: 180 },
+      supportsAutoReturn: false,
+      supportsDuration: false,
+      assetCycleMs: 1000,
+      assetCycleStatus: "ok",
+      suggestedDurationMs: null,
+      suggestedDurationStatus: "unavailable",
+      previewDurationMs: 1000,
+      displayHintWarning: false,
+      displayHintTarget: null,
+      fallbackTargetState: null,
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      aspectRatioWarning: null,
+    };
+    const runtime = {
+      animationOverridesData: {
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [],
+        sections: [{ id: "work", cards: [card] }],
+        cards: [card],
+        sounds: [],
+      },
+      animOverridesSubtab: "animations",
+      expandedOverrideRowIds: new Set(["state:thinking"]),
+      assetPicker: {
+        state: null,
+        pollTimer: null,
+      },
+    };
+    const modalRoot = new FakeElement("div");
+    let commandCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => {
+          commandCount++;
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const inputs = parent.querySelectorAll("input");
+    const range = inputs.find((input) => input.type === "range");
+    const number = inputs.find((input) => input.type === "number");
+    assert.ok(range, "expanded animation override row should render a fade-in range input");
+    assert.ok(number, "expanded animation override row should render a fade-in number input");
+    assert.ok(number.parentNode.classList.contains("anim-override-number-field"));
+    const unit = number.parentNode.querySelector(".anim-override-slider-unit");
+    assert.ok(unit, "timing number input should render an inline unit label");
+    assert.strictEqual(unit.textContent, "ms");
+    number.value = "260";
+    for (const listener of number.eventListeners.input || []) listener();
+    assert.strictEqual(range.style.getPropertyValue("--anim-override-fill"), "26%");
+    for (const listener of number.eventListeners.change || []) listener();
+    for (const listener of number.eventListeners.blur || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(commandCount, 1);
+  });
+
+  it("does not keep reset-slot null timing values as pending slider edits", async () => {
+    const card = createAnimOverrideCard({
+      supportsAutoReturn: true,
+      autoReturnMs: 2600,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const payloads = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (_name, payload) => {
+          payloads.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      },
+      readersOverrides: {
+        readThemeOverrideMap: () => ({
+          states: {
+            thinking: {
+              transition: { in: 120, out: 180 },
+            },
+          },
+          timings: {
+            autoReturn: {
+              thinking: 2600,
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(resetButton, "expanded row should render a reset button");
+    for (const listener of resetButton.eventListeners.click || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(payloads.length, 1);
+    assert.strictEqual(payloads[0].autoReturnMs, null);
+    assert.ok(
+      !core.runtime.pendingAnimationOverrideEdits || core.runtime.pendingAnimationOverrideEdits.size === 0,
+      "reset-slot null timing values should not leak into the pending timing edit map"
+    );
+  });
+
+  it("only patches Animation Overrides broadcasts that exactly acknowledge pending timing edits", () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    let fetchCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => new Promise(() => {}),
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          fetchCount++;
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const fadeInRange = parent.querySelectorAll("input").find((input) => input.type === "range");
+    fadeInRange.value = "260";
+    for (const listener of fadeInRange.eventListeners.input || []) listener();
+    for (const listener of fadeInRange.eventListeners.change || []) listener();
+
+    const previousSnapshot = { themeOverrides: {} };
+    const acknowledgedSnapshot = {
+      themeOverrides: {
+        cloudling: {
+          states: {
+            thinking: {
+              transition: { in: 260, out: 180 },
+            },
+          },
+        },
+      },
+    };
+    assert.strictEqual(
+      core.tabs.animOverrides.patchInPlace(
+        { themeOverrides: acknowledgedSnapshot.themeOverrides },
+        { previousSnapshot, snapshot: acknowledgedSnapshot }
+      ),
+      true,
+      "the in-flight timing edit broadcast should be safe to reconcile in place"
+    );
+
+    const unrelatedSnapshot = {
+      themeOverrides: {
+        cloudling: {
+          states: {
+            working: {
+              file: "other.svg",
+            },
+          },
+        },
+      },
+    };
+    assert.strictEqual(
+      core.tabs.animOverrides.patchInPlace(
+        { themeOverrides: unrelatedSnapshot.themeOverrides },
+        { previousSnapshot, snapshot: unrelatedSnapshot }
+      ),
+      false,
+      "unrelated themeOverrides broadcasts should fall through to a full content refresh"
+    );
+    assert.strictEqual(fetchCount, 1);
+  });
+
+  it("routes matching Animation Overrides timing broadcasts through applyChanges in place", () => {
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => Promise.resolve({
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [],
+        sections: [],
+        cards: [{
+          id: "state:thinking",
+          slotType: "state",
+          stateKey: "thinking",
+          transition: { in: 260, out: 180 },
+        }],
+        sounds: [],
+      }),
+    });
+    core.state.activeTab = "animOverrides";
+    core.state.snapshot = {
+      theme: "cloudling",
+      themeOverrides: {},
+    };
+    core.runtime.animationOverridesData = {
+      theme: { id: "cloudling", name: "Cloudling" },
+      assets: [],
+      sections: [],
+      cards: [{
+        id: "state:thinking",
+        slotType: "state",
+        stateKey: "thinking",
+        transition: { in: 120, out: 180 },
+      }],
+      sounds: [],
+    };
+    core.runtime.animOverridesSubtab = "animations";
+    core.runtime.assetPicker.state = null;
+    core.runtime.pendingAnimationOverrideEdits.set("state:thinking", {
+      seq: 1,
+      slotType: "state",
+      stateKey: "thinking",
+      transition: { in: 260, out: 180 },
+    });
+
+    let contentRenderCount = 0;
+    let modalRenderCount = 0;
+    core.ops.installRenderHooks({
+      sidebar: () => {},
+      content: () => {
+        contentRenderCount++;
+      },
+      modal: () => {
+        modalRenderCount++;
+      },
+    });
+
+    const nextSnapshot = {
+      theme: "cloudling",
+      themeOverrides: {
+        cloudling: {
+          states: {
+            thinking: {
+              transition: { in: 260, out: 180 },
+            },
+          },
+        },
+      },
+    };
+    core.ops.applyChanges({
+      changes: { themeOverrides: nextSnapshot.themeOverrides },
+      snapshot: nextSnapshot,
+    });
+
+    assert.strictEqual(contentRenderCount, 0, "matching timing ack should avoid rebuilding content");
+    assert.strictEqual(modalRenderCount, 0, "modal render happens after the async fetch settles");
+  });
+
+  it("does not patch mixed-key Animation Overrides broadcasts in place", () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    let fetchCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => new Promise(() => {}),
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          fetchCount++;
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const fadeInRange = parent.querySelectorAll("input").find((input) => input.type === "range");
+    fadeInRange.value = "260";
+    for (const listener of fadeInRange.eventListeners.input || []) listener();
+    for (const listener of fadeInRange.eventListeners.change || []) listener();
+
+    const previousSnapshot = { lang: "en", themeOverrides: {} };
+    const snapshot = {
+      lang: "ja",
+      themeOverrides: {
+        cloudling: {
+          states: {
+            thinking: {
+              transition: { in: 260, out: 180 },
+            },
+          },
+        },
+      },
+    };
+
+    assert.strictEqual(
+      core.tabs.animOverrides.patchInPlace(
+        { lang: "ja", themeOverrides: snapshot.themeOverrides },
+        { previousSnapshot, snapshot }
+      ),
+      false,
+      "mixed-key broadcasts should fall through so non-timing UI side effects can render"
+    );
+    assert.strictEqual(fetchCount, 0);
+  });
+
+  it("clears pending Animation Overrides timing edits on theme changes", () => {
+    const core = loadSettingsCoreForTest({});
+    core.state.snapshot = {
+      theme: "cloudling",
+      themeVariant: "default",
+      themeOverrides: {},
+    };
+    core.runtime.pendingAnimationOverrideEdits.set("state:thinking", {
+      slotType: "state",
+      stateKey: "thinking",
+      transition: { in: 260, out: 180 },
+      seq: 1,
+    });
+    core.state.mountedControls.animOverrideTimingSliders.set("state:thinking:transition.in", { row: {} });
+
+    core.ops.applyChanges({
+      changes: { theme: "calico" },
+      snapshot: {
+        theme: "calico",
+        themeVariant: "default",
+        themeOverrides: {},
+      },
+    });
+
+    assert.strictEqual(core.runtime.pendingAnimationOverrideEdits.size, 0);
+    assert.strictEqual(core.state.mountedControls.animOverrideTimingSliders.size, 0);
+  });
+
+  it("does not patch Animation Overrides broadcasts without a pending timing edit", () => {
+    const card = {
+      id: "state:thinking",
+      slotType: "state",
+      stateKey: "thinking",
+      triggerKind: "thinking",
+      currentFile: "cloudling-thinking.svg",
+      currentFileUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      currentFilePreviewUrl: "file:///themes/cloudling/assets/cloudling-thinking.svg",
+      bindingLabel: "states.thinking[0]",
+      transition: { in: 120, out: 180 },
+      supportsAutoReturn: false,
+      supportsDuration: false,
+      assetCycleMs: 1000,
+      assetCycleStatus: "ok",
+      suggestedDurationMs: null,
+      suggestedDurationStatus: "unavailable",
+      previewDurationMs: 1000,
+      displayHintWarning: false,
+      displayHintTarget: null,
+      fallbackTargetState: null,
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      aspectRatioWarning: null,
+    };
+    const runtime = {
+      animationOverridesData: {
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [],
+        sections: [{ id: "work", cards: [card] }],
+        cards: [card],
+        sounds: [],
+      },
+      animOverridesSubtab: "animations",
+      expandedOverrideRowIds: new Set(["state:thinking"]),
+      assetPicker: {
+        state: null,
+        pollTimer: null,
+      },
+    };
+    const modalRoot = new FakeElement("div");
+    let fetchCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          fetchCount++;
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    assert.strictEqual(core.tabs.animOverrides.patchInPlace({ themeOverrides: { cloudling: { states: {} } } }), false);
+    assert.strictEqual(fetchCount, 0);
   });
 });
 

@@ -8,6 +8,7 @@ const {
   checkAgentIntegrations,
   findOpencodePluginEntry,
 } = require("../src/doctor-detectors/agent-integrations");
+const { GEMINI_HOOK_EVENTS } = require("../hooks/gemini-install");
 
 const tempDirs = [];
 
@@ -50,6 +51,17 @@ function runOne(descriptor, options = {}) {
       scriptPath: "/app/hooks/test-hook.js",
     })),
   }).details[0];
+}
+
+function geminiHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/gemini-hook.js" ${event}`) {
+  const hooks = {};
+  for (const event of GEMINI_HOOK_EVENTS) {
+    hooks[event] = [{
+      matcher: "*",
+      hooks: [{ name: "clawd", type: "command", command: commandForEvent(event) }],
+    }];
+  }
+  return hooks;
 }
 
 afterEach(() => {
@@ -113,6 +125,163 @@ describe("checkAgentIntegrations", () => {
 
     const detail = runOne(descriptor);
     assert.strictEqual(detail.status, "ok");
+  });
+
+  it("validates Gemini nested hook commands for every required event", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: geminiHooksConfig(),
+    });
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        return {
+          ok: true,
+          nodeBin: "/node",
+          scriptPath: "/app/hooks/gemini-hook.js",
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, GEMINI_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, GEMINI_HOOK_EVENTS.length);
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "gemini_hooks",
+      value: "enabled",
+      detail: "hooksConfig allows Clawd Gemini hooks",
+    });
+  });
+
+  it("warns when Gemini is missing any required hook event", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: {
+        BeforeTool: [{
+          matcher: "*",
+          hooks: [{ name: "clawd", type: "command", command: '"/node" "/app/hooks/gemini-hook.js" BeforeTool' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.ok(detail.missingGeminiHookEvents.includes("SessionStart"));
+    assert.ok(detail.missingGeminiHookEvents.includes("AfterTool"));
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "gemini-cli" });
+  });
+
+  it("turns Gemini ok into warning when hooksConfig.enabled=false", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: geminiHooksConfig(),
+      hooksConfig: {
+        enabled: false,
+      },
+    });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.strictEqual(detail.detail, "Gemini hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "gemini_hooks",
+      value: "disabled-global",
+      detail: "hooksConfig.enabled is false",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("reports disabled Gemini hooks even when command coverage is incomplete", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: {
+        BeforeTool: [{
+          matcher: "*",
+          hooks: [{ name: "clawd", type: "command", command: '"/node" "/app/hooks/gemini-hook.js" BeforeTool' }],
+        }],
+      },
+      hooksConfig: {
+        enabled: false,
+      },
+    });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.detail, "Gemini hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "gemini_hooks",
+      value: "disabled-global",
+      detail: "hooksConfig.enabled is false",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("turns Gemini ok into warning when hooksConfig.disabled includes clawd", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: geminiHooksConfig(),
+      hooksConfig: {
+        disabled: ["clawd"],
+      },
+    });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "gemini_hooks",
+      value: "disabled-clawd",
+      detail: 'hooksConfig.disabled includes "clawd"',
+    });
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("does not treat legacy disabled Gemini hook command strings as a stable disabled signal", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: geminiHooksConfig(),
+      hooksConfig: {
+        disabled: ['"/node" "/app/hooks/gemini-hook.js" BeforeTool'],
+      },
+    });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.level, null);
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "gemini_hooks",
+      value: "enabled",
+      detail: "hooksConfig allows Clawd Gemini hooks",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
   });
 
   it("returns broken-path when all matching commands fail validation", () => {
@@ -285,6 +454,34 @@ describe("checkAgentIntegrations", () => {
     });
     assert.strictEqual(result.status, "critical");
     assert.strictEqual(result.level, "critical");
+  });
+
+  it("keeps the integration summary in warning when Gemini hooks are disabled", () => {
+    const descriptor = baseDescriptor({
+      agentId: "gemini-cli",
+      marker: "gemini-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: geminiHooksConfig(),
+      hooksConfig: {
+        enabled: false,
+      },
+    });
+
+    const result = checkAgentIntegrations({
+      fs,
+      descriptors: [descriptor],
+      validateCommand: () => ({
+        ok: true,
+        nodeBin: "/node",
+        scriptPath: "/app/hooks/gemini-hook.js",
+      }),
+    });
+    assert.strictEqual(result.status, "warning");
+    assert.strictEqual(result.level, "warning");
+    assert.strictEqual(result.warningCount, 1);
+    assert.strictEqual(result.okCount, 0);
   });
 });
 

@@ -10,6 +10,9 @@
 //   listAgents()                        Promise<Array<{id, name, ...}>>
 //   onChanged(cb)                       cb({ changes, snapshot? }) — fires for
 //                                       every settings-changed broadcast
+//   onAnimationPreviewPosterReady(cb)   cb({ themeId, filename, previewImageUrl,
+//                                       previewPosterCacheKey }) — incremental
+//                                       animation override preview poster
 //
 // All writes go through ipcMain.handle("settings:update") in main.js, which
 // routes through the controller. The renderer never owns state — it always
@@ -64,10 +67,22 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   checkForUpdates: () => ipcRenderer.invoke("settings:check-for-updates"),
   openExternal: (url) => ipcRenderer.invoke("settings:open-external", url),
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
+  refreshCodexPets: () => ipcRenderer.invoke("settings:refresh-codex-pets"),
+  openCodexPetsDir: () => ipcRenderer.invoke("settings:open-codex-pets-dir"),
+  importCodexPetZip: () => ipcRenderer.invoke("settings:import-codex-pet-zip"),
+  removeCodexPet: (themeId) => ipcRenderer.invoke("settings:remove-codex-pet", themeId),
   confirmRemoveTheme: (themeId) =>
     ipcRenderer.invoke("settings:confirm-remove-theme", themeId),
   onChanged: (cb) => {
     if (typeof cb === "function") listeners.add(cb);
+  },
+  onAnimationPreviewPosterReady: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    const listener = (_event, payload) => {
+      try { cb(payload); } catch (err) { console.warn("animation preview poster listener threw:", err); }
+    };
+    ipcRenderer.on("settings:animation-preview-poster-ready", listener);
+    return () => ipcRenderer.removeListener("settings:animation-preview-poster-ready", listener);
   },
   onShortcutFailuresChanged: (cb) => {
     if (typeof cb !== "function") return () => {};

@@ -335,6 +335,7 @@ const HOOK_MARKER = "clawd-hook.js";
 const SETTINGS_FILENAME = "settings.json";
 const CODEX_OFFICIAL_HOOK_SOURCE = "codex-official";
 const MAX_CODEX_OFFICIAL_TURNS = 200;
+const CODEX_SESSION_ROLE_SUBAGENT = "subagent";
 
 function entriesContainCommandMarker(entries, marker) {
   if (!Array.isArray(entries)) return false;
@@ -395,7 +396,25 @@ function pruneCodexOfficialTurns(turns) {
   }
 }
 
-function resolveCodexOfficialHookState(data, requestedState, turns) {
+function getCodexOfficialTurnKey(sessionId, turnId) {
+  if (!turnId) return null;
+  return `${sessionId || "default"}|${turnId}`;
+}
+
+function classifyCodexOfficialSession(data, classifier) {
+  if (!classifier || typeof classifier.registerSession !== "function") return "unknown";
+  const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "default";
+  try {
+    return classifier.registerSession(sessionId, {
+      hookPayload: data,
+      hookRole: data.codex_session_role,
+    });
+  } catch {
+    return "unknown";
+  }
+}
+
+function resolveCodexOfficialHookState(data, requestedState, turns, classifier = null) {
   if (!data || data.agent_id !== "codex" || data.hook_source !== CODEX_OFFICIAL_HOOK_SOURCE) {
     return { state: requestedState, drop: false };
   }
@@ -403,32 +422,37 @@ function resolveCodexOfficialHookState(data, requestedState, turns) {
   const event = typeof data.event === "string" ? data.event : "";
   const turnId = typeof data.turn_id === "string" && data.turn_id ? data.turn_id : null;
   const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "default";
+  const sessionRole = classifyCodexOfficialSession(data, classifier);
+  const isSubagent = sessionRole === CODEX_SESSION_ROLE_SUBAGENT;
+  const headless = isSubagent ? { headless: true } : {};
+  const turnKey = getCodexOfficialTurnKey(sessionId, turnId);
 
   if (event === "Stop" && data.stop_hook_active === true) {
-    if (turnId && turns) turns.delete(turnId);
-    return { state: requestedState, drop: true };
+    if (turnKey && turns) turns.delete(turnKey);
+    return { state: requestedState, drop: true, ...headless };
   }
 
-  if (turnId && turns) {
+  if (turnKey && turns) {
     if (event === "UserPromptSubmit") {
-      turns.set(turnId, { sessionId, hadToolUse: false });
+      turns.set(turnKey, { sessionId, hadToolUse: false });
       pruneCodexOfficialTurns(turns);
     } else if (event === "PreToolUse" || event === "PostToolUse") {
-      const current = turns.get(turnId) || { sessionId, hadToolUse: false };
+      const current = turns.get(turnKey) || { sessionId, hadToolUse: false };
       current.sessionId = sessionId;
       current.hadToolUse = true;
-      turns.set(turnId, current);
+      turns.set(turnKey, current);
       pruneCodexOfficialTurns(turns);
     } else if (event === "Stop") {
-      const current = turns.get(turnId);
-      if (current) turns.delete(turnId);
+      const current = turns.get(turnKey);
+      if (current) turns.delete(turnKey);
+      if (isSubagent) return { state: "idle", drop: false, headless: true };
       return { state: current && current.hadToolUse ? "attention" : "idle", drop: false };
     }
   } else if (event === "Stop") {
-    return { state: "idle", drop: false };
+    return { state: "idle", drop: false, ...headless };
   }
 
-  return { state: requestedState, drop: false };
+  return { state: requestedState, drop: false, ...headless };
 }
 
 module.exports = function initServer(ctx) {
@@ -895,6 +919,7 @@ function startHttpServer() {
           const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
           const sessionTitle = rawTitle || null;
           const permissionSuspect = data.permission_suspect === true;
+          const preserveState = data.preserve_state === true;
           const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
           // Agent gate: user disabled this agent in the settings panel. Drop
           // with 204 so hook scripts get a quick no-op response instead of
@@ -933,14 +958,23 @@ function startHttpServer() {
               res.end("ok");
               return;
             }
-            const codexHookState = resolveCodexOfficialHookState(data, state, codexOfficialTurns);
+            const codexHookState = resolveCodexOfficialHookState(
+              data,
+              state,
+              codexOfficialTurns,
+              ctx.codexSubagentClassifier
+            );
             if (codexHookState.drop) {
               res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
               res.end();
               return;
             }
             state = codexHookState.state;
-            if (agentId === "codex" && event !== "codex-permission") {
+            if (
+              agentId === "codex"
+              && event !== "codex-permission"
+              && typeof ctx.clearCodexNotifyBubbles === "function"
+            ) {
               ctx.clearCodexNotifyBubbles(sid, `codex-state-transition:${state}`);
             }
             if (state.startsWith("mini-") && !svg) {
@@ -957,6 +991,17 @@ function startHttpServer() {
                 allowSingletonFallback: event === "Stop",
               });
               if (perm) ctx.resolvePermissionEntry(perm, "deny", "User answered in terminal");
+              // Stale elicitation sweep: AskUserQuestion is a blocking tool
+              // call, so any forward progress in the same session means the
+              // user already answered in the terminal.  The exact-match above
+              // may miss the elicitation entry when the /state PostToolUse
+              // carries a different tool_input fingerprint from the original
+              // /permission request, or when tool_use_id is absent.
+              for (const stale of [...ctx.pendingPermissions]) {
+                if (stale !== perm && stale.isElicitation && stale.res && stale.sessionId === sid) {
+                  ctx.resolvePermissionEntry(stale, "deny", "User answered in terminal");
+                }
+              }
             }
             recordRequestHookEvent.acceptedUnlessDnd(shouldDropForDnd());
             if (svg) {
@@ -971,10 +1016,11 @@ function startHttpServer() {
                 agentPid,
                 agentId,
                 host,
-                headless,
+                headless: headless || codexHookState.headless === true,
                 displayHint: display_svg,
                 sessionTitle,
                 permissionSuspect,
+                preserveState,
                 hookSource,
               });
             }
@@ -1459,6 +1505,7 @@ module.exports.__test = {
   normalizeToolMatchValue,
   buildToolInputFingerprint,
   findPendingPermissionForStateEvent,
+  getCodexOfficialTurnKey,
   resolveCodexOfficialHookState,
   recordHookEventInBuffer,
   getRecentHookEventsFromBuffer,

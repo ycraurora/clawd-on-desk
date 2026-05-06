@@ -6,7 +6,8 @@
     "soundMuted",
     "soundVolume",
     "lowPowerIdleMode",
-    "sessionHudEnabled",
+    "sessionHudShowElapsed",
+    "sessionHudCleanupDetached",
     "allowEdgePinning",
     "keepSizeAcrossDisplays",
     "openAtLogin",
@@ -24,9 +25,12 @@
   const BUBBLE_SECONDS_AUTO_COMMIT_DELAY_MS = 600;
 
   let state = null;
+  let runtime = null;
   let readers = null;
   let helpers = null;
   let ops = null;
+
+  const LANGUAGE_OPTIONS = ["en", "zh", "ko", "ja"];
 
   function t(key) {
     return helpers.t(key);
@@ -42,6 +46,7 @@
     subtitle.textContent = t("settingsSubtitle");
     parent.appendChild(subtitle);
 
+    const sessionHudControlsEnabled = !!(state.snapshot && state.snapshot.sessionHudEnabled);
     parent.appendChild(helpers.buildSection(t("sectionAppearance"), [
       buildLanguageRow(),
       buildSizeSliderRow(),
@@ -49,6 +54,18 @@
         key: "sessionHudEnabled",
         labelKey: "rowSessionHud",
         descKey: "rowSessionHudDesc",
+      }),
+      helpers.buildSwitchRow({
+        key: "sessionHudShowElapsed",
+        labelKey: "rowSessionHudElapsed",
+        descKey: "rowSessionHudElapsedDesc",
+        disabled: !sessionHudControlsEnabled,
+      }),
+      helpers.buildSwitchRow({
+        key: "sessionHudCleanupDetached",
+        labelKey: "rowSessionHudCleanupDetached",
+        descKey: "rowSessionHudCleanupDetachedDesc",
+        disabled: !sessionHudControlsEnabled,
       }),
       buildDashboardRow(),
       helpers.buildSwitchRow({
@@ -169,7 +186,7 @@
         `<span class="row-desc"></span>` +
       `</div>` +
       `<div class="row-control">` +
-        `<div class="segmented" role="tablist">` +
+        `<div class="segmented language-segmented" role="tablist">` +
           `<button data-lang="en"></button>` +
           `<button data-lang="zh"></button>` +
           `<button data-lang="ko"></button>` +
@@ -184,6 +201,22 @@
     buttons[2].textContent = t("langKorean");
     buttons[3].textContent = t("langJapanese");
     const current = readers.getLang();
+    const segmented = row.querySelector(".language-segmented");
+    const transition = runtime && runtime.languageTransition;
+    const currentIndex = Math.max(0, LANGUAGE_OPTIONS.indexOf(current));
+    const fromIndex = transition && transition.to === current
+      ? Math.max(0, LANGUAGE_OPTIONS.indexOf(transition.from))
+      : currentIndex;
+    segmented.style.setProperty("--language-active-index", String(fromIndex));
+    if (fromIndex !== currentIndex) {
+      requestAnimationFrame(() => {
+        segmented.getBoundingClientRect();
+        segmented.style.setProperty("--language-active-index", String(currentIndex));
+      });
+    }
+    if (runtime && transition) {
+      runtime.languageTransition = null;
+    }
     for (const btn of buttons) {
       if (btn.dataset.lang === current) btn.classList.add("active");
       btn.addEventListener("click", () => {
@@ -913,6 +946,7 @@
 
   function init(core) {
     state = core.state;
+    runtime = core.runtime;
     readers = core.readers;
     helpers = core.helpers;
     ops = core.ops;

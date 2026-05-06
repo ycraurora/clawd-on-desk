@@ -1,10 +1,13 @@
 // test/state.test.js — Unit tests for src/state.js core logic
 const { describe, it, beforeEach, afterEach, mock } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 // Load default theme for test ctx
 const themeLoader = require("../src/theme-loader");
-themeLoader.init(require("path").join(__dirname, "..", "src"));
+themeLoader.init(path.join(__dirname, "..", "src"));
 const _defaultTheme = themeLoader.loadTheme("clawd");
 const _calicoTheme = themeLoader.loadTheme("calico");
 const { createTranslator } = require("../src/i18n");
@@ -372,6 +375,35 @@ describe("working sub-animations", () => {
   });
 });
 
+describe("hitbox selection", () => {
+  let api;
+
+  afterEach(() => { if (api) api.cleanup(); });
+
+  it("uses a file-specific hitbox for the displayed SVG", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const fileBox = { x: 10, y: 11, w: 12, h: 13 };
+    theme.fileHitBoxes = { "clawd-working-typing.svg": fileBox };
+    api = require("../src/state")(makeCtx({ theme }));
+
+    api.applyState("working", "clawd-working-typing.svg");
+
+    assert.deepStrictEqual(api.getCurrentHitBox(), fileBox);
+  });
+
+  it("keeps wide/default fallback when no file-specific hitbox exists", () => {
+    const theme = cloneTheme(_defaultTheme);
+    theme.fileHitBoxes = {};
+    api = require("../src/state")(makeCtx({ theme }));
+
+    api.applyState("error", "clawd-error.svg");
+    assert.deepStrictEqual(api.getCurrentHitBox(), theme.hitBoxes.wide);
+
+    api.applyState("working", "clawd-working-typing.svg");
+    assert.deepStrictEqual(api.getCurrentHitBox(), theme.hitBoxes.default);
+  });
+});
+
 describe("visual fallback resolution", () => {
   let api;
 
@@ -601,11 +633,118 @@ describe("cleanStaleSessions()", () => {
     assert.strictEqual(api.sessions.size, 0);
   });
 
-  it("last non-headless deleted → triggers yawning", () => {
+  it("detached ended idle session expires quickly when auto-clear is enabled", () => {
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "claude-code",
+      sourcePid: 9999,
+      pidReachable: true,
+      updatedAt: Date.now() - 31000,
+      recentEvents: [{ event: "Stop", state: "attention", at: Date.now() - 32000 }],
+    }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 0);
+  });
+
+  it("detached idle session stays by default before normal stale cleanup", () => {
+    api = require("../src/state")(makeCtx({ processKill: makePidKill(new Set()) }));
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "claude-code",
+      sourcePid: 9999,
+      pidReachable: true,
+      updatedAt: Date.now() - 31000,
+      recentEvents: [{ event: "Stop", state: "attention", at: Date.now() - 32000 }],
+    }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 1);
+  });
+
+  it("broadcasts HUD-hidden state before deleting detached ended session", () => {
+    const alivePids = new Set([9999]);
+    const broadcasts = [];
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(alivePids),
+      sessionHudCleanupDetached: true,
+      broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot),
+    }));
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "claude-code",
+      sourcePid: 9999,
+      pidReachable: true,
+      updatedAt: Date.now() - 10000,
+      recentEvents: [{ event: "Stop", state: "attention", at: Date.now() - 11000 }],
+    }));
+
+    assert.strictEqual(api.emitSessionSnapshot({ force: true }).changed, true);
+    assert.strictEqual(broadcasts[0].sessions.find((s) => s.id === "s1").hiddenFromHud, false);
+
+    alivePids.delete(9999);
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 1);
+    assert.strictEqual(broadcasts.length, 2);
+    assert.strictEqual(broadcasts[1].sessions.find((s) => s.id === "s1").hiddenFromHud, true);
+  });
+
+  it("detached idle session without an ended badge does not auto-clear", () => {
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "gemini-cli",
+      sourcePid: 9999,
+      pidReachable: true,
+      updatedAt: Date.now() - 31000,
+      recentEvents: [{ event: "AfterAgent", state: "idle", at: Date.now() - 32000 }],
+    }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 1);
+  });
+
+  it("detached ended session does not auto-clear when pid reachability was never confirmed", () => {
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "claude-code",
+      sourcePid: 9999,
+      pidReachable: false,
+      updatedAt: Date.now() - 31000,
+      recentEvents: [{ event: "Stop", state: "attention", at: Date.now() - 32000 }],
+    }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 1);
+  });
+
+  it("detached ended Kimi auto-clear disposes notification state", () => {
+    const cleared = [];
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+      clearKimiNotifyBubbles: (id, reason) => cleared.push({ id, reason }),
+    }));
+    api.updateSession("k1", "notification", "PermissionRequest", { agentId: "kimi-cli" });
+    api.sessions.set("k1", rawSession("idle", {
+      agentId: "kimi-cli",
+      sourcePid: 9999,
+      pidReachable: true,
+      updatedAt: Date.now() - 31000,
+      recentEvents: [{ event: "Stop", state: "attention", at: Date.now() - 32000 }],
+    }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 0);
+    assert.deepStrictEqual(cleared, [{ id: "k1", reason: "kimi-session-disposed" }]);
+  });
+
+  it("last non-headless deleted → returns to idle", () => {
     api = require("../src/state")(makeCtx({ processKill: makePidKill(new Set()) }));
     api.sessions.set("s1", rawSession("working", { agentPid: 9999, pidReachable: true }));
     api.cleanStaleSessions();
-    assert.strictEqual(api.getCurrentState(), "yawning");
+    assert.strictEqual(api.getCurrentState(), "idle");
   });
 
   it("all headless deleted → idle (not yawning)", () => {
@@ -693,6 +832,17 @@ describe("updateSession()", () => {
     assert.ok(!api.sessions.has("s1"));
   });
 
+  it("dismissSession removes only Clawd bookkeeping for that session", () => {
+    update(api, { id: "s1", state: "working" });
+    update(api, { id: "s2", state: "thinking" });
+
+    assert.strictEqual(api.dismissSession("s1"), true);
+    assert.ok(!api.sessions.has("s1"));
+    assert.ok(api.sessions.has("s2"));
+    assert.strictEqual(api.resolveDisplayState(), "thinking");
+    assert.strictEqual(api.dismissSession("missing"), false);
+  });
+
   it("PermissionRequest → notification state, no session creation", () => {
     update(api, { id: "perm1", state: "notification", event: "PermissionRequest" });
     assert.ok(!api.sessions.has("perm1"));
@@ -719,11 +869,11 @@ describe("updateSession()", () => {
     assert.strictEqual(api.getCurrentState(), "sweeping");
   });
 
-  it("SessionEnd + last non-headless → sleeping", () => {
+  it("SessionEnd + last non-headless → idle", () => {
     update(api, { id: "s1", state: "working" });
     mock.timers.tick(1000);
     update(api, { id: "s1", state: "sleeping", event: "SessionEnd" });
-    assert.strictEqual(api.getCurrentState(), "sleeping");
+    assert.strictEqual(api.getCurrentState(), "idle");
   });
 
   it("headless session does not affect resolveDisplayState", () => {
@@ -759,6 +909,119 @@ describe("updateSession()", () => {
     });
 
     assert.ok(logs.some((msg) => msg.includes("source=codex-official")));
+  });
+
+  it("Codex Stop schedules an exit probe and deletes when agentPid exits", () => {
+    api.cleanup();
+    const alive = new Set([1000, 2000]);
+    const logs = [];
+    ctx = makeCtx({
+      processKill: makePidKill(alive),
+      debugLog: (msg) => logs.push(msg),
+    });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("c1", "thinking", "UserPromptSubmit", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+    });
+    api.updateSession("c1", "idle", "Stop", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+
+    assert.ok(api.sessions.has("c1"));
+    assert.ok(logs.some((msg) => msg.includes("codex-exit-probe schedule")));
+
+    alive.delete(1000);
+    mock.timers.tick(1000);
+
+    assert.ok(!api.sessions.has("c1"));
+    assert.strictEqual(api.getCurrentState(), "idle");
+    assert.ok(logs.some((msg) => msg.includes("codex-exit-probe delete reason=agent-exit")));
+  });
+
+  it("Codex exit probe keeps the session when agentPid stays alive", () => {
+    api.cleanup();
+    const alive = new Set([1000, 2000]);
+    const logs = [];
+    ctx = makeCtx({
+      processKill: makePidKill(alive),
+      debugLog: (msg) => logs.push(msg),
+    });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("c1", "idle", "Stop", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    mock.timers.tick(15000);
+
+    assert.ok(api.sessions.has("c1"));
+    assert.ok(logs.some((msg) => msg.includes("codex-exit-probe keep reason=agent-alive")));
+  });
+
+  it("Codex exit probe cancels when new activity arrives", () => {
+    api.cleanup();
+    const alive = new Set([1000, 2000]);
+    const logs = [];
+    ctx = makeCtx({
+      processKill: makePidKill(alive),
+      debugLog: (msg) => logs.push(msg),
+    });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("c1", "idle", "Stop", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    api.updateSession("c1", "thinking", "UserPromptSubmit", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+
+    alive.delete(1000);
+    mock.timers.tick(15000);
+
+    assert.ok(api.sessions.has("c1"));
+    assert.ok(logs.some((msg) => msg.includes("codex-exit-probe cancel sid=c1 reason=UserPromptSubmit")));
+  });
+
+  it("upgrades pidReachable when later Codex hooks provide a live pid", () => {
+    api.cleanup();
+    const alive = new Set([1000, 2000]);
+    ctx = makeCtx({ processKill: makePidKill(alive) });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("c1", "thinking", "event_msg:task_started", {
+      agentId: "codex",
+      cwd: "/tmp",
+    });
+    assert.strictEqual(api.sessions.get("c1").pidReachable, false);
+
+    api.updateSession("c1", "thinking", "UserPromptSubmit", {
+      agentId: "codex",
+      agentPid: 1000,
+      sourcePid: 2000,
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+
+    assert.strictEqual(api.sessions.get("c1").pidReachable, true);
   });
 
   it("attention is oneshot — stored as idle in session", () => {
@@ -902,6 +1165,63 @@ describe("recentEvents tracking", () => {
     assert.strictEqual(events.length, 1);
     assert.strictEqual(events[0].event, null);
   });
+
+  it("records Gemini PreCompress without changing the active session state", () => {
+    update(api, { id: "g1", state: "thinking", event: "UserPromptSubmit", agentId: "gemini-cli" });
+    api.updateSession("g1", "idle", "PreCompress", {
+      cwd: "/tmp",
+      agentId: "gemini-cli",
+      preserveState: true,
+    });
+
+    const session = api.sessions.get("g1");
+    assert.strictEqual(session.state, "thinking");
+    assert.deepStrictEqual(
+      session.recentEvents.map((entry) => entry.event),
+      ["UserPromptSubmit", "PreCompress"]
+    );
+  });
+
+  it("keeps the pet display state on Gemini PreCompress while exposing the event in session snapshots", () => {
+    const stateChanges = [];
+    api.cleanup();
+    api = require("../src/state")(makeCtx({
+      sendToRenderer: (...args) => stateChanges.push(args),
+      syncHitWin: () => {},
+      sendToHitWin: () => {},
+    }));
+
+    update(api, { id: "g1", state: "thinking", event: "UserPromptSubmit", agentId: "gemini-cli" });
+    const beforeCount = stateChanges.length;
+    api.updateSession("g1", "idle", "PreCompress", {
+      cwd: "/tmp",
+      agentId: "gemini-cli",
+      preserveState: true,
+    });
+
+    assert.strictEqual(api.resolveDisplayState(), "thinking");
+    const snapshot = api.buildSessionSnapshot();
+    assert.strictEqual(snapshot.sessions[0].lastEvent.rawEvent, "PreCompress");
+    assert.strictEqual(snapshot.sessions[0].lastEvent.labelKey, "eventLabelPreCompress");
+    assert.strictEqual(stateChanges.length, beforeCount);
+    assert.ok(stateChanges.every((entry) => entry[1] !== "sweeping"));
+  });
+
+  it("returns Gemini sessions to idle on AfterAgent without marking them done", () => {
+    update(api, { id: "g1", state: "working", event: "PreToolUse", agentId: "gemini-cli" });
+    api.updateSession("g1", "idle", "AfterAgent", {
+      cwd: "/tmp",
+      agentId: "gemini-cli",
+    });
+
+    const session = api.sessions.get("g1");
+    assert.strictEqual(session.state, "idle");
+    assert.strictEqual(api.deriveSessionBadge(session), "idle");
+    assert.deepStrictEqual(
+      session.recentEvents.map((entry) => entry.event),
+      ["PreToolUse", "AfterAgent"]
+    );
+  });
 });
 
 describe("buildSessionSnapshot", () => {
@@ -1021,6 +1341,7 @@ describe("buildSessionSnapshot", () => {
     api.sessions.set("done-local", rawSession("idle", {
       updatedAt: 3000,
       sourcePid: pid,
+      pidReachable: true,
       cwd: "/tmp/done-project",
       agentId: "claude-code",
       recentEvents: [{ event: "Stop", state: "attention", at: 2900 }],
@@ -1034,9 +1355,77 @@ describe("buildSessionSnapshot", () => {
 
     const snapshot = api.buildSessionSnapshot();
     assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").badge, "done");
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").hiddenFromHud, false);
     assert.strictEqual(snapshot.hudTotalNonIdle, 1);
     assert.strictEqual(snapshot.hudLastSessionId, "done-local");
     assert.strictEqual(snapshot.hudLastTitle, "done-project");
+  });
+
+  it("hides detached ended idle sessions from HUD aggregates when auto-clear is enabled and source is dead", () => {
+    api.cleanup();
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("done-local", rawSession("idle", {
+      updatedAt: 3000,
+      sourcePid: 9999,
+      pidReachable: true,
+      cwd: "/tmp/done-project",
+      agentId: "claude-code",
+      recentEvents: [{ event: "Stop", state: "attention", at: 2900 }],
+    }));
+
+    const snapshot = api.buildSessionSnapshot();
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").badge, "done");
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").hiddenFromHud, true);
+    assert.strictEqual(snapshot.hudTotalNonIdle, 0);
+    assert.strictEqual(snapshot.hudLastSessionId, null);
+    assert.strictEqual(snapshot.hudLastTitle, null);
+  });
+
+  it("keeps detached idle sessions in HUD aggregates when auto-clear is enabled but badge is idle", () => {
+    api.cleanup();
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("idle-local", rawSession("idle", {
+      updatedAt: 3000,
+      sourcePid: 9999,
+      pidReachable: true,
+      cwd: "/tmp/idle-project",
+      agentId: "gemini-cli",
+      recentEvents: [{ event: "AfterAgent", state: "idle", at: 2900 }],
+    }));
+
+    const snapshot = api.buildSessionSnapshot();
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "idle-local").badge, "idle");
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "idle-local").hiddenFromHud, false);
+    assert.strictEqual(snapshot.hudTotalNonIdle, 1);
+    assert.strictEqual(snapshot.hudLastSessionId, "idle-local");
+  });
+
+  it("keeps detached ended sessions in HUD aggregates when pid reachability is unknown", () => {
+    api.cleanup();
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      sessionHudCleanupDetached: true,
+    }));
+    api.sessions.set("done-local", rawSession("idle", {
+      updatedAt: 3000,
+      sourcePid: 9999,
+      pidReachable: false,
+      cwd: "/tmp/done-project",
+      agentId: "claude-code",
+      recentEvents: [{ event: "Stop", state: "attention", at: 2900 }],
+    }));
+
+    const snapshot = api.buildSessionSnapshot();
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").badge, "done");
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "done-local").hiddenFromHud, false);
+    assert.strictEqual(snapshot.hudTotalNonIdle, 1);
+    assert.strictEqual(snapshot.hudLastSessionId, "done-local");
   });
 
   it("applies session aliases to displayTitle without mutating raw session fields", () => {
@@ -1069,6 +1458,34 @@ describe("buildSessionSnapshot", () => {
     assert.strictEqual(codex.displayTitle, "Codex follow-up");
     assert.strictEqual(codex.cwd, "d:/animation/");
     assert.strictEqual(snapshot.hudLastTitle, "Claude review");
+  });
+
+  it("uses Codex thread_name from session_index.jsonl for local session displayTitle", () => {
+    const codexDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-index-"));
+    fs.writeFileSync(path.join(codexDir, "session_index.jsonl"), [
+      JSON.stringify({
+        id: "019d23d4-f1a9-7633-b9c7-758327137228",
+        thread_name: "요구사항개선",
+      }),
+    ].join("\n") + "\n", "utf8");
+    const oldCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexDir;
+    try {
+      api.sessions.set("codex:019d23d4-f1a9-7633-b9c7-758327137228", rawSession("thinking", {
+        updatedAt: 1000,
+        cwd: "D:\\repository\\spms",
+        agentId: "codex",
+        sessionTitle: "Auto Summary",
+      }));
+
+      const snapshot = api.buildSessionSnapshot();
+      assert.strictEqual(snapshot.sessions[0].sessionTitle, "요구사항개선");
+      assert.strictEqual(snapshot.sessions[0].displayTitle, "요구사항개선");
+    } finally {
+      if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = oldCodexHome;
+      fs.rmSync(codexDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps session aliases scoped by host, agent, and session id", () => {
@@ -1304,6 +1721,11 @@ describe("deriveSessionBadge", () => {
     assert.strictEqual(api.deriveSessionBadge(s), "done");
   });
 
+  it("returns 'idle' when idle with Gemini AfterAgent in recentEvents", () => {
+    const s = { state: "idle", recentEvents: [{ event: "AfterAgent" }] };
+    assert.strictEqual(api.deriveSessionBadge(s), "idle");
+  });
+
   it("returns 'idle' when sleeping (no tombstone, not 'exited')", () => {
     // SessionEnd deletes the session from the Map so menu iteration never
     // sees it — sleeping here comes from other paths (idle timeout etc).
@@ -1377,6 +1799,24 @@ describe("DND mode", () => {
     assert.strictEqual(ctx.doNotDisturb, true);
     mock.timers.tick(3000);
     assert.strictEqual(api.getCurrentState(), "collapsing");
+  });
+
+  it("enableDoNotDisturb uses theme-specific direct sleep transition art when provided", () => {
+    const theme = cloneTheme(_defaultTheme);
+    theme.timings.dndSleepTransitionSvg = "custom-idle-to-sleeping.svg";
+    theme.timings.dndSleepTransitionDuration = 4800;
+    api.cleanup();
+    ctx = makeCtx({ theme });
+    api = require("../src/state")(ctx);
+
+    api.enableDoNotDisturb();
+
+    assert.strictEqual(api.getCurrentState(), "collapsing");
+    assert.strictEqual(api.getCurrentSvg(), "custom-idle-to-sleeping.svg");
+    mock.timers.tick(4799);
+    assert.strictEqual(api.getCurrentState(), "collapsing");
+    mock.timers.tick(1);
+    assert.strictEqual(api.getCurrentState(), "sleeping");
   });
 
   it("enableDoNotDisturb mini → mini-sleep", () => {
