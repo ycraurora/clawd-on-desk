@@ -1,38 +1,39 @@
 // src/state.js — State machine + session management + DND + wake poll
 // Extracted from main.js L158-240, L299-505, L544-960
 
-let screen, nativeImage;
-try { ({ screen, nativeImage } = require("electron")); } catch { screen = null; nativeImage = null; }
-const path = require("path");
-const fs = require("fs");
-const { pathToFileURL } = require("url");
-const { VISUAL_FALLBACK_STATES } = require("./theme-loader");
-const { sessionAliasKey } = require("./session-alias");
-const { readCodexThreadName } = require("../hooks/codex-session-index");
-
-// ── Agent icons (official logos from assets/icons/agents/) ──
-const AGENT_ICON_DIR = path.join(__dirname, "..", "assets", "icons", "agents");
-const _agentIconCache = new Map();
-const _agentIconUrlCache = new Map();
-
-function getAgentIcon(agentId) {
-  if (!nativeImage || !agentId) return undefined;
-  if (_agentIconCache.has(agentId)) return _agentIconCache.get(agentId);
-  const iconPath = path.join(AGENT_ICON_DIR, `${agentId}.png`);
-  if (!fs.existsSync(iconPath)) return undefined;
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  _agentIconCache.set(agentId, icon);
-  return icon;
-}
-
-function getAgentIconUrl(agentId) {
-  if (!agentId) return null;
-  if (_agentIconUrlCache.has(agentId)) return _agentIconUrlCache.get(agentId);
-  const iconPath = path.join(AGENT_ICON_DIR, `${agentId}.png`);
-  const iconUrl = fs.existsSync(iconPath) ? pathToFileURL(iconPath).href : null;
-  _agentIconUrlCache.set(agentId, iconUrl);
-  return iconUrl;
-}
+let screen;
+try { ({ screen } = require("electron")); } catch { screen = null; }
+const {
+  createStatePriorityConstants,
+  getStatePriority,
+  resolveDisplayStateFromSessions,
+} = require("./state-priority");
+const {
+  buildStateBindings,
+  hasOwnVisualFiles: hasOwnVisualFilesWithBindings,
+  resolveVisualBinding: resolveVisualBindingWithBindings,
+  getSvgOverride: getSvgOverrideWithDeps,
+} = require("./state-visual-resolver");
+const {
+  getStaleSessionDecision,
+} = require("./state-stale-cleanup");
+const {
+  createHitboxRuntime,
+  resolveHitBoxForSvg: resolveHitBoxForSvgWithRuntime,
+} = require("./state-hitbox-resolver");
+const {
+  pickDisplayHint: pickDisplayHintWithMap,
+  pushRecentEvent,
+} = require("./state-session-events");
+const {
+  deriveSessionBadge,
+  normalizeTitle,
+  shouldAutoClearDetachedSession: shouldAutoClearDetachedSessionWithDeps,
+  buildSessionSnapshot: buildSessionSnapshotFromSessions,
+  getActiveSessionAliasKeys: getActiveSessionAliasKeysFromSessions,
+  sessionSnapshotSignature,
+} = require("./state-session-snapshot");
+const { getAgentIconUrl } = require("./state-agent-icons");
 
 module.exports = function initState(ctx) {
 
@@ -54,43 +55,7 @@ let DND_SLEEP_TRANSITION_SVG = null;
 let DND_SLEEP_TRANSITION_DURATION = 0;
 let COLLAPSE_DURATION = 0;
 let SLEEP_MODE = "full";
-const SLEEP_SEQUENCE = new Set(["yawning", "dozing", "collapsing", "sleeping", "waking"]);
-
-const STATE_PRIORITY = {
-  error: 8, notification: 7, sweeping: 6, attention: 5,
-  carrying: 4, juggling: 4, working: 3, thinking: 2, idle: 1, sleeping: 0,
-};
-
-const ONESHOT_STATES = new Set(["attention", "error", "sweeping", "notification", "carrying"]);
-
-// Rolling event history per session. Used by deriveSessionBadge() to infer a
-// user-facing status ("Running" / "Done" / "Interrupted" / "Idle") without
-// extending the state machine. Cap avoids unbounded growth on long sessions.
-const RECENT_EVENT_LIMIT = 8;
-
-// Hook event name → i18n key for recentEvents.label derivation (C2 renders at
-// read time so a language switch updates already-stored events too).
-// eslint-disable-next-line no-unused-vars
-const EVENT_LABEL_KEYS = {
-  SessionStart: "eventLabelSessionStart",
-  SessionEnd: "eventLabelSessionEnd",
-  UserPromptSubmit: "eventLabelUserPromptSubmit",
-  PreToolUse: "eventLabelPreToolUse",
-  PostToolUse: "eventLabelPostToolUse",
-  PostToolUseFailure: "eventLabelPostToolUseFailure",
-  AfterAgent: "eventLabelAfterAgent",
-  Stop: "eventLabelStop",
-  StopFailure: "eventLabelStopFailure",
-  SubagentStart: "eventLabelSubagentStart",
-  SubagentStop: "eventLabelSubagentStop",
-  PreCompress: "eventLabelPreCompress",
-  PreCompact: "eventLabelPreCompact",
-  PostCompact: "eventLabelPostCompact",
-  Notification: "eventLabelNotification",
-  Elicitation: "eventLabelElicitation",
-  WorktreeCreate: "eventLabelWorktreeCreate",
-  "stale-cleanup": "eventLabelStaleCleanup",
-};
+const { SLEEP_SEQUENCE, STATE_PRIORITY, ONESHOT_STATES } = createStatePriorityConstants();
 
 // Session display hints — validated against theme.displayHintMap keys
 let DISPLAY_HINT_MAP = {};
@@ -98,9 +63,6 @@ let DISPLAY_HINT_MAP = {};
 // ── Session tracking ──
 const sessions = new Map();
 const MAX_SESSIONS = 20;
-const SESSION_STALE_MS = 600000;
-const WORKING_STALE_MS = 300000;
-const DETACHED_IDLE_STALE_MS = 30000;
 const CODEX_EXIT_PROBE_DELAYS_MS = [1000, 3000, 8000, 15000];
 let lastSessionSnapshotSignature = null;
 let lastSessionSnapshot = null;
@@ -114,6 +76,7 @@ let HIT_BOXES = {};
 let FILE_HIT_BOXES = {};
 let WIDE_SVGS = new Set();
 let SLEEPING_SVGS = new Set();
+let hitboxRuntime = { hitBoxes: HIT_BOXES, fileHitBoxes: FILE_HIT_BOXES, wideSvgs: WIDE_SVGS, sleepingSvgs: SLEEPING_SVGS };
 let currentHitBox = HIT_BOXES.default;
 
 // ── State machine internal ──
@@ -201,43 +164,8 @@ const STATE_LABEL_KEY = {
   idle: "sessionIdle", sleeping: "sessionSleeping",
 };
 
-function buildStateBindings(nextTheme) {
-  const bindings = {};
-  const sourceBindings = nextTheme && nextTheme._stateBindings;
-  if (sourceBindings && typeof sourceBindings === "object") {
-    for (const [stateKey, entry] of Object.entries(sourceBindings)) {
-      bindings[stateKey] = {
-        files: Array.isArray(entry && entry.files) ? [...entry.files] : [],
-        fallbackTo: typeof (entry && entry.fallbackTo) === "string" && entry.fallbackTo ? entry.fallbackTo : null,
-      };
-    }
-  }
-  if (nextTheme && nextTheme.states) {
-    for (const [stateKey, files] of Object.entries(nextTheme.states)) {
-      const normalizedFiles = Array.isArray(files) ? [...files] : [];
-      if (!bindings[stateKey]) {
-        bindings[stateKey] = { files: normalizedFiles, fallbackTo: null };
-      } else if (bindings[stateKey].files.length === 0) {
-        bindings[stateKey].files = normalizedFiles;
-      }
-    }
-  }
-  if (nextTheme && nextTheme.miniMode && nextTheme.miniMode.states) {
-    for (const [stateKey, files] of Object.entries(nextTheme.miniMode.states)) {
-      bindings[stateKey] = {
-        files: Array.isArray(files) ? [...files] : [],
-        fallbackTo: null,
-      };
-    }
-  }
-  return bindings;
-}
-
 function resolveHitBoxForSvg(svg) {
-  if (svg && FILE_HIT_BOXES[svg]) return FILE_HIT_BOXES[svg];
-  if (svg && SLEEPING_SVGS.has(svg)) return HIT_BOXES.sleeping;
-  if (svg && WIDE_SVGS.has(svg)) return HIT_BOXES.wide;
-  return HIT_BOXES.default;
+  return resolveHitBoxForSvgWithRuntime(svg, hitboxRuntime);
 }
 
 function refreshTheme() {
@@ -263,10 +191,11 @@ function refreshTheme() {
   COLLAPSE_DURATION = theme.timings.collapseDuration || 0;
   SLEEP_MODE = theme.sleepSequence && theme.sleepSequence.mode === "direct" ? "direct" : "full";
   DISPLAY_HINT_MAP = theme.displayHintMap || {};
-  HIT_BOXES = theme.hitBoxes;
-  FILE_HIT_BOXES = theme.fileHitBoxes || {};
-  WIDE_SVGS = new Set(theme.wideHitboxFiles || []);
-  SLEEPING_SVGS = new Set(theme.sleepingHitboxFiles || []);
+  hitboxRuntime = createHitboxRuntime(theme);
+  HIT_BOXES = hitboxRuntime.hitBoxes;
+  FILE_HIT_BOXES = hitboxRuntime.fileHitBoxes;
+  WIDE_SVGS = hitboxRuntime.wideSvgs;
+  SLEEPING_SVGS = hitboxRuntime.sleepingSvgs;
 
   currentHitBox = resolveHitBoxForSvg(currentSvg);
   refreshUpdateVisualOverride();
@@ -290,7 +219,7 @@ function setState(newState, svgOverride) {
   if (newState === "yawning" && SLEEP_SEQUENCE.has(currentState)) return;
 
   if (pendingTimer) {
-    if (pendingState && (STATE_PRIORITY[newState] || 0) < (STATE_PRIORITY[pendingState] || 0)) {
+    if (pendingState && getStatePriority(newState, STATE_PRIORITY) < getStatePriority(pendingState, STATE_PRIORITY)) {
       return;
     }
     clearTimeout(pendingTimer);
@@ -346,35 +275,12 @@ function isOneshotDisabled(logicalState) {
   catch { return false; }
 }
 
-function pickStateFile(files) {
-  if (!Array.isArray(files) || files.length === 0) return null;
-  return files[Math.floor(Math.random() * files.length)];
-}
-
 function hasOwnVisualFiles(state) {
-  const entry = STATE_BINDINGS[state];
-  return !!(entry && Array.isArray(entry.files) && entry.files.length > 0);
+  return hasOwnVisualFilesWithBindings(STATE_BINDINGS, state);
 }
 
 function resolveVisualBinding(state) {
-  let cursor = state;
-  let visited = null;
-  for (let hops = 0; hops <= 3; hops += 1) {
-    const entry = STATE_BINDINGS[cursor];
-    if (entry && Array.isArray(entry.files) && entry.files.length > 0) {
-      return pickStateFile(entry.files);
-    }
-    if (!entry || !entry.fallbackTo || !VISUAL_FALLBACK_STATES.has(cursor)) break;
-    if (!visited) visited = new Set([cursor]);
-    if (visited.has(entry.fallbackTo)) break;
-    visited.add(entry.fallbackTo);
-    cursor = entry.fallbackTo;
-  }
-  const idleEntry = STATE_BINDINGS.idle;
-  if (idleEntry && Array.isArray(idleEntry.files) && idleEntry.files.length > 0) {
-    return pickStateFile(idleEntry.files);
-  }
-  return null;
+  return resolveVisualBindingWithBindings(state, STATE_BINDINGS);
 }
 
 function applyResolvedDisplayState() {
@@ -583,15 +489,7 @@ function wakeFromDoze() {
 }
 
 function pickDisplayHint(state, existing, incoming) {
-  if (state !== "working" && state !== "thinking" && state !== "juggling") {
-    return null;
-  }
-  if (incoming !== undefined) {
-    if (incoming === null || incoming === "") return null;
-    if (DISPLAY_HINT_MAP[incoming] != null) return incoming;
-    return existing && existing.displayHint != null ? existing.displayHint : null;
-  }
-  return existing && existing.displayHint != null ? existing.displayHint : null;
+  return pickDisplayHintWithMap(state, existing, incoming, DISPLAY_HINT_MAP);
 }
 
 function debugSession(msg) {
@@ -729,79 +627,11 @@ function updateCodexExitProbe(sessionId, agentId, event) {
   }
 }
 
-// Append an event to a session's rolling recentEvents list, dropping the
-// oldest when over RECENT_EVENT_LIMIT. Returned list is a new array —
-// caller assigns it to session.recentEvents.
-// Intentionally does NOT store a human-readable label field. C2 derives
-// labels via i18n at render time so language switches update existing
-// sessions' menu labels too.
-function pushRecentEvent(existing, state, event) {
-  const previous = Array.isArray(existing && existing.recentEvents)
-    ? existing.recentEvents.slice(-(RECENT_EVENT_LIMIT - 1))
-    : [];
-  previous.push({
-    at: Date.now(),
-    event: event || null,
-    state: state || "idle",
-  });
-  return previous;
-}
-
-// Derive a user-facing status badge from a session. Returns one of:
-// "running" / "done" / "interrupted" / "idle".
-// Intentionally 4 categories — not 5. There is no "exited" because sessions
-// are deleted on SessionEnd (src/state.js `sessions.delete(sessionId)`),
-// so a session with state:"sleeping"+event:"SessionEnd" is unreachable in
-// the menu iteration.
-function deriveSessionBadge(session) {
-  if (!session) return "idle";
-  // Any non-idle/non-sleeping state → session is actively doing something
-  if (session.state !== "idle" && session.state !== "sleeping") return "running";
-  // Sleeping is treated as idle (the pet sleeping doesn't mean the session is dead)
-  if (session.state === "sleeping") return "idle";
-  // state === "idle": disambiguate by most-recent event
-  const events = Array.isArray(session.recentEvents) ? session.recentEvents : [];
-  const latest = events.length ? events[events.length - 1] : null;
-  const latestEvent = latest && latest.event;
-  if (latestEvent === "StopFailure" || latestEvent === "PostToolUseFailure") return "interrupted";
-  if (latestEvent === "Stop" || latestEvent === "PostCompact") return "done";
-  return "idle";
-}
-
-function isEndedSessionBadge(badge) {
-  return badge === "done" || badge === "interrupted";
-}
-
 function shouldAutoClearDetachedSession(session, badge) {
-  if (ctx.sessionHudCleanupDetached !== true) return false;
-  if (!session || session.headless || session.state !== "idle" || session.agentPid) return false;
-  if (!session.pidReachable || !session.sourcePid) return false;
-  if (!isEndedSessionBadge(badge)) return false;
-  return !isProcessAlive(session.sourcePid);
-}
-
-// Local title normalizer (trim, strip control chars, clamp, empty → null).
-// Note: hooks/clawd-hook.js has an identical helper; hook scripts can't require src/* (different runtime
-// context: plain node child process, no Electron), so the two are kept in
-// sync manually rather than sharing a module.
-const SESSION_TITLE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]+/g;
-const SESSION_TITLE_MAX = 80;
-
-function normalizeTitle(value) {
-  if (typeof value !== "string") return null;
-  const collapsed = value
-    .replace(SESSION_TITLE_CONTROL_RE, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!collapsed) return null;
-  return collapsed.length > SESSION_TITLE_MAX
-    ? `${collapsed.slice(0, SESSION_TITLE_MAX - 1)}\u2026`
-    : collapsed;
-}
-
-function sessionUpdatedAt(session) {
-  const updatedAt = Number(session && session.updatedAt);
-  return Number.isFinite(updatedAt) ? updatedAt : 0;
+  return shouldAutoClearDetachedSessionWithDeps(session, badge, {
+    sessionHudCleanupDetached: ctx.sessionHudCleanupDetached === true,
+    isProcessAlive,
+  });
 }
 
 function getSessionAliases() {
@@ -812,172 +642,18 @@ function getSessionAliases() {
     : {};
 }
 
-function getSessionAliasEntry(id, sessionLike, sessionAliases = {}) {
-  const scopedAliasKey = sessionAliasKey(
-    sessionLike && sessionLike.host,
-    sessionLike && sessionLike.agentId,
-    id,
-    { cwd: sessionLike && sessionLike.cwd }
-  );
-  if (scopedAliasKey && sessionAliases[scopedAliasKey]) return sessionAliases[scopedAliasKey];
-
-  const legacyAliasKey = sessionAliasKey(
-    sessionLike && sessionLike.host,
-    sessionLike && sessionLike.agentId,
-    id
-  );
-  if (legacyAliasKey && legacyAliasKey !== scopedAliasKey) return sessionAliases[legacyAliasKey] || null;
-  return legacyAliasKey ? sessionAliases[legacyAliasKey] : null;
-}
-
-function sessionDisplayTitle(id, sessionLike, sessionAliases = {}) {
-  const alias = getSessionAliasEntry(id, sessionLike, sessionAliases);
-  if (alias && typeof alias.title === "string" && alias.title) return alias.title;
-  const title = getEffectiveSessionTitle(id, sessionLike);
-  if (title) return title;
-  const cwd = sessionLike && sessionLike.cwd;
-  if (cwd) return path.basename(cwd);
-  return id && id.length > 6 ? `${id.slice(0, 6)}..` : id;
-}
-
-function getEffectiveSessionTitle(id, sessionLike) {
-  if (sessionLike && sessionLike.agentId === "codex" && !sessionLike.host) {
-    const threadName = normalizeTitle(readCodexThreadName(id));
-    if (threadName) return threadName;
-  }
-  return normalizeTitle(sessionLike && sessionLike.sessionTitle);
-}
-
-function sessionMenuComparator(a, b) {
-  const pa = STATE_PRIORITY[a.state] || 0;
-  const pb = STATE_PRIORITY[b.state] || 0;
-  if (pb !== pa) return pb - pa;
-  return sessionUpdatedAt(b) - sessionUpdatedAt(a);
-}
-
-function sessionUpdatedAtComparator(a, b) {
-  const byTime = sessionUpdatedAt(b) - sessionUpdatedAt(a);
-  if (byTime !== 0) return byTime;
-  return String(a.id).localeCompare(String(b.id));
-}
-
-function buildSessionSnapshotEntry(id, session, sessionAliases = {}) {
-  const alias = getSessionAliasEntry(id, session, sessionAliases);
-  const recentEvents = Array.isArray(session && session.recentEvents)
-    ? session.recentEvents
-    : [];
-  const latestEvent = recentEvents.length ? recentEvents[recentEvents.length - 1] : null;
-  const rawEvent = latestEvent && latestEvent.event ? latestEvent.event : null;
-  const eventAt = Number(latestEvent && latestEvent.at);
-  const badge = deriveSessionBadge(session);
-  return {
-    id,
-    agentId: (session && session.agentId) || null,
-    iconUrl: getAgentIconUrl(session && session.agentId),
-    state: (session && session.state) || "idle",
-    badge,
-    hiddenFromHud: shouldAutoClearDetachedSession(session, badge),
-    hasAlias: !!(alias && typeof alias.title === "string" && alias.title),
-    sessionTitle: getEffectiveSessionTitle(id, session),
-    displayTitle: sessionDisplayTitle(id, session, sessionAliases),
-    cwd: (session && session.cwd) || "",
-    updatedAt: sessionUpdatedAt(session),
-    sourcePid: (session && session.sourcePid) || null,
-    host: (session && session.host) || null,
-    headless: !!(session && session.headless),
-    lastEvent: latestEvent ? {
-      labelKey: rawEvent ? (EVENT_LABEL_KEYS[rawEvent] || null) : null,
-      rawEvent,
-      at: Number.isFinite(eventAt) ? eventAt : 0,
-    } : null,
-  };
-}
-
 function buildSessionSnapshot() {
-  const entries = [];
-  const sessionAliases = getSessionAliases();
-  for (const [id, session] of sessions) {
-    entries.push(buildSessionSnapshotEntry(id, session, sessionAliases));
-  }
-
-  const dashboardEntries = entries.slice().sort(sessionUpdatedAtComparator);
-  const menuEntries = entries.slice().sort(sessionMenuComparator);
-  const orderedIds = dashboardEntries.map((entry) => entry.id);
-  const menuOrderedIds = menuEntries.map((entry) => entry.id);
-  const hudEntries = dashboardEntries.filter((entry) =>
-    !entry.headless && entry.state !== "sleeping" && !entry.hiddenFromHud
-  );
-
-  const groupMap = new Map();
-  for (const entry of dashboardEntries) {
-    const host = entry.host || "";
-    if (!groupMap.has(host)) groupMap.set(host, []);
-    groupMap.get(host).push(entry.id);
-  }
-  const groups = [];
-  if (groupMap.has("")) {
-    groups.push({ host: "", ids: groupMap.get("") });
-  }
-  for (const [host, ids] of groupMap) {
-    if (!host) continue;
-    groups.push({ host, ids });
-  }
-
-  const lastSession = dashboardEntries[0] || null;
-  return {
-    sessions: entries,
-    groups,
-    orderedIds,
-    menuOrderedIds,
-    hudTotalNonIdle: hudEntries.length,
-    hudLastSessionId: hudEntries.length ? hudEntries[0].id : null,
-    hudLastTitle: hudEntries.length ? hudEntries[0].displayTitle : null,
-    lastSessionId: lastSession ? lastSession.id : null,
-    lastTitle: lastSession ? lastSession.displayTitle : null,
-  };
+  return buildSessionSnapshotFromSessions(sessions, {
+    sessionAliases: getSessionAliases(),
+    getAgentIconUrl,
+    statePriority: STATE_PRIORITY,
+    sessionHudCleanupDetached: ctx.sessionHudCleanupDetached === true,
+    isProcessAlive,
+  });
 }
 
 function getActiveSessionAliasKeys() {
-  const keys = new Set();
-  for (const [id, session] of sessions) {
-    const key = sessionAliasKey(
-      session && session.host,
-      session && session.agentId,
-      id,
-      { cwd: session && session.cwd }
-    );
-    if (key) keys.add(key);
-  }
-  return keys;
-}
-
-function sessionSnapshotSignature(snapshot) {
-  return JSON.stringify({
-    orderedIds: snapshot.orderedIds,
-    menuOrderedIds: snapshot.menuOrderedIds,
-    hudTotalNonIdle: snapshot.hudTotalNonIdle,
-    hudLastSessionId: snapshot.hudLastSessionId,
-    hudLastTitle: snapshot.hudLastTitle,
-    lastSessionId: snapshot.lastSessionId,
-    lastTitle: snapshot.lastTitle,
-    sessions: snapshot.sessions.map((entry) => ({
-      id: entry.id,
-      state: entry.state,
-      badge: entry.badge,
-      hasAlias: entry.hasAlias,
-      sessionTitle: entry.sessionTitle,
-      displayTitle: entry.displayTitle,
-      cwd: entry.cwd,
-      agentId: entry.agentId,
-      sourcePid: entry.sourcePid,
-      headless: entry.headless,
-      hiddenFromHud: !!entry.hiddenFromHud,
-      host: entry.host,
-      lastEventLabelKey: entry.lastEvent ? entry.lastEvent.labelKey : null,
-      lastEventRawEvent: entry.lastEvent ? entry.lastEvent.rawEvent : null,
-      lastEventAt: entry.lastEvent ? entry.lastEvent.at : null,
-    })),
-  });
+  return getActiveSessionAliasKeysFromSessions(sessions);
 }
 
 function broadcastSessionSnapshot(snapshot) {
@@ -1286,61 +962,29 @@ function cleanStaleSessions() {
   let changed = false;
   let snapshotRefreshNeeded = false;
   for (const [id, s] of sessions) {
-    const age = now - s.updatedAt;
+    const decision = getStaleSessionDecision(s, {
+      now,
+      isProcessAlive,
+      deriveSessionBadge,
+      shouldAutoClearDetachedSession,
+    });
 
-    if (s.pidReachable && s.agentPid && !isProcessAlive(s.agentPid)) {
-      debugSession(`stale-delete agent-exit ${describeSession(id, s)}`);
-      if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-agent-exit");
+    if (decision.snapshotRefreshNeeded) snapshotRefreshNeeded = true;
+
+    if (decision.action === "delete") {
+      const badgeSuffix = decision.reason === "detached-ended" ? ` badge=${decision.badge}` : "";
+      debugSession(`stale-delete ${decision.reason} ${describeSession(id, s)}${badgeSuffix}`);
+      if (s && s.agentId === "codex") cancelCodexExitProbe(id, `stale-delete-${decision.reason}`);
       if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
       sessions.delete(id); changed = true;
       continue;
     }
 
-    const badge = deriveSessionBadge(s);
-    const autoClearDetached = shouldAutoClearDetachedSession(s, badge);
-    if (autoClearDetached) {
-      if (age > DETACHED_IDLE_STALE_MS) {
-        debugSession(`stale-delete detached-ended ${describeSession(id, s)} badge=${badge}`);
-        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-detached-ended");
-        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-        sessions.delete(id); changed = true;
-        continue;
-      }
-      snapshotRefreshNeeded = true;
-    }
-
-    if (age > SESSION_STALE_MS) {
-      if (s.pidReachable && s.sourcePid) {
-        if (!isProcessAlive(s.sourcePid)) {
-          debugSession(`stale-delete source-exit ${describeSession(id, s)}`);
-          if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-source-exit");
-          if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-          sessions.delete(id); changed = true;
-        } else if (s.state !== "idle") {
-          debugSession(`stale-idle session-timeout ${describeSession(id, s)}`);
-          s.state = "idle"; s.displayHint = null; changed = true;
-        }
-      } else if (!s.pidReachable) {
-        debugSession(`stale-delete unreachable ${describeSession(id, s)}`);
-        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-unreachable");
-        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-        sessions.delete(id); changed = true;
-      } else {
-        debugSession(`stale-delete no-source ${describeSession(id, s)}`);
-        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-no-source");
-        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-        sessions.delete(id); changed = true;
-      }
-    } else if (age > WORKING_STALE_MS) {
-      if (s.pidReachable && s.sourcePid && !isProcessAlive(s.sourcePid)) {
-        debugSession(`stale-delete working-source-exit ${describeSession(id, s)}`);
-        if (s && s.agentId === "codex") cancelCodexExitProbe(id, "stale-delete-working-source-exit");
-        if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-        sessions.delete(id); changed = true;
-      } else if (s.state === "working" || s.state === "juggling" || s.state === "thinking") {
-        debugSession(`stale-idle working-timeout ${describeSession(id, s)}`);
-        s.state = "idle"; s.displayHint = null; s.updatedAt = now; changed = true;
-      }
+    if (decision.action === "idle") {
+      debugSession(`stale-idle ${decision.reason} ${describeSession(id, s)}`);
+      s.state = "idle"; s.displayHint = null;
+      if (decision.updateTimestamp) s.updatedAt = now;
+      changed = true;
     }
   }
   if (changed && sessions.size === 0) {
@@ -1576,31 +1220,12 @@ function stopKimiPermissionPoll(sessionId) {
 }
 
 function resolveDisplayState() {
-  let best;
-  if (sessions.size === 0) {
-    best = "idle";
-  } else {
-    best = "sleeping";
-    let hasNonHeadless = false;
-    for (const [, s] of sessions) {
-      if (s.headless) continue;
-      hasNonHeadless = true;
-      if ((STATE_PRIORITY[s.state] || 0) > (STATE_PRIORITY[best] || 0)) best = s.state;
-    }
-    if (!hasNonHeadless) best = "idle";
-  }
-  // Permission animation lock (highest priority): if any permission request is
-  // pending, always pin notification regardless of session priority.
-  if (hasPermissionAnimationLock()) {
-    best = "notification";
-  }
-
-  // Update overlay participates in priority, but equal-priority live states
-  // such as notification/permission locks must remain visible.
-  if (updateVisualState && (updateVisualPriority || (STATE_PRIORITY[updateVisualState] || 0)) > (STATE_PRIORITY[best] || 0)) {
-    return updateVisualState;
-  }
-  return best;
+  return resolveDisplayStateFromSessions(sessions, {
+    statePriority: STATE_PRIORITY,
+    permissionLocked: hasPermissionAnimationLock(),
+    updateVisualState,
+    updateVisualPriority,
+  });
 }
 
 function setUpdateVisualState(kind) {
@@ -1613,79 +1238,21 @@ function setUpdateVisualState(kind) {
   }
   updateVisualKind = kind;
   updateVisualState = UPDATE_VISUAL_STATE_MAP[kind] || kind;
-  updateVisualPriority = UPDATE_VISUAL_PRIORITY_MAP[kind] || STATE_PRIORITY[updateVisualState] || 0;
+  updateVisualPriority = UPDATE_VISUAL_PRIORITY_MAP[kind] || getStatePriority(updateVisualState, STATE_PRIORITY);
   refreshUpdateVisualOverride();
   return updateVisualState;
 }
 
-function getActiveWorkingCount() {
-  let n = 0;
-  for (const [, s] of sessions) {
-    if (!s.headless && (s.state === "working" || s.state === "thinking" || s.state === "juggling")) n++;
-  }
-  return n;
-}
-
-function getWorkingSvg() {
-  const n = getActiveWorkingCount();
-  if (theme.workingTiers) {
-    for (const tier of theme.workingTiers) {
-      if (n >= tier.minSessions) return tier.file;
-    }
-  }
-  return STATE_SVGS.working[0];
-}
-
-function getWinningSessionDisplayHint(targetState) {
-  let best = null;
-  let bestAt = -1;
-  for (const [, s] of sessions) {
-    if (s.headless || s.state !== targetState) continue;
-    if (s.updatedAt >= bestAt) {
-      bestAt = s.updatedAt;
-      best = s;
-    }
-  }
-  if (!best || !best.displayHint) return null;
-  // Resolve semantic hint token through displayHintMap
-  const resolved = DISPLAY_HINT_MAP[best.displayHint];
-  return resolved || null;
-}
-
 function getSvgOverride(state) {
-  if (updateVisualState && state === updateVisualState && updateVisualSvgOverride) {
-    return updateVisualSvgOverride;
-  }
-  if (state === "idle") return SVG_IDLE_FOLLOW;
-  if (state === "working") {
-    const hinted = getWinningSessionDisplayHint("working");
-    if (hinted) return hinted;
-    return getWorkingSvg();
-  }
-  if (state === "juggling") {
-    const hinted = getWinningSessionDisplayHint("juggling");
-    if (hinted) return hinted;
-    return getJugglingSvg();
-  }
-  if (state === "thinking") {
-    const hinted = getWinningSessionDisplayHint("thinking");
-    if (hinted) return hinted;
-    return STATE_SVGS.thinking[0];
-  }
-  return null;
-}
-
-function getJugglingSvg() {
-  let n = 0;
-  for (const [, s] of sessions) {
-    if (!s.headless && s.state === "juggling") n++;
-  }
-  if (theme.jugglingTiers) {
-    for (const tier of theme.jugglingTiers) {
-      if (n >= tier.minSessions) return tier.file;
-    }
-  }
-  return STATE_SVGS.juggling[0];
+  return getSvgOverrideWithDeps(state, {
+    updateVisualState,
+    updateVisualSvgOverride,
+    idleFollowSvg: SVG_IDLE_FOLLOW,
+    sessions,
+    displayHintMap: DISPLAY_HINT_MAP,
+    theme,
+    stateSvgs: STATE_SVGS,
+  });
 }
 
 // ── Session Dashboard ──
@@ -1701,9 +1268,9 @@ function formatElapsed(ms) {
 // ── Do Not Disturb ──
 // Drops every Kimi hold + suspect timer WITHOUT triggering a state resolve.
 // Used by two "channel is no longer available" paths:
-//   1. enableDoNotDisturb — the DND loop has already dismissed matching
-//      bubbles via resolvePermissionEntry, but without this the lock would
-//      pin notification the moment DND is disabled.
+//   1. enableDoNotDisturb — the DND permission dismiss helper has already
+//      dropped matching bubbles without answering for the user, but without
+//      this the lock would pin notification the moment DND is disabled.
 //   2. dismissPermissionsByAgent("kimi-cli") — when the user toggles off
 //      Kimi's permission UI from settings; symmetric to (1).
 // Intentionally does NOT call applyResolvedDisplayState — the callers are
@@ -1727,7 +1294,9 @@ function enableDoNotDisturb() {
   ctx.doNotDisturb = true;
   ctx.sendToRenderer("dnd-change", true);
   ctx.sendToHitWin("hit-state-sync", { dndEnabled: true });
-  for (const perm of [...ctx.pendingPermissions]) ctx.resolvePermissionEntry(perm, "deny", "DND enabled");
+  if (typeof ctx.dismissPermissionsForDnd === "function") {
+    ctx.dismissPermissionsForDnd();
+  }
   disposeAllKimiPermissionState();
   if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; pendingState = null; }
   if (autoReturnTimer) { clearTimeout(autoReturnTimer); autoReturnTimer = null; }

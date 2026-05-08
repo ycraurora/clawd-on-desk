@@ -106,6 +106,20 @@ function shouldPauseForLowPower() {
   return lowPowerIdleMode && LOW_POWER_PAUSE_STATES.has(currentState);
 }
 
+function shouldSuppressPassiveTrackingForLowPower() {
+  return lowPowerIdleMode && lowPowerSvgPaused && shouldPauseForLowPower();
+}
+
+function setLowPowerSvgPaused(paused) {
+  const next = !!paused;
+  if (lowPowerSvgPaused === next) return;
+  lowPowerSvgPaused = next;
+  if (next) _cancelLayerAnimLoop();
+  if (window.electronAPI && typeof window.electronAPI.setLowPowerIdlePaused === "function") {
+    window.electronAPI.setLowPowerIdlePaused(next);
+  }
+}
+
 function getLowPowerAnimationBoundaryDelayMs(root) {
   if (!root || typeof root.getAnimations !== "function") return 0;
   let animations = [];
@@ -187,7 +201,7 @@ function pauseCurrentSvgForLowPower({ waitForBoundary = false } = {}) {
   try {
     if (typeof root.pauseAnimations === "function") root.pauseAnimations();
   } catch {}
-  lowPowerSvgPaused = true;
+  setLowPowerSvgPaused(true);
 }
 
 function resumeCurrentSvgForLowPower() {
@@ -204,7 +218,7 @@ function resumeCurrentSvgForLowPower() {
       if (typeof root.unpauseAnimations === "function") root.unpauseAnimations();
     } catch {}
   }
-  lowPowerSvgPaused = false;
+  setLowPowerSvgPaused(false);
 }
 
 function scheduleLowPowerIdlePause() {
@@ -325,6 +339,7 @@ let _fileOffsets = {};
 let _transitions = {};  // per-file fade config: { "file.apng": { in: 400, out: 400 } }
 let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
 let _inMiniMode = false;
+let _miniPreEntryMode = false;
 let _viewportOffsetY = 0;
 
 function setViewportOffset(offsetY) {
@@ -337,9 +352,13 @@ function setViewportOffset(offsetY) {
   }
 }
 
-function applyMiniFlip(el) {
+function shouldApplyMiniAssetFlip(state) {
+  return _miniFlipAssets && (_inMiniMode || (_miniPreEntryMode && state === "mini-crabwalk"));
+}
+
+function applyMiniFlip(el, state = currentState) {
   if (!el || el.tagName !== "IMG") return;
-  el.style.transform = (_miniFlipAssets && _inMiniMode) ? "scaleX(-1)" : "";
+  el.style.transform = shouldApplyMiniAssetFlip(state) ? "scaleX(-1)" : "";
 }
 
 // ── Layered tracking state (multi-layer eye/head/body tracking) ──
@@ -399,10 +418,11 @@ window.electronAPI.onDndChange((enabled) => { dndEnabled = enabled; });
 
 window.electronAPI.onMiniModeChange((enabled, edge, options) => {
   const preEntry = !!(options && options.preEntry);
+  _miniPreEntryMode = !!enabled && preEntry;
   _inMiniMode = !!enabled && !preEntry;
   miniLeftFlip = !!enabled && edge === "left";
   container.classList.toggle("mini-left", miniLeftFlip);
-  applyMiniFlip(clawdEl);
+  applyMiniFlip(clawdEl, currentState);
   if (miniLeftFlip) {
     applyGlyphFlipCompensation(clawdEl);
   } else {
@@ -519,6 +539,7 @@ function applyCloudlingPointerBridge(payload) {
   const normalized = normalizeCloudlingPointerPayload(payload);
   if (!normalized) return;
   lastCloudlingPointerPayload = normalized;
+  if (shouldSuppressPassiveTrackingForLowPower()) return;
   if (!shouldUseCloudlingPointerBridge(currentState, currentDisplayedSvg)) return;
   callCloudlingPointerBridge(clawdEl, getDisplayedCloudlingPointerPayload(normalized));
 }
@@ -708,7 +729,7 @@ function swapToFile(file, state, useObjectChannel) {
     next.id = "clawd";
     next.style.opacity = "0";
     applyObjectScaleStyle(next, file, state);
-    applyMiniFlip(next);
+    applyMiniFlip(next, state);
 
     const swap = () => {
       if (pendingNext !== next) return;
@@ -971,6 +992,7 @@ function _startLayerAnimLoop() {
 
   function tick() {
     if (!_trackingLayers) { _layerAnimFrame = null; return; }
+    if (shouldSuppressPassiveTrackingForLowPower()) { _layerAnimFrame = null; return; }
 
     const rawDx = _layerTargetDx;
     const rawDy = _layerTargetDy;
@@ -1017,14 +1039,18 @@ function _startLayerAnimLoop() {
   _layerAnimFrame = requestAnimationFrame(tick);
 }
 
-/**
- * Clean up layered tracking: cancel RAF, unwrap elements, reset state.
- */
-function _cleanupLayeredTracking() {
+function _cancelLayerAnimLoop() {
   if (_layerAnimFrame) {
     cancelAnimationFrame(_layerAnimFrame);
     _layerAnimFrame = null;
   }
+}
+
+/**
+ * Clean up layered tracking: cancel RAF, unwrap elements, reset state.
+ */
+function _cleanupLayeredTracking() {
+  _cancelLayerAnimLoop();
 
   // Unwrap elements in the current SVG if still accessible
   if (_trackingLayers && clawdEl && clawdEl.tagName === "OBJECT") {
@@ -1103,10 +1129,14 @@ function detachEyeTracking() {
 }
 
 window.electronAPI.onEyeMove((dx, dy) => {
-  noteLowPowerActivity();
   const effectiveDx = miniLeftFlip ? -dx : dx;
   lastEyeDx = effectiveDx;
   lastEyeDy = dy;
+
+  if (shouldSuppressPassiveTrackingForLowPower()) {
+    _cancelLayerAnimLoop();
+    return;
+  }
 
   if (_trackingLayers) {
     // Layered tracking: store targets, RAF loop handles easing
@@ -1130,7 +1160,6 @@ window.electronAPI.onEyeMove((dx, dy) => {
 
 if (window.electronAPI && typeof window.electronAPI.onCloudlingPointer === "function") {
   window.electronAPI.onCloudlingPointer((payload) => {
-    noteLowPowerActivity();
     applyCloudlingPointerBridge(payload);
   });
 }

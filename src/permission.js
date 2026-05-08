@@ -40,6 +40,36 @@ const LINUX_WINDOW_TYPE = "toolbar";
 // single tall bubble never hugs or exceeds the visible work area.
 const BUBBLE_HEIGHT_RESERVE = 24;
 
+function requiredDependency(value, name, owner) {
+  if (!value) throw new Error(`${owner} requires ${name}`);
+  return value;
+}
+
+function registerPermissionIpc(options = {}) {
+  const ipcMain = requiredDependency(options.ipcMain, "ipcMain", "registerPermissionIpc");
+  const permission = requiredDependency(options.permission, "permission", "registerPermissionIpc");
+  requiredDependency(permission.handleBubbleHeight, "permission.handleBubbleHeight", "registerPermissionIpc");
+  requiredDependency(permission.handleDecide, "permission.handleDecide", "registerPermissionIpc");
+  const disposers = [];
+
+  function on(channel, listener) {
+    ipcMain.on(channel, listener);
+    disposers.push(() => ipcMain.removeListener(channel, listener));
+  }
+
+  on("bubble-height", (event, height) => permission.handleBubbleHeight(event, height));
+  on("permission-decide", (event, behavior) => permission.handleDecide(event, behavior));
+
+  return {
+    dispose() {
+      while (disposers.length) {
+        const dispose = disposers.pop();
+        dispose();
+      }
+    },
+  };
+}
+
 function clampBubbleHeight(naturalHeight, workAreaHeight, reserve = BUBBLE_HEIGHT_RESERVE) {
   const roundedHeight = Math.ceil(Number(naturalHeight));
   if (!Number.isFinite(roundedHeight) || roundedHeight <= 0) return 0;
@@ -981,6 +1011,31 @@ function refreshPassiveNotifyAutoClose() {
   return processed;
 }
 
+function dismissInteractivePermissionWithoutDecision(perm, reason) {
+  const idx = pendingPermissions.indexOf(perm);
+  if (idx !== -1) pendingPermissions.splice(idx, 1);
+  if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
+  if (perm.abortHandler && perm.res) {
+    try { perm.res.removeListener("close", perm.abortHandler); } catch {}
+  }
+  if (perm.hideTimer) clearTimeout(perm.hideTimer);
+  if (perm.bubble && !perm.bubble.isDestroyed()) {
+    try { perm.bubble.webContents.send("permission-hide"); } catch {}
+    const bub = perm.bubble;
+    perm.hideTimer = setTimeout(() => {
+      if (bub && !bub.isDestroyed()) bub.destroy();
+    }, 250);
+  }
+  // Do not answer approval requests on the user's behalf. Dropping the UI
+  // means Codex receives no decision, CC/CodeBuddy fall back via socket
+  // close, and opencode falls back by receiving no bridge reply.
+  if (perm.isCodex) {
+    sendCodexNoDecisionResponse(perm.res, reason || "permission-dismissed");
+  } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
+    try { perm.res.destroy(); } catch {}
+  }
+}
+
 // Mirrors the DND dispatcher: CC res.destroy() so it falls back to chat,
 // opencode skips the bridge reply so TUI takes over, codex just closes.
 function dismissPermissionsByAgent(agentId) {
@@ -992,30 +1047,7 @@ function dismissPermissionsByAgent(agentId) {
       dismissPassiveNotify(perm, `dismiss-by-agent:${agentId}`);
       continue;
     }
-    const idx = pendingPermissions.indexOf(perm);
-    if (idx !== -1) pendingPermissions.splice(idx, 1);
-    if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
-    if (perm.abortHandler && perm.res) {
-      try { perm.res.removeListener("close", perm.abortHandler); } catch {}
-    }
-    if (perm.bubble && !perm.bubble.isDestroyed()) {
-      sendToBubble(perm.bubble, "permission-hide");
-      if (perm.hideTimer) clearTimeout(perm.hideTimer);
-      const bub = perm.bubble;
-      perm.hideTimer = setTimeout(() => {
-        if (bub && !bub.isDestroyed()) bub.destroy();
-      }, 250);
-    }
-    // opencode: skip bridge reply — TUI has its own fallback prompt.
-    // Codex: close with no decision so the native approval prompt continues.
-    // CC / codebuddy / elicitation: destroy the connection so CC falls back
-    //   to its built-in chat permission prompt (same pattern as DND, see
-    //   commit 9f90... spike 2026-04-07).
-    if (perm.isCodex) {
-      sendCodexNoDecisionResponse(perm.res, `dismiss-by-agent:${agentId}`);
-    } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
-      try { perm.res.destroy(); } catch {}
-    }
+    dismissInteractivePermissionWithoutDecision(perm, `dismiss-by-agent:${agentId}`);
   }
   repositionBubbles();
   repositionDependentBubbles();
@@ -1028,32 +1060,28 @@ function dismissInteractivePermissionBubbles() {
   const toDismiss = pendingPermissions.filter((p) => p && !p.isCodexNotify && !p.isKimiNotify);
   if (toDismiss.length === 0) return 0;
   for (const perm of toDismiss) {
-    const idx = pendingPermissions.indexOf(perm);
-    if (idx !== -1) pendingPermissions.splice(idx, 1);
-    if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
-    if (perm.abortHandler && perm.res) {
-      try { perm.res.removeListener("close", perm.abortHandler); } catch {}
-    }
-    if (perm.hideTimer) clearTimeout(perm.hideTimer);
-    if (perm.bubble && !perm.bubble.isDestroyed()) {
-      try { perm.bubble.webContents.send("permission-hide"); } catch {}
-      const bub = perm.bubble;
-      perm.hideTimer = setTimeout(() => {
-        if (bub && !bub.isDestroyed()) bub.destroy();
-      }, 250);
-    }
-    // Do not answer approval requests on the user's behalf. Dropping the UI
-    // means Codex receives no decision, CC/CodeBuddy fall back via socket
-    // close, and opencode falls back by receiving no bridge reply.
-    if (perm.isCodex) {
-      sendCodexNoDecisionResponse(perm.res, "interactive-bubbles-dismissed");
-    } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
-      try { perm.res.destroy(); } catch {}
-    }
+    dismissInteractivePermissionWithoutDecision(perm, "interactive-bubbles-dismissed");
   }
   repositionBubbles();
   syncPermissionShortcuts();
   permLog(`dismissInteractivePermissionBubbles(): cleared ${toDismiss.length}`);
+  return toDismiss.length;
+}
+
+function dismissPermissionsForDnd() {
+  const toDismiss = pendingPermissions.filter(Boolean);
+  if (toDismiss.length === 0) return 0;
+  for (const perm of toDismiss) {
+    if (perm.isCodexNotify || perm.isKimiNotify) {
+      dismissPassiveNotify(perm, "dnd-enabled");
+      continue;
+    }
+    dismissInteractivePermissionWithoutDecision(perm, "dnd-enabled");
+  }
+  repositionBubbles();
+  repositionDependentBubbles();
+  syncPermissionShortcuts();
+  permLog(`dismissPermissionsForDnd(): cleared ${toDismiss.length}`);
   return toDismiss.length;
 }
 
@@ -1107,11 +1135,14 @@ return {
   showKimiNotifyBubble, clearKimiNotifyBubbles,
   refreshPassiveNotifyAutoClose,
   dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
+  dismissPermissionsForDnd,
   syncPermissionShortcuts,
   replyOpencodePermission,
 };
 
 };
+
+module.exports.registerPermissionIpc = registerPermissionIpc;
 
 // Test-only exports — bypasses the initPermission factory so unit tests can
 // hit the pure layout function without standing up Electron / ctx mocks.

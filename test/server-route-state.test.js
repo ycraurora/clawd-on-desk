@@ -1,0 +1,272 @@
+"use strict";
+
+const { describe, it } = require("node:test");
+const assert = require("node:assert");
+const { EventEmitter } = require("node:events");
+
+const {
+  CLAWD_SERVER_HEADER,
+  CLAWD_SERVER_ID,
+} = require("../hooks/server-config");
+const {
+  MAX_STATE_BODY_BYTES,
+  isRemoteCodexPermissionEvent,
+  sendStateHealthResponse,
+  handleStatePost,
+} = require("../src/server-route-state");
+
+function makeReq(body) {
+  const req = new EventEmitter();
+  setImmediate(() => {
+    if (body != null) req.emit("data", Buffer.from(body));
+    req.emit("end");
+  });
+  return req;
+}
+
+function makeRes() {
+  return {
+    statusCode: null,
+    headers: {},
+    body: "",
+    writeHead(code, headers) {
+      this.statusCode = code;
+      if (headers) this.headers = headers;
+    },
+    end(data) {
+      if (data) this.body += String(data);
+      if (this.resolve) this.resolve(this);
+    },
+  };
+}
+
+function callStatePost(body, overrides = {}) {
+  return new Promise((resolve) => {
+    const res = makeRes();
+    res.resolve = resolve;
+    const calls = {
+      updateSession: [],
+      setState: [],
+      recorder: [],
+      resolved: [],
+      showCodexNotifyBubble: [],
+      clearCodexNotifyBubbles: [],
+    };
+    const ctx = {
+      STATE_SVGS: {
+        working: "x.svg",
+        attention: "x.svg",
+        notification: "x.svg",
+        "mini-idle": "x.svg",
+      },
+      pendingPermissions: [],
+      isAgentEnabled: () => true,
+      setState: (...args) => calls.setState.push(args),
+      updateSession: (...args) => calls.updateSession.push(args),
+      resolvePermissionEntry: (perm, behavior, message) => calls.resolved.push({ perm, behavior, message }),
+      showCodexNotifyBubble: (...args) => calls.showCodexNotifyBubble.push(args),
+      clearCodexNotifyBubbles: (...args) => calls.clearCodexNotifyBubbles.push(args),
+      ...overrides.ctx,
+    };
+    handleStatePost(makeReq(body), res, {
+      ctx,
+      createRequestHookRecorder: (data, route) => {
+        calls.recorder.push({ data, route });
+        return {
+          acceptedUnlessDnd: (dropForDnd) => calls.recorder.push({ outcome: dropForDnd ? "dnd" : "accepted" }),
+          droppedByDisabled: () => calls.recorder.push({ outcome: "disabled" }),
+        };
+      },
+      shouldDropForDnd: () => false,
+      codexOfficialTurns: new Map(),
+      ...overrides.options,
+    });
+    res.calls = calls;
+  });
+}
+
+describe("server-route-state health", () => {
+  it("returns the same /state health payload and header", () => {
+    const res = makeRes();
+
+    sendStateHealthResponse(res, { getHookServerPort: () => 23334 });
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.headers["Content-Type"], "application/json");
+    assert.strictEqual(res.headers[CLAWD_SERVER_HEADER], CLAWD_SERVER_ID);
+    assert.deepStrictEqual(JSON.parse(res.body), {
+      ok: true,
+      app: CLAWD_SERVER_ID,
+      port: 23334,
+    });
+  });
+});
+
+describe("isRemoteCodexPermissionEvent", () => {
+  it("detects remote Codex permission notifications", () => {
+    assert.strictEqual(isRemoteCodexPermissionEvent({
+      agent_id: "codex",
+      event: "codex-permission",
+    }), true);
+    assert.strictEqual(isRemoteCodexPermissionEvent({
+      agent_id: "codex",
+      event: "PreToolUse",
+    }), false);
+    assert.strictEqual(isRemoteCodexPermissionEvent({
+      agent_id: "claude-code",
+      event: "codex-permission",
+    }), false);
+  });
+});
+
+describe("server-route-state POST", () => {
+  it("passes normalized metadata to updateSession", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PreToolUse",
+      display_svg: "/tmp/display.svg",
+      source_pid: 123.9,
+      cwd: "D:\\repo",
+      editor: "cursor",
+      pid_chain: [1, "bad", 3],
+      agent_pid: 99.8,
+      agent_id: "codex",
+      host: "remote-host",
+      headless: true,
+      session_title: "  Work title  ",
+      permission_suspect: true,
+      preserve_state: true,
+      hook_source: "codex-official",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.calls.updateSession, [[
+      "sid",
+      "working",
+      "PreToolUse",
+      {
+        sourcePid: 123,
+        cwd: "D:\\repo",
+        editor: "cursor",
+        pidChain: [1, 3],
+        agentPid: 99,
+        agentId: "codex",
+        host: "remote-host",
+        headless: true,
+        displayHint: "display.svg",
+        sessionTitle: "Work title",
+        permissionSuspect: true,
+        preserveState: true,
+        hookSource: "codex-official",
+      },
+    ]]);
+  });
+
+  it("uses basename for explicit svg state overrides", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      svg: "/tmp/pet.svg",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.calls.setState, [["working", "pet.svg"]]);
+  });
+
+  it("routes remote Codex permission events to notification bubbles without replacing session state", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "notification",
+      session_id: "codex-remote",
+      event: "codex-permission",
+      agent_id: "codex",
+      cwd: "/workspace/app",
+      permissionDetail: {
+        command: "git push",
+      },
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.calls.updateSession, [[
+      "codex-remote",
+      "notification",
+      "codex-permission",
+      {
+        sourcePid: null,
+        cwd: "/workspace/app",
+        editor: null,
+        pidChain: null,
+        agentPid: null,
+        agentId: "codex",
+        host: null,
+        headless: false,
+        displayHint: undefined,
+        sessionTitle: null,
+        permissionSuspect: false,
+        hookSource: null,
+      },
+    ]]);
+    assert.deepStrictEqual(res.calls.showCodexNotifyBubble, [[{
+      sessionId: "codex-remote",
+      command: "git push",
+    }]]);
+  });
+
+  it("clears remote Codex notify bubbles when a normal Codex state arrives", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "codex-remote",
+      event: "PreToolUse",
+      agent_id: "codex",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.calls.clearCodexNotifyBubbles, [[
+      "codex-remote",
+      "codex-state-transition:working",
+    ]]);
+  });
+
+  it("drops disabled agents with a 204 and records the disabled outcome", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      agent_id: "codex",
+    }), {
+      ctx: {
+        isAgentEnabled: (agentId) => agentId !== "codex",
+      },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.headers[CLAWD_SERVER_HEADER], CLAWD_SERVER_ID);
+    assert.deepStrictEqual(res.calls.recorder.map((entry) => entry.outcome).filter(Boolean), ["disabled"]);
+    assert.deepStrictEqual(res.calls.updateSession, []);
+  });
+
+  it("returns 400 for mini states without an svg override", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "mini-idle",
+    }));
+
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(res.body, "mini states require svg override");
+  });
+
+  it("returns 413 when the body exceeds MAX_STATE_BODY_BYTES", async () => {
+    const body = JSON.stringify({
+      state: "working",
+      session_title: "x".repeat(MAX_STATE_BODY_BYTES),
+    });
+
+    const res = await callStatePost(body);
+
+    assert.strictEqual(res.statusCode, 413);
+    assert.strictEqual(res.body, "state payload too large");
+  });
+
+  it("returns 400 for invalid JSON", async () => {
+    const res = await callStatePost("{not json");
+
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(res.body, "bad json");
+  });
+});

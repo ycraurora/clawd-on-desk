@@ -41,9 +41,9 @@ function loadSettingsI18nStrings() {
 }
 
 function loadBubbleStrings() {
-  const source = fs.readFileSync(path.join(ROOT, "src", "bubble.html"), "utf8");
+  const source = fs.readFileSync(path.join(ROOT, "src", "bubble-renderer.js"), "utf8");
   const match = source.match(/const BUBBLE_STRINGS = (\{[\s\S]*?\n\});/);
-  assert.ok(match, "bubble.html should define BUBBLE_STRINGS");
+  assert.ok(match, "bubble-renderer.js should define BUBBLE_STRINGS");
   const context = {};
   vm.runInNewContext(`result = ${match[1]};`, context);
   return context.result;
@@ -67,11 +67,15 @@ describe("i18n locales", () => {
   });
 
   it("keeps main-process Settings dialog strings available for every supported language", () => {
-    const source = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
-    for (const name of [
-      "SOUND_OVERRIDE_DIALOG_STRINGS",
-      "ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS",
-      "REMOVE_THEME_DIALOG_STRINGS",
+    const settingsIpcSource = fs.readFileSync(path.join(ROOT, "src", "settings-ipc.js"), "utf8");
+    const animationOverridesSource = fs.readFileSync(
+      path.join(ROOT, "src", "settings-animation-overrides-main.js"),
+      "utf8"
+    );
+    for (const [name, source] of [
+      ["SOUND_OVERRIDE_DIALOG_STRINGS", settingsIpcSource],
+      ["ANIMATION_OVERRIDES_EXPORT_DIALOG_STRINGS", animationOverridesSource],
+      ["REMOVE_THEME_DIALOG_STRINGS", settingsIpcSource],
     ]) {
       const start = source.indexOf(`const ${name} = {`);
       assert.notStrictEqual(start, -1, `missing ${name}`);
