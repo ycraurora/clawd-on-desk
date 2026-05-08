@@ -6,9 +6,9 @@ const {
   buildSessionRootCandidates,
   extractSessionId,
   normalizePosixDir,
-} = require("../extensions/vscode/codex-monitor");
+} = require("../extensions/vscode-remote-codex/codex-monitor");
 
-describe("vscode codex monitor helpers", () => {
+describe("remote vscode codex monitor helpers", () => {
   it("normalizes posix directories", () => {
     assert.strictEqual(normalizePosixDir(" /home/vscode/ "), "/home/vscode");
     assert.strictEqual(normalizePosixDir("root"), "/root");
