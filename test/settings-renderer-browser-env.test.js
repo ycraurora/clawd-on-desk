@@ -740,6 +740,7 @@ function loadAnimOverridesTabForTest({
   settingsAPI = {},
   opsOverrides = {},
   readersOverrides = {},
+  helpersOverrides = {},
 }) {
   const document = {
     body: new FakeElement("body"),
@@ -779,10 +780,17 @@ function loadAnimOverridesTabForTest({
     runtime,
     helpers: {
       t: (key) => key,
+      createDisclosureChevron: (className) => {
+        const chevron = document.createElement("span");
+        chevron.className = className;
+        chevron.setAttribute("aria-hidden", "true");
+        return chevron;
+      },
       attachActivation: (el, invoke) => {
         if (typeof invoke === "function") el.addEventListener("click", () => invoke());
         return el;
       },
+      ...helpersOverrides,
     },
     ops: {
       selectTab: () => {},
@@ -876,6 +884,7 @@ describe("settings renderer browser environment", () => {
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
       "settings-tab-about.js",
+      "settings-tab-remote-ssh.js",
       "settings-doctor-modal.js",
       "settings-renderer.js",
     ];
@@ -1679,8 +1688,21 @@ describe("settings renderer browser environment", () => {
     assert.ok(coreSource.includes("defaultCollapsed = false"));
     assert.ok(coreSource.includes('header.setAttribute("aria-expanded"'));
     assert.ok(coreSource.includes("collapsibleSummary"));
-    assert.ok(css.includes(".collapsible-group-header"));
-    assert.ok(css.includes(".collapsible-group-chevron"));
+    assert.ok(coreSource.includes("function createDisclosureChevron("));
+    assert.ok(coreSource.includes('createDisclosureChevron("collapsible-group-chevron")'));
+    assert.ok(coreSource.includes('svg.setAttribute("viewBox", "0 0 20 20")'));
+    assert.ok(coreSource.includes('path.setAttribute("d", "M8 5l5 5-5 5")'));
+    assert.ok(!coreSource.includes('chevron.textContent = "\\u25B8";'));
+    assert.ok(!coreSource.includes("chevron.innerHTML"));
+    assert.ok(/\.collapsible-group-header\s*\{[\s\S]*gap:\s*4px;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*width:\s*18px;[\s\S]*height:\s*18px;[\s\S]*opacity:\s*0\.72;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);[\s\S]*transition:[\s\S]*transform 0\.22s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\),[\s\S]*color 0\.16s ease,[\s\S]*opacity 0\.16s ease/.test(css));
+    assert.ok(/\.collapsible-group-chevron svg,\s*\.anim-override-chevron svg\s*\{[\s\S]*width:\s*16px;[\s\S]*height:\s*16px;[\s\S]*overflow:\s*visible;/.test(css));
+    assert.ok(/\.collapsible-group-chevron path,\s*\.anim-override-chevron path\s*\{[\s\S]*fill:\s*none;[\s\S]*stroke:\s*currentColor;[\s\S]*stroke-width:\s*2\.2;[\s\S]*stroke-linecap:\s*round;[\s\S]*stroke-linejoin:\s*round;/.test(css));
+    assert.ok(/\.collapsible-group-header:hover\s+\.collapsible-group-chevron\s*\{[\s\S]*color:\s*var\(--text-secondary\);[\s\S]*opacity:\s*0\.95;/.test(css));
+    assert.ok(/\.collapsible-group\.collapsed\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);/.test(css));
+    assert.ok(/\.collapsible-group:not\(\.collapsed\)\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.collapsible-group-chevron,[\s\S]*\.anim-override-chevron,[\s\S]*transition:\s*none;/.test(css));
     assert.ok(i18nSource.includes("collapsibleExpand"));
     assert.ok(i18nSource.includes("collapsibleCollapse"));
   });
@@ -2169,6 +2191,25 @@ describe("settings renderer browser environment", () => {
     );
   });
 
+  it("uses the shared SVG chevron treatment for Animation Overrides rows", () => {
+    const overridesSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+
+    assert.ok(!overridesSource.includes('chevron.textContent = "\\u25B8";'));
+    assert.ok(!overridesSource.includes("chevron.innerHTML"));
+    assert.ok(overridesSource.includes('helpers.createDisclosureChevron("anim-override-chevron")'));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*width:\s*18px;[\s\S]*height:\s*18px;[\s\S]*opacity:\s*0\.72;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);[\s\S]*transition:[\s\S]*transform 0\.22s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\),[\s\S]*color 0\.16s ease,[\s\S]*opacity 0\.16s ease/.test(css));
+    assert.ok(/\.collapsible-group-chevron svg,\s*\.anim-override-chevron svg\s*\{[\s\S]*width:\s*16px;[\s\S]*height:\s*16px;[\s\S]*overflow:\s*visible;/.test(css));
+    assert.ok(/\.collapsible-group-chevron path,\s*\.anim-override-chevron path\s*\{[\s\S]*fill:\s*none;[\s\S]*stroke:\s*currentColor;[\s\S]*stroke-width:\s*2\.2;[\s\S]*stroke-linecap:\s*round;[\s\S]*stroke-linejoin:\s*round;/.test(css));
+    assert.ok(/\.anim-override-row > summary:hover \.anim-override-chevron\s*\{[\s\S]*color:\s*var\(--text-secondary\);[\s\S]*opacity:\s*0\.95;/.test(css));
+    assert.ok(/\.anim-override-row\[open\]\s*>\s*summary\s+\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.anim-override-chevron,[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(/\.anim-override-thumb\s*\{[\s\S]*transform:\s*translateX\(-3px\);/.test(css));
+    assert.ok(/\.anim-override-summary-text\s*\{[\s\S]*transform:\s*translateX\(-3px\);/.test(css));
+    assert.ok(!/\.anim-override-summary-change\s*\{[\s\S]*translateX\(-3px\)/.test(css));
+  });
+
   it("uses captured poster previews for trusted scripted animation override SVGs", () => {
     const html = fs.readFileSync(SETTINGS_HTML, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -2602,6 +2643,91 @@ describe("settings renderer browser environment", () => {
     const placeholders = parent.querySelectorAll(".placeholder-desc");
     assert.ok(placeholders.length > 0);
     assert.strictEqual(placeholders[0].textContent, "animOverridesLoading");
+  });
+
+  it("renders Animation Overrides theme actions in two intentional rows", () => {
+    const runtime = createAnimOverridesRuntime(createAnimOverrideCard());
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+
+    core.tabs.animOverrides.render(parent, core);
+
+    const meta = parent.querySelector(".anim-override-meta");
+    assert.ok(meta);
+    assert.deepStrictEqual(
+      meta.querySelectorAll(".anim-override-meta-label").map((label) => label.textContent),
+      ["animOverridesCurrentTheme: Cloudling", "animOverridesReplacementConfig"]
+    );
+
+    const primary = meta.querySelector(".anim-override-meta-primary-actions");
+    const secondary = meta.querySelector(".anim-override-meta-secondary-actions");
+    assert.deepStrictEqual(
+      primary.querySelectorAll("button").map((button) => button.textContent),
+      ["animOverridesOpenThemeTab", "animOverridesOpenAssets"]
+    );
+    assert.deepStrictEqual(
+      secondary.querySelectorAll("button").map((button) => button.textContent),
+      ["animOverridesImport", "animOverridesExport", "animOverridesResetAll"]
+    );
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.match(
+      css,
+      /\.anim-override-meta\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\) auto;/
+    );
+    assert.match(
+      css,
+      /\.anim-override-meta-actions\s*\{[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*flex-end;/
+    );
+    assert.match(
+      css,
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.anim-override-meta-actions\s*\{[\s\S]*justify-content:\s*flex-start;/
+    );
+
+    const strings = loadSettingsI18nForTest();
+    assert.strictEqual(strings.en.animOverridesReplacementConfig, "Overrides config");
+    assert.strictEqual(strings.zh.animOverridesReplacementConfig, "动画/音效覆盖配置");
+    assert.strictEqual(strings.ko.animOverridesReplacementConfig, "애니메이션/사운드 덮어쓰기 설정");
+    assert.strictEqual(strings.ja.animOverridesReplacementConfig, "アニメ/サウンド上書き設定");
+    assert.strictEqual(strings.en.animOverridesImport, "Import config…");
+    assert.strictEqual(strings.zh.animOverridesImport, "导入配置…");
+    assert.strictEqual(strings.ko.animOverridesImport, "설정 가져오기…");
+    assert.strictEqual(strings.ja.animOverridesImport, "設定をインポート…");
+    assert.strictEqual(strings.en.animOverridesExport, "Export config…");
+    assert.strictEqual(strings.zh.animOverridesExport, "导出配置…");
+    assert.strictEqual(strings.ko.animOverridesExport, "설정 내보내기…");
+    assert.strictEqual(strings.ja.animOverridesExport, "設定をエクスポート…");
+    assert.strictEqual(strings.en.animOverridesResetAll, "Clear all overrides");
+    assert.strictEqual(strings.zh.animOverridesResetAll, "清除全部覆盖");
+    assert.strictEqual(strings.ko.animOverridesResetAll, "모든 덮어쓰기 지우기");
+    assert.strictEqual(strings.ja.animOverridesResetAll, "すべての上書きを解除");
+    assert.match(
+      css,
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.anim-override-meta\s*\{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/
+    );
+  });
+
+  it("does not build Animation Overrides theme actions on the Sounds subtab", () => {
+    const runtime = createAnimOverridesRuntime(createAnimOverrideCard(), { animOverridesSubtab: "sounds" });
+    const modalRoot = new FakeElement("div");
+    let activationCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      helpersOverrides: {
+        attachActivation: (el, invoke) => {
+          activationCount += 1;
+          if (typeof invoke === "function") el.addEventListener("click", () => invoke());
+          return el;
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+
+    core.tabs.animOverrides.render(parent, core);
+
+    assert.strictEqual(parent.querySelector(".anim-override-meta"), null);
+    assert.strictEqual(activationCount, 1, "only the Sounds directory button should be wired");
   });
 
   it("uses specific fade timing labels and gives the slider label enough room", () => {

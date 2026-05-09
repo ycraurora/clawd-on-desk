@@ -6,7 +6,7 @@
 
 **Claude Code** — 开箱即用。Clawd 启动时会自动注册 hooks。只有在确认 Claude Code 版本兼容时才会注册 versioned hooks（`PreCompact`、`PostCompact`、`StopFailure`）；如果版本无法确认，会自动回退到核心 hooks，并清理旧的不兼容条目。
 
-**Codex CLI** — 开箱即用。Clawd 会在检测到 Codex 时自动注册 official hooks 到 `~/.codex/hooks.json`，并在用户没有显式设置 `codex_hooks = false` 时启用 `[features].codex_hooks = true`。Official hooks 提供实时状态和真实 Allow/Deny 权限气泡；`~/.codex/sessions/` JSONL 轮询保留为 hook 被禁用或 hook 未覆盖事件的 fallback。
+**Codex CLI** — 开箱即用。Clawd 会在检测到 Codex 时自动注册 official hooks 到 `~/.codex/hooks.json`，并在用户没有显式关闭 hooks 时启用 `[features].hooks = true`。Installer 会把已废弃的 `[features].codex_hooks` 迁移到 `hooks`，同时保留用户显式设置的 false。Official hooks 提供实时状态和真实 Allow/Deny 权限气泡；`~/.codex/sessions/` JSONL 轮询保留为 hook 被禁用或 hook 未覆盖事件的 fallback。
 
 **Docker / devcontainer 里的 VS Code Codex** — Clawd 采用双端 bridge：随应用自动安装的本地 `clawd-terminal-focus` 扩展负责把事件转发到本机 Clawd，而真正读取容器内 `~/.codex/sessions` 的是另一个跑在 remote/workspace 侧的 helper 扩展。这个 helper 目前还不会自动装进容器里的 VS Code Server，测试这条链路时需要先手动安装一次。
 
