@@ -146,7 +146,7 @@ const updateRegistry = {
   savedPixelHeight: requireNonNegativeFiniteNumber("savedPixelHeight"),
 
   // ── Pure data prefs (function-form: validator only) ──
-  lang: requireEnum("lang", ["en", "zh", "ko", "ja"]),
+  lang: requireEnum("lang", ["en", "zh", "zh-TW", "ko", "ja"]),
   soundMuted: requireBoolean("soundMuted"),
   soundVolume: requireNumberInRange("soundVolume", 0, 1),
   lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
@@ -160,6 +160,11 @@ const updateRegistry = {
   permissionBubblesEnabled: requireBoolean("permissionBubblesEnabled"),
   notificationBubbleAutoCloseSeconds: requireIntegerInRange(
     "notificationBubbleAutoCloseSeconds",
+    0,
+    MAX_AUTO_CLOSE_SECONDS
+  ),
+  permissionBubbleAutoCloseSeconds: requireIntegerInRange(
+    "permissionBubbleAutoCloseSeconds",
     0,
     MAX_AUTO_CLOSE_SECONDS
   ),

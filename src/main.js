@@ -214,6 +214,8 @@ const _settingsController = createSettingsController({
     // Theme runtime is wired after theme-loader.init(); keep these closures
     // lazy so settings actions never capture a pre-init runtime reference.
     activateTheme: (id, variantId, overrideMap) => themeRuntime.activateTheme(id, variantId, overrideMap),
+    refreshActiveThemeHitboxOverrides: (id, overrideMap) =>
+      themeRuntime.refreshActiveThemeHitboxOverrides(id, overrideMap),
     getThemeInfo: (id) => themeRuntime.getThemeInfo(id),
     removeThemeDir: (id) => themeRuntime.removeThemeDir(id),
     globalShortcut,
@@ -796,7 +798,7 @@ const _permCtx = {
     _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   focusTerminalForSession: (sessionId, options = {}) => {
     const s = sessions.get(sessionId);
-    if (s && s.sourcePid) {
+    if (s && s.sourcePid && s.platform !== "webui") {
       focusTerminalWindow({
         sourcePid: s.sourcePid,
         cwd: s.cwd,
@@ -1018,7 +1020,7 @@ function focusDashboardSession(sessionId, options = {}) {
   if (!sessionId) return;
   const requestSource = options.requestSource || "dashboard";
   const session = sessions.get(String(sessionId));
-  if (session && session.sourcePid) {
+  if (session && session.sourcePid && session.platform !== "webui") {
     focusTerminalWindow({
       sourcePid: session.sourcePid,
       cwd: session.cwd,
@@ -1268,6 +1270,7 @@ const settingsEffectRouter = createSettingsEffectRouter({
   clearCodexNotifyBubbles,
   clearKimiNotifyBubbles,
   refreshPassiveNotifyAutoClose: () => callRuntimeMethod(_perm, "refreshPassiveNotifyAutoClose"),
+  refreshPermissionAutoCloseForPolicy: () => callRuntimeMethod(_perm, "refreshPermissionAutoCloseForPolicy"),
   hideUpdateBubbleForPolicy: () => callRuntimeMethod(_updateBubble, "hideForPolicy"),
   refreshUpdateBubbleAutoClose: () => callRuntimeMethod(_updateBubble, "refreshAutoCloseForPolicy"),
   repositionFloatingBubbles,

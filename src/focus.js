@@ -1,7 +1,9 @@
 // src/focus.js — Terminal focus system (PowerShell persistent process + macOS osascript)
 // Extracted from main.js L1030-1335
 
+const fs = require("fs");
 const http = require("http");
+const os = require("os");
 const crypto = require("crypto");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
@@ -9,6 +11,67 @@ const { execFile, spawn } = require("child_process");
 const isMac = process.platform === "darwin";
 const isWin = process.platform === "win32";
 const isLinux = process.platform === "linux";
+
+// ── Mac-only: Superset workspace deep-link helpers ──────────────────────────
+// Superset.app is a multi-workspace Electron host. The generic
+// `set frontmost of process whose unix id is N` script only activates the app
+// — it can't switch the visible workspace to the worktree the request came
+// from. Use the reverse-engineered `superset://workspace/<id>` URL scheme to
+// navigate (observed 2026-05-08; internal scheme, no stability guarantee).
+//
+// `open` is given `-b com.superset.desktop` so a stale Superset DMG that
+// LaunchServices still claims for the scheme cannot intercept the deep link.
+//
+// These helpers are at module scope so the unit tests can exercise them
+// without standing up the full Electron context.
+
+const SUPERSET_BUNDLE_ID = "com.superset.desktop";
+
+function findSupersetDataDirs(homeDir) {
+  // Superset by default lives in ~/.superset, but custom instances use
+  // `~/.superset-<name>` and the matching URL scheme `superset-<name>://`.
+  const home = homeDir || os.homedir();
+  try {
+    return fs.readdirSync(home, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith(".superset"))
+      .map((e) => path.join(home, e.name))
+      .filter((dir) => {
+        try { return fs.existsSync(path.join(dir, "local.db")); }
+        catch { return false; }
+      });
+  } catch { return []; }
+}
+
+function supersetSchemeForDir(dir) {
+  const base = path.basename(dir);
+  if (base === ".superset") return "superset";
+  if (base.startsWith(".superset-")) return `superset-${base.slice(".superset-".length)}`;
+  return null;
+}
+
+function querySupersetWorkspaceId(dbPath, cwd, callback) {
+  // Async callback form: invoke `callback(id|null)`. Spawning sqlite3 as a
+  // child process with execFile keeps the Electron main event loop free
+  // even on cold disks where the read can take a few hundred ms.
+  if (!cwd) return callback(null);
+  const candidates = [cwd];
+  try {
+    const real = fs.realpathSync(cwd);
+    if (real && real !== cwd) candidates.push(real);
+  } catch {}
+  const tryNext = (idx) => {
+    if (idx >= candidates.length) return callback(null);
+    const escaped = candidates[idx].replace(/'/g, "''");
+    const sql = `SELECT ws.id FROM workspaces ws JOIN worktrees w ON w.id = ws.worktree_id WHERE w.path = '${escaped}' ORDER BY COALESCE(ws.last_opened_at, 0) DESC LIMIT 1;`;
+    execFile("sqlite3", ["-readonly", dbPath, sql], { encoding: "utf8", timeout: 1500 }, (err, stdout) => {
+      if (err) return tryNext(idx + 1);
+      const trimmed = (stdout || "").trim();
+      if (trimmed) return callback(trimmed);
+      tryNext(idx + 1);
+    });
+  };
+  tryNext(0);
+}
 
 module.exports = function initFocus(ctx) {
 
@@ -30,6 +93,9 @@ public class WinFocus {
     public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int maxCount);
     [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
     public static void Focus(IntPtr hWnd) {
@@ -38,6 +104,18 @@ public class WinFocus {
         keybd_event(0x12, 0, 0, UIntPtr.Zero);
         keybd_event(0x12, 0, 2, UIntPtr.Zero);
         SetForegroundWindow(hWnd);
+    }
+    public static IntPtr FindConsoleWindowForPid(uint targetPid) {
+        // Console shells such as powershell.exe / pwsh.exe can have
+        // MainWindowHandle == 0 because the visible HWND belongs to the
+        // console host. Attaching briefly lets us retrieve that HWND.
+        // The helper uses stdin/stdout pipes, so detaching from a console does
+        // not break the IPC channel back to Electron.
+        FreeConsole();
+        if (!AttachConsole(targetPid)) return IntPtr.Zero;
+        IntPtr hWnd = GetConsoleWindow();
+        FreeConsole();
+        return hWnd;
     }
     public static IntPtr[] FindByPidTitles(uint targetPid, string[] subs) {
         var found = new List<IntPtr>();
@@ -96,7 +174,9 @@ function makeFocusCmd(sourcePid, cwdCandidates) {
             } elseif ($matches.Count -gt 1) {
                 $reason = 'wt-parent-title-ambiguous'
             } else {
-                $reason = 'wt-parent-title-mismatch'
+                [WinFocus]::Focus($proc.MainWindowHandle)
+                $focused = $true
+                $reason = 'wt-parent-direct-fallback'
             }
         } else {
             [WinFocus]::Focus($proc.MainWindowHandle)
@@ -146,6 +226,13 @@ for ($i = 0; $i -lt 8; $i++) {
     $proc = Get-Process -Id $curPid -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ProcessName -eq 'explorer') { break }
     if ($proc.MainWindowHandle -ne 0) {${parentWindowBlock}
+    }
+    $consoleHwnd = [WinFocus]::FindConsoleWindowForPid([uint32]$curPid)
+    if ($consoleHwnd -ne [IntPtr]::Zero -and [WinFocus]::IsWindowVisible($consoleHwnd)) {
+        [WinFocus]::Focus($consoleHwnd)
+        $focused = $true
+        $reason = 'console-window'
+        break
     }
     $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$curPid" -ErrorAction SilentlyContinue
     if (-not $cim -or $cim.ParentProcessId -eq 0 -or $cim.ParentProcessId -eq $curPid) { break }
@@ -407,6 +494,80 @@ function executeMacFocusRequest(request) {
   focusTerminalWindowLegacy(request, finalize);
   scheduleTerminalTabFocus(request.editor, request.pidChain);
   scheduleITermTabFocus(request.sourcePid, request.pidChain);
+  scheduleSupersetFocus(request.sourcePid, request.cwd);
+  scheduleGhosttyFocus(request.sourcePid, request.cwd);
+}
+
+function scheduleSupersetFocus(sourcePid, cwd) {
+  // Mirror scheduleITermTabFocus / scheduleGhosttyFocus: detect the host by
+  // the source process command name *first*, then run the deep link. Without
+  // the comm gate, any focus request whose cwd happens to be tracked by
+  // Superset (e.g. a worktree opened in VS Code / Cursor / iTerm2) would
+  // pull Superset to the front and steal focus from the real source.
+  if (!isMac || !sourcePid || !cwd) return;
+  execFile("ps", ["-o", "comm=", "-p", String(sourcePid)], { encoding: "utf8", timeout: 500 }, (err, stdout) => {
+    if (err) return;
+    // Superset bundles exec at /Applications/Superset.app/Contents/MacOS/Superset,
+    // so path.basename of the comm is "Superset" for every Superset-hosted
+    // shell (the boundary walk in shared-process.js ends at the bundle exec
+    // because terminalNames does not list Superset).
+    const name = path.basename(stdout.trim()).toLowerCase();
+    if (name !== "superset") return;
+
+    const dirs = findSupersetDataDirs();
+    if (!dirs.length) return;
+    const tryDir = (idx) => {
+      if (idx >= dirs.length) return;
+      const dir = dirs[idx];
+      querySupersetWorkspaceId(path.join(dir, "local.db"), cwd, (id) => {
+        if (!id) return tryDir(idx + 1);
+        const scheme = supersetSchemeForDir(dir);
+        if (!scheme) return tryDir(idx + 1);
+        const url = `${scheme}://workspace/${id}`;
+        execFile("/usr/bin/open", ["-b", SUPERSET_BUNDLE_ID, url], { timeout: 1500 }, (err2) => {
+          if (err2) focusLog(`superset deep-link failed: ${err2.message}`);
+        });
+      });
+    };
+    tryDir(0);
+  });
+}
+
+function scheduleGhosttyFocus(sourcePid, cwd) {
+  // Mirror scheduleITermTabFocus: detect Ghostty by the source process
+  // command name, then ask Ghostty's scripting dictionary to focus the
+  // terminal whose `working directory` matches cwd. `focus` selects the
+  // surface and raises its window, so no separate System Events activate is
+  // needed.
+  if (!isMac || !sourcePid || !cwd) return;
+  execFile("ps", ["-o", "comm=", "-p", String(sourcePid)], { encoding: "utf8", timeout: 500 }, (err, stdout) => {
+    if (err) return;
+    const name = path.basename(stdout.trim()).toLowerCase();
+    if (name !== "ghostty") return;
+
+    const candidates = [cwd];
+    try {
+      const real = fs.realpathSync(cwd);
+      if (real && real !== cwd) candidates.push(real);
+    } catch {}
+    const escapeAS = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const literalList = candidates.map((c) => `"${escapeAS(c)}"`).join(", ");
+    const script = `
+      tell application "Ghostty"
+        set targetCwds to {${literalList}}
+        repeat with cwdLiteral in targetCwds
+          set matches to every terminal whose working directory is (contents of cwdLiteral)
+          if (count of matches) > 0 then
+            focus (item 1 of matches)
+            return "ok"
+          end if
+        end repeat
+        return "miss"
+      end tell`;
+    setTimeout(() => {
+      execFile("osascript", ["-e", script], { timeout: MAC_FOCUS_TIMEOUT_MS }, () => {});
+    }, 400);
+  });
 }
 
 function requestMacFocus(request) {
@@ -594,4 +755,15 @@ return {
   },
 };
 
+};
+
+// Top-level (no-ctx) helpers exposed so unit tests can exercise the
+// Superset workspace lookup path without running the full Electron factory.
+// The factory's instance-level `__test` namespace (returned above) covers
+// closure-only helpers like makeFocusCmd; this attaches the module-scoped
+// helpers separately.
+module.exports.__test = {
+  findSupersetDataDirs,
+  supersetSchemeForDir,
+  querySupersetWorkspaceId,
 };

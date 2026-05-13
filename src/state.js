@@ -714,6 +714,9 @@ function updateSession(sessionId, state, event, opts = {}) {
     agentId = null,
     host = null,
     headless = false,
+    platform = null,
+    model = null,
+    provider = null,
     displayHint = undefined,
     sessionTitle = null,
     permissionSuspect = false,
@@ -755,6 +758,9 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcAgentId = agentId || (existing && existing.agentId) || null;
   const srcHost = host || (existing && existing.host) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
+  const srcPlatform = platform || (existing && existing.platform) || null;
+  const srcModel = model || (existing && existing.model) || null;
+  const srcProvider = provider || (existing && existing.provider) || null;
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
   const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
@@ -768,7 +774,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
   const recentEvents = pushRecentEvent(existing, preservedState || state, event);
-  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
+  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
 
   if (event === "codex-permission") {
     const nextState = existing && existing.state === "juggling" ? "juggling" : "working";
@@ -1086,21 +1092,28 @@ function detectRunningAgentProcesses(callback) {
   // call entirely — nothing we could "find" should keep startup recovery
   // alive. When at least one agent is enabled, we still run the combined
   // detection because the query can't attribute individual processes back
-  // to agent ids (wmic/pgrep would need per-name queries), and the result
+  // to agent ids without per-name process queries, and the result
   // is only a boolean for startup recovery — not a session creator.
   if (typeof ctx.hasAnyEnabledAgent === "function" && !ctx.hasAnyEnabledAgent()) {
     done(false);
     return;
   }
-  const { exec } = require("child_process");
+  const { execFile, exec } = require("child_process");
   if (process.platform === "win32") {
-    exec(
-      'wmic process where "(Name=\'node.exe\' and CommandLine like \'%claude-code%\') or Name=\'claude.exe\' or Name=\'codex.exe\' or Name=\'copilot.exe\' or Name=\'gemini.exe\' or Name=\'codebuddy.exe\' or Name=\'kiro-cli.exe\' or Name=\'kimi.exe\' or Name=\'opencode.exe\'" get ProcessId /format:csv',
-      { encoding: "utf8", timeout: 5000, windowsHide: true },
+    const psScript =
+      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','opencode.exe','pi.exe','hermes.exe'; " +
+      "$match = Get-CimInstance Win32_Process | Where-Object { " +
+        "$names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') " +
+      "} | Select-Object -First 1; " +
+      "if ($match) { $match.ProcessId }";
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", psScript],
+      { encoding: "utf8", timeout: 5000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi' || pgrep -x 'gemini' || pgrep -x 'kiro-cli' || pgrep -x 'opencode'", { timeout: 3000 },
+    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'kiro-cli' || pgrep -x 'opencode' || pgrep -x 'hermes'", { timeout: 3000 },
       (err) => done(!err)
     );
   }

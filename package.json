@@ -23,10 +23,16 @@
     "install:cursor-hooks": "node hooks/cursor-install.js",
     "install:kiro-hooks": "node hooks/kiro-install.js",
     "install:kimi-hooks": "node hooks/kimi-install.js",
+    "install:pi-extension": "node hooks/pi-install.js",
+    "uninstall:pi-extension": "node hooks/pi-install.js --uninstall",
+    "install:openclaw-plugin": "node hooks/openclaw-install.js",
+    "uninstall:openclaw-plugin": "node hooks/openclaw-install.js --uninstall",
     "install:codex-hooks": "node hooks/codex-install.js",
     "uninstall:codex-hooks": "node hooks/codex-install.js --uninstall",
     "install:codex-debug-hooks": "node hooks/codex-debug-install.js",
     "uninstall:codex-debug-hooks": "node hooks/codex-debug-install.js --uninstall",
+    "install:hermes-plugin": "node hooks/hermes-install.js",
+    "uninstall:hermes-plugin": "node hooks/hermes-install.js --uninstall",
     "register-protocol:dev": "node launch.js --register-protocol"
   },
   "keywords": [
@@ -107,6 +113,7 @@
       "installerHeaderIcon": "assets/icon.ico"
     },
     "files": [
+      "NOTICE.md",
       "src/**/*",
       "assets/icon.ico",
       "assets/icons/**/*",

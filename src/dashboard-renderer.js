@@ -10,6 +10,8 @@ const AGENT_LABELS = {
   "kimi-cli": "Kimi",
   opencode: "opencode",
   codebuddy: "CodeBuddy",
+  pi: "Pi",
+  openclaw: "OpenClaw",
 };
 
 let snapshot = { sessions: [], groups: [], orderedIds: [] };
@@ -273,7 +275,7 @@ function createCard(session, now) {
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = t("dashboardJumpTerminal");
-  button.disabled = !session.sourcePid;
+  button.disabled = !session.sourcePid || session.platform === "webui";
   button.addEventListener("click", () => {
     window.dashboardAPI.focusSession(session.id);
   });
