@@ -69,6 +69,7 @@
       animOverrideTimingSliders: new Map(),
       bubblePolicySummary: null,
       sessionHudSummary: null,
+      languagePicker: null,
       size: null,
       soundSummary: null,
       soundVolume: null,
@@ -106,7 +107,6 @@
       clickCount: 0,
       contributorsExpanded: false,
     },
-    languageTransition: null,
   };
 
   const renderHooks = {
@@ -628,6 +628,9 @@
   }
 
   function clearMountedControls() {
+    if (state.mountedControls.languagePicker && typeof state.mountedControls.languagePicker.dispose === "function") {
+      state.mountedControls.languagePicker.dispose();
+    }
     if (state.mountedControls.size && typeof state.mountedControls.size.dispose === "function") {
       Promise.resolve(state.mountedControls.size.dispose()).catch(() => {});
     }
@@ -643,6 +646,7 @@
     state.mountedControls.animOverrideTimingSliders.clear();
     state.mountedControls.bubblePolicySummary = null;
     state.mountedControls.sessionHudSummary = null;
+    state.mountedControls.languagePicker = null;
     state.mountedControls.size = null;
     state.mountedControls.soundSummary = null;
     state.mountedControls.soundVolume = null;
@@ -904,7 +908,6 @@
   }
 
   function applyChanges(payload) {
-    const previousLang = getLang();
     const previousSnapshot = state.snapshot;
     if (payload && payload.snapshot) {
       state.snapshot = payload.snapshot;
@@ -914,12 +917,6 @@
     if (!state.snapshot) return;
 
     const changes = payload && payload.changes;
-    if (changes && Object.prototype.hasOwnProperty.call(changes, "lang")) {
-      const nextLang = getLang();
-      runtime.languageTransition = state.activeTab === "general" && previousLang !== nextLang
-        ? { from: previousLang, to: nextLang }
-        : null;
-    }
     clearTransientStateForChanges(changes);
     const needsAnimOverridesRefresh = !!(changes && (
       "theme" in changes || "themeVariant" in changes || "themeOverrides" in changes

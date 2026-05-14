@@ -338,24 +338,44 @@ class FakeElement {
 
 function loadGeneralLanguageRowForTest({
   snapshot,
+  update = () => Promise.resolve({ status: "ok" }),
 } = {}) {
   const raf = createQueuedRaf();
   const body = new FakeElement("body");
   const content = new FakeElement("main");
   content.id = "content";
   body.appendChild(content);
+  const toastStack = new FakeElement("div");
+  toastStack.id = "toastStack";
+  body.appendChild(toastStack);
 
+  const documentListeners = new Map();
   const document = {
     body,
     createElement: (tagName) => new FakeElement(tagName),
     getElementById(id) {
       if (id === "content") return content;
+      if (id === "toastStack") return toastStack;
       return null;
+    },
+    addEventListener(type, cb) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(cb);
+    },
+    removeEventListener(type, cb) {
+      const listeners = documentListeners.get(type);
+      if (!listeners) return;
+      const index = listeners.indexOf(cb);
+      if (index !== -1) listeners.splice(index, 1);
     },
   };
 
+  const updateCalls = [];
   const settingsAPI = {
-    update: () => Promise.resolve({ status: "ok" }),
+    update: (key, value) => {
+      updateCalls.push({ key, value });
+      return update(key, value);
+    },
   };
   const context = {
     console,
@@ -366,6 +386,7 @@ function loadGeneralLanguageRowForTest({
     },
     document,
     requestAnimationFrame: (cb) => raf.requestAnimationFrame(cb),
+    setTimeout: () => 1,
     window: null,
     globalThis: null,
     settingsAPI,
@@ -423,14 +444,10 @@ function loadGeneralLanguageRowForTest({
   context.ClawdSettingsTabGeneral.init(core);
 
   let contentRenderCount = 0;
-  let languageTransitionSeenByRender = null;
   function renderLanguageOnly() {
     contentRenderCount++;
     core.ops.clearMountedControls();
     content.innerHTML = "";
-    languageTransitionSeenByRender = core.runtime.languageTransition
-      ? { ...core.runtime.languageTransition }
-      : null;
     content.appendChild(context.ClawdSettingsTabGeneral.__test.buildLanguageRow());
   }
   core.ops.installRenderHooks({ content: renderLanguageOnly });
@@ -439,9 +456,22 @@ function loadGeneralLanguageRowForTest({
     core,
     content,
     raf,
+    settingsAPI,
+    updateCalls,
     getContentRenderCount: () => contentRenderCount,
-    getLanguageTransitionSeenByRender: () => languageTransitionSeenByRender,
-    getSegmented: () => content.querySelector(".language-segmented"),
+    getLangPicker: () => content.querySelector(".language-picker"),
+    getLangTrigger: () => content.querySelector(".language-picker-trigger"),
+    getLangMenu: () => content.querySelector(".language-picker-menu"),
+    getLangValue: () => content.querySelector(".language-picker-value"),
+    getLangOptions: () => content.querySelectorAll(".language-picker-option"),
+    getDocumentListenerCount: (type) => {
+      const listeners = documentListeners.get(type);
+      return listeners ? listeners.length : 0;
+    },
+    getToastText: () => {
+      const toast = toastStack.querySelector(".toast");
+      return toast ? toast.textContent : "";
+    },
   };
 }
 
@@ -1317,7 +1347,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.switch,[\s\S]*\.switch::after\s*\{[\s\S]*transition:\s*none;/.test(css));
   });
 
-  it("animates the Settings language segmented control with a sliding active pill", () => {
+  it("renders the Settings language picker as a dropdown over all supported langs", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -1327,81 +1357,119 @@ describe("settings renderer browser environment", () => {
       SUPPORTED_LANGS.map((lang) => String.raw`"${lang}"`).join(String.raw`,\s*`) +
       String.raw`\];`
     ).test(generalSource));
-    assert.ok(generalSource.includes("language-segmented"));
-    assert.ok(generalSource.includes("runtime.languageTransition"));
-    assert.ok(!generalSource.includes("language-segmented-transitioning"));
-    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(fromIndex));'));
-    assert.ok(generalSource.includes("requestAnimationFrame(() => {"));
-    assert.ok(generalSource.includes("segmented.getBoundingClientRect();"));
-    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(currentIndex));'));
-    assert.ok(coreSource.includes("languageTransition: null"));
-    assert.ok(coreSource.includes("const previousLang = getLang();"));
-    assert.ok(coreSource.includes('Object.prototype.hasOwnProperty.call(changes, "lang")'));
-    assert.ok(coreSource.includes('runtime.languageTransition = state.activeTab === "general" && previousLang !== nextLang'));
-    assert.ok(
-      new RegExp(
-        String.raw`\.language-segmented\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*repeat\(${SUPPORTED_LANGS.length},\s*minmax\(0,\s*1fr\)\);`
-      ).test(css)
-    );
-    assert.ok(css.includes("language-segmented intentionally overrides .segmented display"));
-    assert.ok(/\.language-segmented::before\s*\{[\s\S]*transform:\s*translateX\(calc\(var\(--language-active-index\)\s*\*\s*100%\)\);[\s\S]*transition:\s*transform 0\.24s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\);/.test(css));
-    assert.ok(/\.language-segmented button\.active\s*\{[\s\S]*background:\s*transparent;[\s\S]*box-shadow:\s*none;/.test(css));
-    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-segmented::before\s*\{[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(generalSource.includes(`class="language-picker"`));
+    assert.ok(generalSource.includes(`aria-haspopup="listbox"`));
+    assert.ok(generalSource.includes(`role="listbox"`));
+    assert.ok(generalSource.includes(`aria-hidden="true"`));
+    assert.ok(generalSource.includes(`role", "option"`));
+    assert.ok(!generalSource.includes(`<select class="language-select"`));
+    assert.ok(!generalSource.includes("language-segmented"));
+    assert.ok(!generalSource.includes("runtime.languageTransition"));
+    assert.ok(!generalSource.includes("--language-active-index"));
+    assert.ok(!coreSource.includes("languageTransition"));
+    assert.ok(/\.language-picker-menu\s*\{[\s\S]*box-shadow:/.test(css));
+    assert.ok(/\.language-picker-option:hover,[\s\S]*\.language-picker-option:focus-visible\s*\{[\s\S]*background:/.test(css));
+    assert.ok(/\.language-picker-option\.selected\s*\{[\s\S]*color:\s*var\(--accent\);/.test(css));
+    assert.ok(/@media \(prefers-color-scheme:\s*dark\)\s*\{[\s\S]*\.language-picker-menu/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-picker-trigger,[\s\S]*\.language-picker-chevron,[\s\S]*\.language-picker-menu[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(!css.includes(".language-segmented"));
   });
 
-  it("uses and clears the General tab language slide transition during render", () => {
+  it("populates the language picker with current selection and propagates click changes", () => {
     const harness = loadGeneralLanguageRowForTest({
       snapshot: { lang: "en" },
     });
 
     harness.core.ops.requestRender({ content: true });
     assert.strictEqual(harness.getContentRenderCount(), 1);
-    assert.strictEqual(harness.getSegmented().style.getPropertyValue("--language-active-index"), "0");
+    const picker = harness.getLangPicker();
+    const trigger = harness.getLangTrigger();
+    assert.ok(picker, "language picker should be rendered");
+    assert.ok(trigger, "language picker trigger should be rendered");
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
+    const options = harness.getLangOptions();
+    assert.strictEqual(options.length, SUPPORTED_LANGS.length);
+    for (let i = 0; i < SUPPORTED_LANGS.length; i++) {
+      assert.strictEqual(options[i].dataset.lang, SUPPORTED_LANGS[i]);
+      assert.strictEqual(options[i].tabIndex, -1);
+    }
+    assert.strictEqual(options[0].attributes["aria-selected"], "true");
+
+    trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual(picker.classList.contains("open"), true);
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "false");
+    assert.strictEqual(options[0].tabIndex, 0);
+    options[1].dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking a language option should call settingsAPI.update with the new lang"
+    );
+    assert.strictEqual(picker.classList.contains("open"), false);
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
+    for (const option of options) assert.strictEqual(option.tabIndex, -1);
+    assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+
+    trigger.dispatchEvent({ type: "click" });
+    options[1].dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking the already displayed pending language should not submit a duplicate update"
+    );
+
+    trigger.dispatchEvent({ type: "click" });
+    options[0].dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking back to the committed language while pending should not submit a duplicate update"
+    );
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(options[0].attributes["aria-selected"], "true");
 
     harness.core.ops.applyChanges({
       changes: { lang: "zh" },
       snapshot: { lang: "zh" },
     });
-
-    const segmented = harness.getSegmented();
     assert.strictEqual(harness.getContentRenderCount(), 2);
-    assert.deepStrictEqual(
-      harness.getLanguageTransitionSeenByRender(),
-      { from: "en", to: "zh" },
-      "General render should consume the previous and next language pair"
-    );
-    assert.strictEqual(
-      segmented.style.getPropertyValue("--language-active-index"),
-      "0",
-      "language pill should start at the previous language before rAF"
-    );
-    assert.strictEqual(harness.core.runtime.languageTransition, null);
-    const buttons = segmented.querySelectorAll("button");
-    assert.strictEqual(buttons[1].classList.contains("active"), true);
-
-    harness.raf.flush();
-    assert.strictEqual(
-      segmented.style.getPropertyValue("--language-active-index"),
-      "1",
-      "language pill should move to the new language on rAF"
-    );
+    assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+    assert.strictEqual(harness.getLangOptions()[1].attributes["aria-selected"], "true");
   });
 
-  it("does not keep a stale language slide transition when language changes off the General tab", () => {
-    const core = loadSettingsCoreForTest({});
-    core.state.activeTab = "agents";
-    core.state.snapshot = { lang: "en" };
-
-    core.ops.applyChanges({
-      changes: { lang: "zh" },
-      snapshot: { lang: "zh" },
+  it("supports keyboard language selection and reverts when saving fails", async () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+      update: () => Promise.resolve({ status: "error", message: "synthetic failure" }),
     });
 
-    assert.strictEqual(
-      core.runtime.languageTransition,
-      null,
-      "language changes outside General should not animate later when returning to General"
-    );
+    harness.core.ops.requestRender({ content: true });
+    const trigger = harness.getLangTrigger();
+    trigger.dispatchEvent(createKeyboardEventForTest("ArrowDown"));
+    assert.strictEqual(harness.getLangPicker().classList.contains("open"), true);
+    const options = harness.getLangOptions();
+    options[1].dispatchEvent(createKeyboardEventForTest("Enter"));
+    await Promise.resolve();
+
+    assert.deepStrictEqual(harness.updateCalls, [{ key: "lang", value: "zh" }]);
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(harness.getToastText(), "Failed: synthetic failure");
+  });
+
+  it("cleans up language picker document listeners across re-renders", () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
+    assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
+
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
+    assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
   });
 
   it("exposes aggregate and split bubble controls in the General tab", () => {

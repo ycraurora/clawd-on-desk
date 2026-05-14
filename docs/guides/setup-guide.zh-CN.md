@@ -10,7 +10,7 @@
 
 **Docker / devcontainer 里的 VS Code Codex** — Clawd 采用双端 bridge：随应用自动安装的本地 `clawd-terminal-focus` 扩展负责把事件转发到本机 Clawd，而真正读取容器内 `~/.codex/sessions` 的是另一个跑在 remote/workspace 侧的 helper 扩展。这个 helper 目前还不会自动装进容器里的 VS Code Server，测试这条链路时需要先手动安装一次。
 
-**Copilot CLI** — 目前唯一仍需手动配置 hooks 的受支持 Agent。请参考 [copilot-setup.md](copilot-setup.md)。
+**Copilot CLI** — 本地安装仍需手动配置 `~/.copilot/hooks/hooks.json`（Clawd 启动时不自动同步 Copilot）。SSH 远程部署 (`scripts/remote-deploy.sh`) 现在已经自动配置。详见 [copilot-setup.md](copilot-setup.md)。
 
 **Gemini CLI** — hooks 配置在 `~/.gemini/settings.json`。如果本机已安装 Gemini，Clawd 启动时会自动注册；也可以手动执行 `npm run install:gemini-hooks`。
 
@@ -30,7 +30,7 @@
 
 **Hermes Agent** — 从 [hermes-agent.org](https://hermes-agent.org/) 或 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 安装 Hermes。Clawd 默认会在 Settings 里显示 Hermes 开关，但启动自动同步会先探测 Hermes 是否已安装；未安装时不会写入 `~/.hermes` 或 `%LOCALAPPDATA%\hermes`。安装 Hermes 后，Clawd 会把 plugin 复制到 Hermes 的托管 plugin 目录，并通过 `hermes plugins enable clawd-on-desk` 启用它。也可以手动执行 `npm run install:hermes-plugin` 强制同步，或执行 `npm run uninstall:hermes-plugin` 移除 Clawd 的 Hermes plugin。
 
-## 远程 SSH 模式（Claude Code & Codex CLI）
+## 远程 SSH 模式（Claude Code, Codex CLI & Copilot CLI）
 
 <img src="../assets/screenshot-remote-ssh.png" width="560" alt="远程 SSH — 来自树莓派的权限气泡">
 
@@ -42,7 +42,7 @@ Clawd 支持通过 SSH 反向端口转发感知远程服务器上的 AI Agent �
 bash scripts/remote-deploy.sh user@远程主机
 ```
 
-脚本会将 hook 文件复制到远程服务器，以远程模式注册 Claude Code hooks 和 Codex official hooks，并打印 SSH 配置指引。
+脚本会将 hook 文件复制到远程服务器，以远程模式注册 Claude Code、Codex official 以及 Copilot CLI hooks，并打印 SSH 配置指引。
 
 **SSH 配置**（添加到本地 `~/.ssh/config`）：
 
@@ -58,6 +58,7 @@ Host my-server
 **工作原理：**
 - **Claude Code** — 远程 hook 将状态 POST 到 `localhost:23333`，SSH 隧道转发回本地 Clawd。权限气泡也能正常弹出——HTTP 往返通过隧道完成。
 - **Codex CLI** — 远程 official hooks 通过同一隧道 POST 状态和权限请求。如果远程 Codex hooks 不可用或被禁用，再使用 fallback 日志监控：`node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
+- **Copilot CLI** — `scripts/remote-deploy.sh` 会自动写入远程的 `~/.copilot/hooks/hooks.json`（前提是远程已安装 Copilot CLI，即 `~/.copilot/` 存在）。Hook 通过同一隧道 POST 状态和 session title。
 
 远程 hook 以 `CLAWD_REMOTE` 模式运行，跳过 PID 采集（远程 PID 在本地无意义）。远程会话不支持终端聚焦。
 
@@ -76,13 +77,16 @@ Host my-server
 mkdir -p ~/.claude/hooks
 
 # 从 Windows 侧的 Clawd 仓库复制 hook 文件（按实际路径调整 /mnt/ 前缀）
-cp /mnt/d/animation/hooks/{server-config,json-utils,shared-process,clawd-hook,install,codex-hook,codex-install,codex-install-utils,codex-remote-monitor,codex-session-index,codex-subagent-fields}.js ~/.claude/hooks/
+cp /mnt/d/animation/hooks/{server-config,json-utils,shared-process,clawd-hook,install,codex-hook,codex-install,codex-install-utils,codex-remote-monitor,codex-session-index,codex-subagent-fields,copilot-hook,copilot-install}.js ~/.claude/hooks/
 
 # 以远程模式注册 Claude hooks
 node ~/.claude/hooks/install.js --remote
 
 # 如果 WSL 中安装了 Codex CLI，也以远程模式注册 Codex official hooks
 node ~/.claude/hooks/codex-install.js --remote
+
+# 如果 WSL 中安装了 Copilot CLI，也以远程模式注册 Copilot CLI hooks
+node ~/.claude/hooks/copilot-install.js --remote
 ```
 
 如果你的 WSL 里开启了 SSH 服务，也可以用一键部署脚本：

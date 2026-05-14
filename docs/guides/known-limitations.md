@@ -8,7 +8,7 @@
 | **Codex CLI: partial hook coverage** | Official hooks cover live state and `PermissionRequest` observation/intercept mode, but not every runtime signal. Clawd keeps JSONL polling active for hook-disabled sessions and fallback-only events such as web search, compaction, and aborted turns, so those events can still have polling latency. |
 | **VS Code Codex in devcontainers: helper install is manual** | The local bridge extension auto-installs, but the remote workspace helper still needs to be installed into the container's VS Code Server manually. |
 | **VS Code Codex in devcontainers: focus not wired yet** | Remote VS Code Codex sessions can drive pet state once the helper is installed, but clicking the session menu does not yet jump to the exact remote Codex surface. |
-| **Copilot CLI: manual hook setup** | Copilot is the one supported agent that still requires manually creating `~/.copilot/hooks/hooks.json`. |
+| **Copilot CLI: manual local hook setup** | Local installs still require manually creating `~/.copilot/hooks/hooks.json`. Remote SSH installs are now configured automatically by `scripts/remote-deploy.sh`. |
 | **Copilot CLI: no permission bubble** | Copilot's `preToolUse` hook only supports deny, not the full allow/deny flow. Permission bubbles currently work with Claude Code, Codex CLI, CodeBuddy, opencode, and Pi. |
 | **Gemini CLI: no permission bubble** | Gemini handles tool approval inside the terminal. Clawd observes Gemini hook events, but does not show permission bubbles unless Gemini adds a compatible blocking approval contract later. |
 | **Cursor Agent: no permission bubble** | Cursor handles permissions via stdout JSON in the hook, not HTTP blocking — Clawd can't intercept the approval flow. |
