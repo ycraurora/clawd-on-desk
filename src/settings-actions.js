@@ -110,6 +110,10 @@ const {
   deployTargetFingerprint,
   deployTargetDrift,
 } = require("./remote-ssh-profile");
+const {
+  validateTelegramApproval,
+  validateTelegramBotToken,
+} = require("./telegram-approval-settings");
 
 // ── updateRegistry ──
 // Maps prefs field name → validator. Controller looks up by key and runs.
@@ -280,6 +284,9 @@ const updateRegistry = {
       }
     }
     return { status: "ok" };
+  },
+  tgApproval(value) {
+    return validateTelegramApproval(value);
   },
 
   shortcuts: {
@@ -764,6 +771,50 @@ function remoteSshDeleteProfile(payload, deps) {
   return { status: "ok", commit: { remoteSsh: next } };
 }
 
+async function telegramApprovalSetToken(payload, deps = {}) {
+  const token = typeof payload === "string"
+    ? payload
+    : (payload && typeof payload === "object" ? payload.token : "");
+  const valid = validateTelegramBotToken(token);
+  if (valid.status !== "ok") return valid;
+  if (!deps || typeof deps.writeTelegramApprovalToken !== "function") {
+    return { status: "error", message: "telegramApproval.setToken requires writeTelegramApprovalToken dep" };
+  }
+  const result = await deps.writeTelegramApprovalToken(valid.token);
+  if (!result || result.status !== "ok") {
+    return result || { status: "error", message: "Telegram bot token write failed" };
+  }
+  return { status: "ok", tokenStored: true };
+}
+
+function telegramApprovalStatus(_payload, deps = {}) {
+  if (!deps || typeof deps.getTelegramApprovalStatus !== "function") {
+    return { status: "error", message: "telegramApproval.status requires getTelegramApprovalStatus dep" };
+  }
+  const status = deps.getTelegramApprovalStatus();
+  return { status: "ok", state: status || { status: "stopped" } };
+}
+
+function telegramApprovalTokenInfo(_payload, deps = {}) {
+  if (!deps || typeof deps.getTelegramApprovalTokenInfo !== "function") {
+    return { status: "error", message: "telegramApproval.tokenInfo requires getTelegramApprovalTokenInfo dep" };
+  }
+  const info = deps.getTelegramApprovalTokenInfo() || { configured: false, masked: "" };
+  return {
+    status: "ok",
+    configured: info.configured === true,
+    masked: typeof info.masked === "string" ? info.masked : "",
+  };
+}
+
+async function telegramApprovalSendTest(_payload, deps = {}) {
+  if (!deps || typeof deps.sendTelegramApprovalTest !== "function") {
+    return { status: "error", message: "telegramApproval.test requires sendTelegramApprovalTest dep" };
+  }
+  const result = await deps.sendTelegramApprovalTest();
+  return result || { status: "error", message: "Telegram approval test returned no result" };
+}
+
 // Share a domain lock across all four remoteSsh.* commands so concurrent
 // invocations against the same prefs field serialize. Without this, the
 // controller assigns each command its own lock by name, and two commands
@@ -782,6 +833,8 @@ remoteSshUpdateProfile.lockKey = "remoteSsh";
 remoteSshDeleteProfile.lockKey = "remoteSsh";
 remoteSshMarkDeployed.lockKey = "remoteSsh";
 remoteSshMarkRemoteNode.lockKey = "remoteSsh";
+telegramApprovalSetToken.lockKey = "tgApproval";
+telegramApprovalSendTest.lockKey = "tgApproval";
 
 const repairDoctorIssue = createRepairDoctorIssue({
   repairAgentIntegration,
@@ -816,6 +869,10 @@ const commandRegistry = {
   "remoteSsh.delete": remoteSshDeleteProfile,
   "remoteSsh.markDeployed": remoteSshMarkDeployed,
   "remoteSsh.markRemoteNode": remoteSshMarkRemoteNode,
+  "telegramApproval.setToken": telegramApprovalSetToken,
+  "telegramApproval.status": telegramApprovalStatus,
+  "telegramApproval.tokenInfo": telegramApprovalTokenInfo,
+  "telegramApproval.test": telegramApprovalSendTest,
 };
 
 module.exports = {

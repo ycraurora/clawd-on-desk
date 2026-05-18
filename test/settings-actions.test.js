@@ -201,6 +201,30 @@ describe("updateRegistry pure-data validators", () => {
     assert.strictEqual(updateRegistry.themeOverrides("nope", deps).status, "error");
   });
 
+  it("tgApproval validates the settings object while allowing incomplete saved config", () => {
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: false,
+      allowedTgUserId: "",
+      targetSessionKey: "",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "",
+      targetSessionKey: "telegram:987654321",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:0",
+    }, deps).status, "error");
+  });
+
   it("sessionAliases requires a plain object of valid alias entries", () => {
     const deps = { snapshot: baseSnapshot };
     assert.strictEqual(
@@ -390,6 +414,59 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
     const r = updateRegistry.openAtLogin.effect(true, deps);
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /permission denied/);
+  });
+});
+
+describe("telegram approval commands", () => {
+  it("telegramApproval.setToken validates token and delegates storage", async () => {
+    const calls = [];
+    const token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi_jklmnop";
+    const result = await commandRegistry["telegramApproval.setToken"]({ token }, {
+      writeTelegramApprovalToken: (value) => {
+        calls.push(value);
+        return { status: "ok", tokenStored: true };
+      },
+    });
+    assert.deepStrictEqual(calls, [token]);
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.tokenStored, true);
+
+    const bad = await commandRegistry["telegramApproval.setToken"]({ token: "nope" }, {
+      writeTelegramApprovalToken: () => {
+        throw new Error("should not write invalid token");
+      },
+    });
+    assert.strictEqual(bad.status, "error");
+  });
+
+  it("telegramApproval.status and .test proxy injected runtime helpers", async () => {
+    const status = await commandRegistry["telegramApproval.status"](null, {
+      getTelegramApprovalStatus: () => ({ status: "running", tokenStored: true }),
+    });
+    assert.deepStrictEqual(status, {
+      status: "ok",
+      state: { status: "running", tokenStored: true },
+    });
+
+    const testResult = await commandRegistry["telegramApproval.test"](null, {
+      sendTelegramApprovalTest: async () => ({ status: "ok", decision: "allow" }),
+    });
+    assert.deepStrictEqual(testResult, { status: "ok", decision: "allow" });
+  });
+
+  it("telegramApproval.tokenInfo returns the masked preview without the raw token", async () => {
+    const result = await commandRegistry["telegramApproval.tokenInfo"](null, {
+      getTelegramApprovalTokenInfo: () => ({ configured: true, masked: "1234……wXyZ" }),
+    });
+    assert.deepStrictEqual(result, { status: "ok", configured: true, masked: "1234……wXyZ" });
+
+    const empty = await commandRegistry["telegramApproval.tokenInfo"](null, {
+      getTelegramApprovalTokenInfo: () => ({ configured: false, masked: "" }),
+    });
+    assert.deepStrictEqual(empty, { status: "ok", configured: false, masked: "" });
+
+    const missing = await commandRegistry["telegramApproval.tokenInfo"](null, {});
+    assert.equal(missing.status, "error");
   });
 });
 

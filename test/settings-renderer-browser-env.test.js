@@ -27,6 +27,7 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-anim-map.js"),
   path.join(SRC_DIR, "settings-tab-anim-overrides.js"),
   path.join(SRC_DIR, "settings-tab-shortcuts.js"),
+  path.join(SRC_DIR, "settings-tab-telegram-approval.js"),
   path.join(SRC_DIR, "settings-tab-about.js"),
 ];
 
@@ -891,6 +892,118 @@ function loadAnimMapTabForTest({
   };
 }
 
+function loadTelegramApprovalTabForTest({
+  snapshot,
+  settingsAPI = {},
+} = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+  const updates = [];
+  const commands = [];
+  const renderRequests = [];
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+  const api = {
+    update: (key, value) => {
+      updates.push({ key, value });
+      return Promise.resolve({ status: "ok" });
+    },
+    command: (name, payload) => {
+      commands.push({ name, payload });
+      if (name === "telegramApproval.status") {
+        return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+      }
+      if (name === "telegramApproval.tokenInfo") {
+        return Promise.resolve({ status: "ok", configured: false, masked: "" });
+      }
+      return Promise.resolve({ status: "ok" });
+    },
+    ...settingsAPI,
+  };
+  const context = {
+    console,
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    window: null,
+    globalThis: null,
+    settingsAPI: api,
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-telegram-approval.js"), "utf8"), context);
+
+  const core = {
+    state: {
+      snapshot: snapshot || {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      activeTab: "telegram-approval",
+    },
+    helpers: {
+      t: (key) => key,
+      buildSection: (_title, rows) => {
+        const section = document.createElement("section");
+        for (const row of rows) section.appendChild(row);
+        return section;
+      },
+      setSwitchVisual: (el, checked, options = {}) => {
+        el.classList.toggle("on", !!checked);
+        el.classList.toggle("pending", !!options.pending);
+        el.setAttribute("aria-checked", checked ? "true" : "false");
+      },
+      // Mirror the real buildCollapsibleGroup just enough that children and
+      // headerContent both end up in the DOM tree; collapsed/expand behaviour
+      // is exercised by the real component's own tests.
+      buildCollapsibleGroup: ({ id, headerContent, children = [], className = "" } = {}) => {
+        const group = document.createElement("div");
+        group.className = `collapsible-group${className ? ` ${className}` : ""}`;
+        if (id) group.dataset.groupId = id;
+        const header = document.createElement("div");
+        header.className = "collapsible-group-header";
+        if (headerContent) header.appendChild(headerContent);
+        group.appendChild(header);
+        const body = document.createElement("div");
+        body.className = "collapsible-group-body";
+        for (const child of children) body.appendChild(child);
+        group.appendChild(body);
+        return group;
+      },
+    },
+    ops: {
+      requestRender: (payload) => {
+        renderRequests.push(payload || {});
+      },
+      showToast: () => {},
+    },
+    tabs: {},
+  };
+  context.ClawdSettingsTabTelegramApproval.init(core);
+  function render() {
+    content.innerHTML = "";
+    core.tabs["telegram-approval"].render(content, core);
+  }
+  render();
+
+  return { core, content, updates, commands, render, renderRequests };
+}
+
 function loadAnimOverridesTabForTest({
   runtime,
   modalRoot,
@@ -1041,6 +1154,7 @@ describe("settings renderer browser environment", () => {
       "settings-tab-anim-map.js",
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
+      "settings-tab-telegram-approval.js",
       "settings-tab-about.js",
       "settings-tab-remote-ssh.js",
       "settings-doctor-modal.js",
@@ -1094,6 +1208,180 @@ describe("settings renderer browser environment", () => {
       assert.ok(!source.includes("settingsAPI.onShortcutRecordKey"), `${path.basename(file)} must not subscribe to settingsAPI.onShortcutRecordKey`);
       assert.ok(!source.includes("settingsAPI.onShortcutFailuresChanged"), `${path.basename(file)} must not subscribe to settingsAPI.onShortcutFailuresChanged`);
     }
+  });
+
+  it("keeps Telegram approval drafts local across toggles and rerenders", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    // Wait for tokenInfo + status to land so the switch is enabled.
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    // Token is configured → token row is collapsed (no input). Only the
+    // recipient input is rendered, at index 0.
+    const inputs = harness.content.querySelectorAll("input");
+    const allowedInput = inputs[0];
+    allowedInput.value = "987654321";
+    allowedInput.dispatchEvent({ type: "input" });
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: true,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+      },
+    }]);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    harness.core.state.snapshot = {
+      ...harness.core.state.snapshot,
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: "555555555",
+        targetSessionKey: "telegram:555555555",
+      },
+    };
+    harness.render();
+
+    assert.equal(harness.content.querySelectorAll("input")[0].value, "987654321");
+  });
+
+  it("disables Telegram approval test until runtime status is ready", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                configured: false,
+                reason: "invalid-config",
+                message: "Telegram target session key is not configured",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+    // Test button is the last actionable button: [replace-token, save-recipient, send-test]
+    const buttons = harness.content.querySelectorAll("button");
+    const testButton = buttons[buttons.length - 1];
+    assert.equal(testButton.disabled, true);
+    assert.match(testButton.title, /target session key/);
+
+    testButton.dispatchEvent({ type: "click" });
+    assert.equal(commandCalls.some((call) => call.name === "telegramApproval.test"), false);
+  });
+
+  it("repaints Telegram approval after forced status refresh overlaps pending status", async () => {
+    const staleStatus = createDeferred();
+    const updatedStatus = createDeferred();
+    const statusResponses = [staleStatus, updatedStatus];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") {
+            const next = statusResponses.shift();
+            assert.ok(next, "unexpected Telegram status request");
+            return next.promise;
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+
+    // The send-test button is the last button on the tab; click it to force
+    // a status refresh that overlaps the in-flight initial status request.
+    const buttons = harness.content.querySelectorAll("button");
+    buttons[buttons.length - 1].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+    const beforeStatusResolve = harness.renderRequests.length;
+
+    staleStatus.resolve({
+      status: "ok",
+      state: {
+        status: "stopped",
+        configured: false,
+        reason: "missing-token",
+        message: "Telegram bot token is not configured",
+        tokenStored: false,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(harness.renderRequests.length, beforeStatusResolve + 1);
+
+    harness.render();
+    updatedStatus.resolve({
+      status: "ok",
+      state: {
+        status: "running",
+        configured: true,
+        reason: "",
+        message: "",
+        tokenStored: true,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(harness.renderRequests.length, beforeStatusResolve + 2);
   });
 
   it("wires Clawd Doctor through Settings with Step 2 connection actions", () => {

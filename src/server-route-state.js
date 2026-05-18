@@ -22,6 +22,17 @@ function isRemoteCodexPermissionEvent(data) {
     && data.event === "codex-permission";
 }
 
+function normalizeHwndString(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!/^[1-9]\d{0,18}$/.test(text)) return null;
+  try {
+    return BigInt(text) <= 9223372036854775807n ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 function sendStateHealthResponse(res, options) {
   const body = JSON.stringify({ ok: true, app: CLAWD_SERVER_ID, port: options.getHookServerPort() });
   res.writeHead(200, {
@@ -66,6 +77,7 @@ function handleStatePost(req, res, options) {
       else if (typeof data.display_svg === "string") display_svg = pathApi.basename(data.display_svg);
       else display_svg = undefined;
       const source_pid = Number.isFinite(data.source_pid) && data.source_pid > 0 ? Math.floor(data.source_pid) : null;
+      const wtHwnd = normalizeHwndString(data.wt_hwnd ?? data.wtHwnd);
       const cwd = typeof data.cwd === "string" ? data.cwd : "";
       const editor = (data.editor === "code" || data.editor === "cursor") ? data.editor : null;
       const pidChain = Array.isArray(data.pid_chain) ? data.pid_chain.filter(n => Number.isFinite(n) && n > 0) : null;
@@ -195,6 +207,7 @@ function handleStatePost(req, res, options) {
         } else {
           ctx.updateSession(sid, state, event, {
             sourcePid: source_pid,
+            wtHwnd,
             cwd,
             editor,
             pidChain,
