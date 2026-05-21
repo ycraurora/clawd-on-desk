@@ -376,9 +376,17 @@ function verifyUnregister(accelerator) {
   return true;
 }
 
+function isHardwareBuddyTestPermission(perm) {
+  return !!(perm && perm.isHardwareBuddyTest);
+}
+
 function getActionablePermissions() {
   return pendingPermissions.filter(
-    p => !p.isElicitation && !p.isCodexNotify && !p.isKimiNotify && p.toolName !== "ExitPlanMode"
+    p => !isHardwareBuddyTestPermission(p)
+      && !p.isElicitation
+      && !p.isCodexNotify
+      && !p.isKimiNotify
+      && p.toolName !== "ExitPlanMode"
   );
 }
 
@@ -488,7 +496,8 @@ function repositionBubbles() {
   const wa = getAnchorWorkArea(petBounds);
   const hitRect = ctx.bubbleFollowPet ? ctx.getHitRectScreen(petBounds) : null;
 
-  const bubbleHeights = pendingPermissions.map(perm =>
+  const layoutPermissions = pendingPermissions.filter((perm) => !isHardwareBuddyTestPermission(perm));
+  const bubbleHeights = layoutPermissions.map(perm =>
     clampBubbleHeight(
       perm.measuredHeight || estimateBubbleHeight((perm.suggestions || []).length),
       wa.height
@@ -506,8 +515,8 @@ function repositionBubbles() {
     hudReservedOffset: typeof ctx.getHudReservedOffset === "function" ? ctx.getHudReservedOffset() : 0,
   });
 
-  for (let i = 0; i < pendingPermissions.length; i++) {
-    const perm = pendingPermissions[i];
+  for (let i = 0; i < layoutPermissions.length; i++) {
+    const perm = layoutPermissions[i];
     if (perm.bubble && !perm.bubble.isDestroyed() && bounds[i]) {
       perm.bubble.setBounds(bounds[i]);
     }
@@ -619,6 +628,29 @@ function dismissPermissionWithoutDecision(permEntry, message) {
   if (idx === -1) return;
   permLog(`auto-close dismiss: tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "claude-code"}`);
   resolvePermissionEntry(permEntry, "no-decision", message || "Auto-closed");
+}
+
+function notifyPermissionsChanged(reason) {
+  if (typeof ctx.onPermissionsChanged !== "function") return;
+  try {
+    ctx.onPermissionsChanged(reason);
+  } catch (err) {
+    permLog(`onPermissionsChanged failed: ${err && err.message ? err.message : err}`);
+  }
+}
+
+function addPendingPermission(permEntry, reason = "added") {
+  pendingPermissions.push(permEntry);
+  notifyPermissionsChanged(reason);
+  return permEntry;
+}
+
+function removePendingPermission(permEntry, reason = "removed") {
+  const idx = pendingPermissions.indexOf(permEntry);
+  if (idx === -1) return false;
+  pendingPermissions.splice(idx, 1);
+  notifyPermissionsChanged(reason);
+  return true;
 }
 
 // Called by settings-effect-router after permissionBubbleAutoCloseSeconds
@@ -768,7 +800,10 @@ function dismissPermissionForTerminal(perm) {
   // the splice and the abort.
   cancelRemoteApproval(perm);
   const idx = pendingPermissions.indexOf(perm);
-  if (idx !== -1) pendingPermissions.splice(idx, 1);
+  if (idx !== -1) {
+    pendingPermissions.splice(idx, 1);
+    notifyPermissionsChanged("deny-and-focus");
+  }
   if (perm.bubble && !perm.bubble.isDestroyed()) {
     sendToBubble(perm.bubble, "permission-hide");
     if (perm.hideTimer) clearTimeout(perm.hideTimer);
@@ -848,6 +883,7 @@ function maybeStartRemoteApproval(permEntry) {
   }
 
   pendingPermissions.splice(idx, 1);
+  notifyPermissionsChanged("resolved");
 
   if (permEntry.autoCloseTimer) {
     clearTimeout(permEntry.autoCloseTimer);
@@ -1182,7 +1218,7 @@ function showCodexNotifyBubble({ sessionId, command }) {
     agentId: "codex",
     autoExpireTimer: null,
   };
-  pendingPermissions.push(permEntry);
+  addPendingPermission(permEntry, "passive-added");
   showPermissionBubble(permEntry);
   permLog(`passive notify show: agent=codex session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
   schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
@@ -1206,7 +1242,7 @@ function showKimiNotifyBubble({ sessionId, command }) {
     agentId: "kimi-cli",
     autoExpireTimer: null,
   };
-  pendingPermissions.push(permEntry);
+  addPendingPermission(permEntry, "passive-added");
   showPermissionBubble(permEntry);
   permLog(`passive notify show: agent=kimi-cli session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
   schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
@@ -1230,6 +1266,7 @@ function dismissPassiveNotify(permEntry, reason = "unknown") {
     `passive notify dismiss: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"} reason=${reason}`
   );
   pendingPermissions.splice(idx, 1);
+  notifyPermissionsChanged("passive-dismissed");
   if (permEntry.autoExpireTimer) clearTimeout(permEntry.autoExpireTimer);
   if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
   if (permEntry.bubble && !permEntry.bubble.isDestroyed()) {
@@ -1278,7 +1315,10 @@ function refreshPassiveNotifyAutoClose() {
 
 function dismissInteractivePermissionWithoutDecision(perm, reason) {
   const idx = pendingPermissions.indexOf(perm);
-  if (idx !== -1) pendingPermissions.splice(idx, 1);
+  if (idx !== -1) {
+    pendingPermissions.splice(idx, 1);
+    notifyPermissionsChanged("dismissed");
+  }
   cancelRemoteApproval(perm);
   if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
   if (perm.autoCloseTimer) { clearTimeout(perm.autoCloseTimer); perm.autoCloseTimer = null; }
@@ -1399,6 +1439,7 @@ return {
   showPermissionBubble, resolvePermissionEntry,
   sendPermissionResponse, repositionBubbles, permLog,
   pendingPermissions, PASSTHROUGH_TOOLS,
+  addPendingPermission, removePendingPermission,
   maybeStartRemoteApproval,
   dismissPermissionForTerminal,
   handleBubbleHeight, handleDecide, cleanup,

@@ -1,6 +1,7 @@
 const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { EventEmitter } = require("events");
 const {
   applyWindowsAppUserModelId,
   shouldOpenSettingsWindowFromArgv,
@@ -40,6 +41,7 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const { createHardwareBuddyAdapter } = require("./hardware-buddy-adapter");
 const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
   getSessionFocusTarget,
@@ -185,6 +187,11 @@ let telegramApprovalSidecar = null;
 let telegramApprovalSyncPromise = Promise.resolve();
 let telegramApprovalConfigSignature = "";
 let telegramApprovalTokenRevision = 0;
+let hardwareBuddyAdapter = null;
+let hardwareBuddyStatus = null;
+let hardwareBuddyTestApprovalPromise = null;
+let lastHardwareBuddyStatusLogKey = "";
+let unsubscribeHardwareBuddySettings = null;
 const shortcutHandlers = {
   togglePet: () => togglePetVisibility(),
 };
@@ -829,9 +836,12 @@ const _permCtx = {
   clearShortcutFailure: (actionId) => shortcutRuntime.clearFailure(actionId),
   repositionUpdateBubble: () => repositionUpdateBubble(),
   getTelegramApprovalClient: () => getTelegramApprovalClient(),
+  onPermissionsChanged: () => {
+    if (hardwareBuddyAdapter) hardwareBuddyAdapter.notifyPermissionsChanged();
+  },
 };
 const _perm = initPermission(_permCtx);
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -956,6 +966,7 @@ const _stateCtx = {
     broadcastDashboardSessionSnapshot(snapshot);
     broadcastSessionHudSnapshot(snapshot);
     repositionFloatingBubbles();
+    if (hardwareBuddyAdapter) hardwareBuddyAdapter.notifyStateChanged();
   },
   // Phase 3b: 读 prefs.themeOverrides 判断某个 oneshot state 是否被用户禁用。
   // state.js gate 调这个做 early-return。不做白名单校验——settings-actions
@@ -1182,6 +1193,8 @@ const _serverCtx = {
   updateSession: agentRuntime.updateSessionFromServer,
   resolvePermissionEntry,
   sendPermissionResponse,
+  addPendingPermission,
+  removePendingPermission,
   showPermissionBubble,
   showCodexNotifyBubble,
   clearCodexNotifyBubbles,
@@ -1451,6 +1464,242 @@ async function sendTelegramApprovalTest() {
     clearTimeout(timer);
   }
 }
+
+function hardwareBuddyLog(msg) {
+  const line = `[hardware-buddy] ${msg}`;
+  if (sessionDebugLog) {
+    sessionLog(line);
+  } else {
+    console.log(`Clawd: ${line}`);
+  }
+}
+
+function summarizeHardwareBuddyStatus(status) {
+  const lastError = status && status.lastError && typeof status.lastError === "object"
+    ? status.lastError
+    : null;
+  return {
+    enabled: !!(status && status.enabled),
+    started: !!(status && status.started),
+    sidecarRunning: !!(status && status.sidecarRunning),
+    permissionsEnabled: !!(status && status.permissionsEnabled),
+    connected: !!(status && status.connected),
+    secure: !!(status && status.secure),
+    error: lastError ? `${lastError.category || "unknown"}:${lastError.code || ""}` : "",
+    retryAttempt: status && Number.isFinite(status.retryAttempt) ? status.retryAttempt : 0,
+  };
+}
+
+function logHardwareBuddyStatus(status) {
+  const summary = summarizeHardwareBuddyStatus(status);
+  const key = JSON.stringify(summary);
+  if (key === lastHardwareBuddyStatusLogKey) return;
+  lastHardwareBuddyStatusLogKey = key;
+  hardwareBuddyLog(
+    `status enabled=${summary.enabled} started=${summary.started} sidecar=${summary.sidecarRunning}`
+      + ` permissions=${summary.permissionsEnabled} connected=${summary.connected} secure=${summary.secure}`
+      + ` retry=${summary.retryAttempt}${summary.error ? ` error=${summary.error}` : ""}`
+  );
+}
+
+function broadcastHardwareBuddyStatus(status) {
+  hardwareBuddyStatus = status || null;
+  logHardwareBuddyStatus(hardwareBuddyStatus);
+  try {
+    for (const bw of BrowserWindow.getAllWindows()) {
+      if (!bw.isDestroyed() && bw.webContents && !bw.webContents.isDestroyed()) {
+        bw.webContents.send("hardwareBuddy:status-changed", hardwareBuddyStatus);
+      }
+    }
+  } catch (err) {
+    console.warn("Clawd: Hardware Buddy status broadcast failed:", err && err.message);
+  }
+}
+
+function createHardwareBuddyTestResponse(onFinish) {
+  const res = new EventEmitter();
+  res.writableEnded = false;
+  res.destroyed = false;
+  res.headersSent = false;
+  res.statusCode = null;
+  res.body = "";
+  res.writeHead = (statusCode, headers) => {
+    res.statusCode = statusCode;
+    res.headers = headers || {};
+    res.headersSent = true;
+    return res;
+  };
+  res.end = (body = "") => {
+    if (res.writableEnded || res.destroyed) return res;
+    res.writableEnded = true;
+    res.body = typeof body === "string" ? body : String(body || "");
+    if (typeof onFinish === "function") onFinish(null, res);
+    res.emit("close");
+    return res;
+  };
+  res.destroy = (err) => {
+    if (res.writableEnded || res.destroyed) return res;
+    res.destroyed = true;
+    if (typeof onFinish === "function") onFinish(err || new Error("response destroyed"), res);
+    res.emit("close");
+    return res;
+  };
+  return res;
+}
+
+function parseHardwareBuddyTestDecision(res) {
+  if (!res || !res.body) return null;
+  try {
+    const parsed = JSON.parse(res.body);
+    const decision = parsed
+      && parsed.hookSpecificOutput
+      && parsed.hookSpecificOutput.decision;
+    const behavior = decision && decision.behavior;
+    return behavior === "allow" || behavior === "deny" ? behavior : null;
+  } catch {
+    return null;
+  }
+}
+
+function hardwareBuddyTestError(code, message) {
+  return { status: "error", code, message };
+}
+
+function sendHardwareBuddyTestApproval() {
+  if (hardwareBuddyTestApprovalPromise) return hardwareBuddyTestApprovalPromise;
+
+  const status = hardwareBuddyAdapter && typeof hardwareBuddyAdapter.getStatus === "function"
+    ? hardwareBuddyAdapter.getStatus()
+    : hardwareBuddyStatus;
+  if (!status || status.enabled !== true || status.started !== true) {
+    return Promise.resolve(hardwareBuddyTestError("disabled", "Hardware Buddy is not enabled."));
+  }
+  if (status.permissionsEnabled !== true) {
+    return Promise.resolve(hardwareBuddyTestError("permissions_off", "Hardware permission replies are disabled."));
+  }
+  if (status.connected !== true || status.secure !== true) {
+    return Promise.resolve(hardwareBuddyTestError("not_secure", "Hardware Buddy is not connected over a secure link."));
+  }
+
+  const createdAt = Date.now();
+  const sessionId = `hardware-buddy-test-${createdAt}`;
+  const toolUseId = `hardware-buddy-test-tool-${createdAt}`;
+  const timeoutMs = 60000;
+
+  const promise = new Promise((resolve) => {
+    let settled = false;
+    let permEntry = null;
+    let timeout = null;
+    let noDecisionCode = null;
+
+    const cleanupSession = () => {
+      try {
+        _state.updateSession(sessionId, "idle", "SessionEnd", { agentId: "codex" });
+      } catch (err) {
+        hardwareBuddyLog(`test cleanup failed: ${err && err.message ? err.message : err}`);
+      }
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      cleanupSession();
+      resolve(result);
+    };
+
+    const res = createHardwareBuddyTestResponse((err, response) => {
+      if (settled) return;
+      if (err) {
+        finish(hardwareBuddyTestError("internal_error", err.message || String(err)));
+        return;
+      }
+      const decision = parseHardwareBuddyTestDecision(response);
+      if (decision === "allow" || decision === "deny") {
+        finish({ status: "ok", decision });
+        return;
+      }
+      finish(hardwareBuddyTestError(
+        noDecisionCode || "no_decision",
+        noDecisionCode === "timeout"
+          ? "Hardware Buddy test timed out."
+          : "Hardware Buddy test did not receive a decision."
+      ));
+    });
+
+    permEntry = {
+      res,
+      abortHandler: null,
+      suggestions: [],
+      sessionId,
+      bubble: null,
+      hideTimer: null,
+      toolName: "Bash",
+      toolInput: {
+        command: "echo hardware-buddy-smoke",
+        description: "Hardware Buddy smoke test: echo hardware-buddy-smoke",
+      },
+      toolUseId,
+      toolInputFingerprint: `hardware-buddy-test:${createdAt}`,
+      resolvedSuggestion: null,
+      createdAt,
+      agentId: "codex",
+      isCodex: true,
+      isHardwareBuddyTest: true,
+      cwd: __dirname,
+      codexOriginator: "clawd-settings",
+      codexSource: "hardware-buddy-test",
+    };
+
+    try {
+      _state.updateSession(sessionId, "idle", "SessionStart", {
+        agentId: "codex",
+        cwd: __dirname,
+        sessionTitle: "Hardware Buddy test",
+      });
+      addPendingPermission(permEntry, "hardware-buddy-test");
+    } catch (err) {
+      removePendingPermission(permEntry, "hardware-buddy-test-failed");
+      finish(hardwareBuddyTestError("internal_error", err && err.message ? err.message : String(err)));
+      return;
+    }
+
+    timeout = setTimeout(() => {
+      if (settled) return;
+      hardwareBuddyLog("test approval timed out");
+      noDecisionCode = "timeout";
+      resolvePermissionEntry(permEntry, "no-decision", "Hardware Buddy test timed out");
+    }, timeoutMs);
+  });
+  hardwareBuddyTestApprovalPromise = promise.finally(() => {
+    hardwareBuddyTestApprovalPromise = null;
+  });
+  return hardwareBuddyTestApprovalPromise;
+}
+
+hardwareBuddyAdapter = createHardwareBuddyAdapter({
+  env: process.env,
+  getSettings: () => _settingsController.get("hardwareBuddy"),
+  getSessionSnapshot: () => _state.buildSessionSnapshot(),
+  getPendingPermissions: () => pendingPermissions,
+  getDoNotDisturb: () => doNotDisturb,
+  isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
+  isAgentPermissionsEnabled: (agentId) =>
+    _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  resolvePermissionEntry: (...args) => resolvePermissionEntry(...args),
+  statePriority: _state.STATE_PRIORITY,
+  log: hardwareBuddyLog,
+  onStatusChanged: broadcastHardwareBuddyStatus,
+});
+
+unsubscribeHardwareBuddySettings = _settingsController.subscribeKey("hardwareBuddy", () => {
+  if (!hardwareBuddyAdapter || typeof hardwareBuddyAdapter.applySettingsChange !== "function") return;
+  try {
+    hardwareBuddyAdapter.applySettingsChange();
+  } catch (err) {
+    console.warn("Clawd: failed to apply Hardware Buddy settings:", err && err.message);
+    hardwareBuddyLog(`settings apply failed: ${err && err.message ? err.message : err}`);
+  }
+});
 
 // ── Menu — delegated to src/menu.js ──
 //
@@ -1727,6 +1976,10 @@ registerSettingsIpc({
   getSoundMuted: () => soundMuted,
   getSoundVolume: () => soundVolume,
   getAllAgents,
+  getHardwareBuddyStatus: () => hardwareBuddyStatus || (hardwareBuddyAdapter && hardwareBuddyAdapter.getStatus
+    ? hardwareBuddyAdapter.getStatus()
+    : null),
+  testHardwareBuddyApproval: () => sendHardwareBuddyTestApproval(),
   checkForUpdates,
   aboutHeroSvgPath: path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg"),
 });
@@ -2110,6 +2363,13 @@ if (!gotTheLock) {
     // shouldn't see its file watcher spin up on the next launch.
     agentRuntime.startCodexLogMonitor();
 
+    try {
+      hardwareBuddyAdapter.start();
+    } catch (err) {
+      console.warn("Clawd: failed to start Hardware Buddy adapter:", err && err.message);
+      hardwareBuddyLog(`start failed: ${err && err.message ? err.message : err}`);
+    }
+
     // Auto-install VS Code/Cursor terminal-focus extension
     try { installTerminalFocusExtension(); } catch (err) {
       console.warn("Clawd: failed to auto-install terminal-focus extension:", err.message);
@@ -2125,6 +2385,11 @@ if (!gotTheLock) {
     globalShortcut.unregisterAll();
     void settingsSizePreviewSession.cleanup();
     stopTelegramApprovalSidecar();
+    if (typeof unsubscribeHardwareBuddySettings === "function") {
+      unsubscribeHardwareBuddySettings();
+      unsubscribeHardwareBuddySettings = null;
+    }
+    if (hardwareBuddyAdapter) hardwareBuddyAdapter.stop();
     _perm.cleanup();
     _server.cleanup();
     _updateBubble.cleanup();
