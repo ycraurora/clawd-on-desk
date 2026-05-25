@@ -4,7 +4,7 @@
 //
 //   Claude Code / CodeBuddy → res.destroy()        (chat fallback)
 //   Codex                   → sendCodexNoDecisionResponse (204)
-//   Pi                      → sendNoDecisionResponse (204, pi label)
+//   Antigravity             → sendNoDecisionResponse (204, ask fallback)
 //   Elicitation             → res.destroy() + focusTerminalForSession
 //   opencode                → silent drop (no bridge POST)
 //
@@ -164,10 +164,10 @@ describe("permission autoclose: no-decision dismiss semantics", () => {
     assert.equal(pendingPermissions.indexOf(permEntry), -1);
   });
 
-  it("Pi branch sends 204 no-decision", () => {
+  it("Antigravity branch sends 204 no-decision", () => {
     const ctx = makeCtx();
     const { resolvePermissionEntry, pendingPermissions } = initPermission(ctx);
-    const permEntry = makePermEntry({ isPi: true });
+    const permEntry = makePermEntry({ isAntigravity: true, agentId: "antigravity-cli" });
     pendingPermissions.push(permEntry);
 
     resolvePermissionEntry(permEntry, "no-decision", "Auto-closed");

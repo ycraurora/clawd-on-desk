@@ -586,6 +586,7 @@ function makeGeneralSnapshot(overrides = {}) {
     lang: "en",
     size: 50,
     sessionHudEnabled: true,
+    sessionHudShowStateLabels: true,
     sessionHudShowElapsed: true,
     sessionHudCleanupDetached: true,
     soundMuted: false,
@@ -1819,6 +1820,59 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("bubbleSecondsPrefix"));
   });
 
+  it("registers the Session cleanup group with three number rows, atomic reset, and i18n keys", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const uiCoreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const actionsSource = fs.readFileSync(path.join(SRC_DIR, "settings-actions.js"), "utf8");
+
+    // Group is mounted top-level in the General tab (not nested under HUD).
+    assert.ok(generalSource.includes("buildSessionCleanupGroup()"));
+    assert.ok(generalSource.includes('id: "general:session-cleanup"'));
+
+    // All three numeric prefs map to their own number input row.
+    assert.ok(generalSource.includes('key: "sessionStaleMs"'));
+    assert.ok(generalSource.includes('key: "workingStaleMs"'));
+    assert.ok(generalSource.includes('key: "detachedIdleStaleMs"'));
+    assert.ok(generalSource.includes("buildNumberInputRow"));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_NUMBER_KEYS"));
+
+    // Reset button goes through the atomic command path.
+    assert.ok(generalSource.includes('"sessionCleanup.setTriple"'));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_DEFAULTS"));
+    assert.ok(generalSource.includes('"actionResetSessionCleanup"'));
+
+    // patchInPlace covers the new keys in BOTH the existence guard and the sync loop.
+    assert.ok(generalSource.match(/SESSION_CLEANUP_NUMBER_KEYS\.has\(key\)[\s\S]+sessionCleanupControls\.get\(key\)\.syncFromSnapshot\(\)/));
+
+    // ui-core registers the helper and the mountedControls bag.
+    assert.ok(uiCoreSource.includes("buildNumberInputRow"));
+    assert.ok(uiCoreSource.includes("sessionCleanupControls: new Map()"));
+    assert.ok(uiCoreSource.includes("state.mountedControls.sessionCleanupControls.clear()"));
+
+    // The command is registered in settings-actions.
+    assert.ok(actionsSource.includes('"sessionCleanup.setTriple": setSessionCleanupTriple'));
+
+    // i18n keys present in all five languages.
+    for (const key of [
+      "rowSessionCleanupGroup",
+      "rowSessionCleanupGroupDesc",
+      "rowStaleSession",
+      "rowStaleSessionDesc",
+      "rowStaleWorking",
+      "rowStaleWorkingDesc",
+      "rowStaleDetached",
+      "rowStaleDetachedDesc",
+      "unitMinutes",
+      "unitSeconds",
+      "valueDisabled",
+      "actionResetSessionCleanup",
+    ]) {
+      const matches = i18nSource.match(new RegExp(`\\b${key}:`, "g"));
+      assert.ok(matches && matches.length >= 5, `${key} should appear in all 5 language tables (saw ${matches ? matches.length : 0})`);
+    }
+  });
+
   it("uses collapsible option lists for Session HUD and sound controls", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -1837,6 +1891,8 @@ describe("settings renderer browser environment", () => {
     assert.ok(generalSource.includes('state.transientUiState.generalSwitches.set("soundMuted"'));
     assert.ok(generalSource.includes("if (!result || result.status !== \"ok\" || result.noop)"));
     assert.ok(generalSource.includes("sessionHudSummaryAutoHide"));
+    assert.ok(generalSource.includes("sessionHudSummaryLabels"));
+    assert.ok(generalSource.includes('key: "sessionHudShowStateLabels"'));
     assert.ok(generalSource.includes("session-hud-summary-control"));
     assert.ok(/\.settings-option-list\s*\{[\s\S]*display:\s*grid;[\s\S]*gap:\s*8px;/.test(css));
     assert.ok(/\.settings-option-list \.settings-option-item\s*\{[\s\S]*background:\s*color-mix\(in srgb,\s*var\(--panel-bg\) 78%,\s*transparent\);/.test(css));
@@ -1848,7 +1904,9 @@ describe("settings renderer browser environment", () => {
     assert.ok(!/\.sound-collapsible \.collapsible-group-summary\s*\{[^}]*flex-wrap:\s*nowrap;/.test(css));
     assert.ok(/\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(4,\s*max-content\);/.test(css));
     assert.ok(/\.session-hud-summary-control\.compact\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*width:\s*auto;/.test(css));
-    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[\s\S]*width:\s*min\(238px,\s*42vw\);/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-header\s*\{[\s\S]*flex-wrap:\s*wrap;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-summary\s*\{[\s\S]*flex:\s*0 0 calc\(100% - 22px\);[\s\S]*margin-left:\s*22px;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[\s\S]*width:\s*min\(238px,\s*100%\);/.test(css));
     assert.ok(/\.collapsible-group-text \.row-label\s*\{[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/.test(css));
     assert.ok(/\.collapsible-group-text \.row-desc\s*\{[\s\S]*white-space:\s*normal;[\s\S]*-webkit-line-clamp:\s*2;/.test(css));
     assert.ok(/\.sound-summary-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
@@ -1865,7 +1923,7 @@ describe("settings renderer browser environment", () => {
 
     const sections = generalHarness.content.querySelectorAll(".section");
     const sectionTitles = sections.map((section) => section.querySelector(".section-title").textContent);
-    assert.deepStrictEqual(sectionTitles, ["Appearance", "Startup", "Bubbles"]);
+    assert.deepStrictEqual(sectionTitles, ["Appearance", "Session management", "Startup", "Bubbles"]);
     assert.strictEqual(generalHarness.content.querySelector(".hardware-buddy-collapsible"), null);
 
     const remoteHarness = loadTelegramApprovalTabForTest({
@@ -1933,6 +1991,8 @@ describe("settings renderer browser environment", () => {
     assert.ok(/\.tg-approval-channel-header\s*\{[\s\S]*justify-content:\s*space-between;/.test(css));
     assert.ok(/\.hardware-buddy-status-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
     assert.ok(/\.hardware-buddy-test-button\s*\{[\s\S]*border:\s*1px solid var\(--accent\);/.test(css));
+    assert.ok(/\.hardware-buddy-quick-command-control\s*\{[\s\S]*display:\s*flex;/.test(css));
+    assert.ok(/\.hardware-buddy-quick-command-button\s*\{[\s\S]*min-height:\s*28px;/.test(css));
   });
 
   it("sends a Hardware Buddy test approval from the settings panel", async () => {
@@ -2024,6 +2084,136 @@ describe("settings renderer browser environment", () => {
     desc = harness.content.querySelector(".hardware-buddy-test-row .row-desc");
     assert.strictEqual(harness.core.runtime.hardwareBuddyTest.result, null);
     assert.strictEqual(desc.textContent, "hardwareBuddyTestDisabled");
+  });
+
+  it("renders Hardware Buddy Quick Command presets without adding stop and sends a command event", async () => {
+    const calls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+          quickCommandsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        sendQuickCommand: (payload) => {
+          calls.push(payload);
+          return Promise.resolve({ status: "ok", quickCommand: { id: payload.id } });
+        },
+      },
+    });
+    harness.core.runtime.quickCommandPresets = {
+      enabled: true,
+      presets: [
+        { id: "plan_first", label: "先列计划" },
+        { id: "show_diff", label: "show diff" },
+      ],
+    };
+    harness.render();
+
+    const buttons = harness.content.querySelectorAll(".hardware-buddy-quick-command-button");
+    assert.deepStrictEqual(buttons.map((button) => button.textContent), ["先列计划", "show diff"]);
+    assert.ok(!buttons.some((button) => button.textContent === "停"));
+
+    buttons[0].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].id, "plan_first");
+    assert.match(calls[0].clientRequestId, /^clawd-settings-plan_first-/);
+    assert.deepStrictEqual(Object.keys(calls[0]).sort(), ["clientRequestId", "id"]);
+  });
+
+  it("keeps Hardware Buddy Quick Command presets disabled while the feature is off", () => {
+    const calls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+          quickCommandsEnabled: false,
+        },
+      },
+      settingsAPI: {
+        sendQuickCommand: (payload) => {
+          calls.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.runtime.quickCommandPresets = {
+      enabled: true,
+      presets: [{ id: "plan_first", label: "先列计划" }],
+    };
+    harness.render();
+
+    const button = harness.content.querySelector(".hardware-buddy-quick-command-button");
+    assert.strictEqual(button.disabled, true);
+    button.dispatchEvent({ type: "click" });
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("keeps a pending Hardware Buddy Quick Command disabled across rerenders", async () => {
+    const calls = [];
+    let resolveCommand;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+          quickCommandsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        sendQuickCommand: (payload) => {
+          calls.push(payload);
+          return new Promise((resolve) => { resolveCommand = resolve; });
+        },
+      },
+    });
+    harness.core.runtime.quickCommandPresets = {
+      enabled: true,
+      presets: [{ id: "plan_first", label: "先列计划" }],
+    };
+    harness.render();
+
+    harness.content.querySelector(".hardware-buddy-quick-command-button").dispatchEvent({ type: "click" });
+    harness.render();
+
+    const pendingButton = harness.content.querySelector(".hardware-buddy-quick-command-button");
+    assert.strictEqual(pendingButton.disabled, true);
+    pendingButton.dispatchEvent({ type: "click" });
+    assert.strictEqual(calls.length, 1);
+
+    resolveCommand({ status: "ok", quickCommand: { id: "plan_first" } });
+    await Promise.resolve();
+    await Promise.resolve();
   });
 
   it("adds hover affordance to General size and volume sliders", () => {
@@ -2141,6 +2331,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: false,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2169,11 +2360,13 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
     const summary = harness.core.state.mountedControls.sessionHudSummary.element;
     const optionList = harness.content.querySelector(".session-hud-option-list");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
     assert.ok(optionList);
@@ -2182,6 +2375,9 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(summary.children.length, 1);
     assert.strictEqual(summary.children[0].textContent, "HUD: off");
     assert.strictEqual(summary.classList.contains("compact"), true);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);
@@ -2198,10 +2394,14 @@ describe("settings renderer browser environment", () => {
       "Session HUD master broadcasts should patch mounted controls instead of rebuilding General"
     );
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), true);
     assert.strictEqual(master.classList.contains("pending"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
+    assert.strictEqual(labels.attributes["aria-disabled"], undefined);
+    assert.strictEqual(labels.tabIndex, 0);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.attributes["aria-disabled"], undefined);
     assert.strictEqual(elapsed.tabIndex, 0);
@@ -2209,7 +2409,7 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(cleanup.tabIndex, 0);
     assert.strictEqual(summary.children.length, 4);
     assert.strictEqual(summary.classList.contains("compact"), false);
-    assert.strictEqual(summary.children[0].textContent, "HUD: on");
+    assert.strictEqual(summary.children[0].textContent, "Labels: on");
     assert.strictEqual(summary.children[1].textContent, "Time: on");
     assert.strictEqual(summary.children[2].textContent, "Auto-hide: off");
     assert.strictEqual(summary.children[3].textContent, "Auto-clear: on");
@@ -2419,6 +2619,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2484,6 +2685,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2545,11 +2747,14 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
 
@@ -2561,9 +2766,13 @@ describe("settings renderer browser environment", () => {
 
     assert.strictEqual(harness.getContentRenderCount(), beforeRenderCount);
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);

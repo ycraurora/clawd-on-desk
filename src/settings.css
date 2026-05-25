@@ -399,11 +399,19 @@ html, body {
 @media (max-width: 720px) {
   .session-hud-collapsible .collapsible-group-header {
     align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .session-hud-collapsible .collapsible-group-summary {
+    flex: 0 0 calc(100% - 22px);
+    justify-content: flex-start;
+    max-width: calc(100% - 22px);
+    margin-left: 22px;
   }
   .session-hud-summary-control {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    width: min(238px, 42vw);
+    width: min(238px, 100%);
     max-width: 100%;
+    justify-content: start;
   }
   .session-hud-summary-control .collapsible-summary-chip {
     max-width: 100%;
@@ -698,6 +706,30 @@ html, body {
   cursor: default;
   opacity: 0.52;
 }
+.hardware-buddy-quick-command-row {
+  align-items: flex-start;
+}
+.hardware-buddy-quick-command-control {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: min(440px, 52vw);
+}
+.hardware-buddy-quick-command-button {
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+.hardware-buddy-quick-command-button.pending {
+  cursor: wait;
+}
+.hardware-buddy-quick-command-empty {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
 .hardware-buddy-text-control {
   min-width: min(260px, 42vw);
 }
@@ -736,6 +768,10 @@ html, body {
   }
   .hardware-buddy-status-control {
     justify-content: flex-start;
+  }
+  .hardware-buddy-quick-command-control {
+    justify-content: flex-start;
+    max-width: 100%;
   }
   .hardware-buddy-field-row .row-control,
   .hardware-buddy-text-control {

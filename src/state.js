@@ -701,15 +701,89 @@ function resolvePidReachable(existing, agentPid, sourcePid) {
 
 function evictOldestSessionIfNeeded(sessionId) {
   if (sessions.has(sessionId) || sessions.size < MAX_SESSIONS) return;
+
+  // Phase 1: prefer the oldest NON-ack session — capacity safety is what we
+  // care about first, but we don't want to silently evict a session the user
+  // hasn't seen yet.
   let oldestId = null;
   let oldestTime = Infinity;
   for (const [id, s] of sessions) {
+    if (s && s.requiresCompletionAck === true) continue;
     if (s.updatedAt < oldestTime) {
       oldestTime = s.updatedAt;
       oldestId = id;
     }
   }
+
+  // Phase 2: only when EVERY entry is ack-pending do we evict the oldest
+  // ack one — capacity is a memory cap, ack retention is a UX promise; when
+  // they conflict, capacity has to win.
+  if (!oldestId) {
+    for (const [id, s] of sessions) {
+      if (s.updatedAt < oldestTime) {
+        oldestTime = s.updatedAt;
+        oldestId = id;
+      }
+    }
+  }
+
   if (oldestId) sessions.delete(oldestId);
+}
+
+// Sets / clears `requiresCompletionAck` based on the current event.
+// Called from updateSession's `finally` block so every early-return path
+// (PermissionRequest on disabled Kimi, SessionEnd, SubagentStop on missing
+// session, etc.) still gets its flag reconciled — placing this in the
+// dispatch body would miss those paths.
+//
+// `ackedAt` is intentionally NOT touched here. It's only set in
+// ackSessionCompletion (user-initiated). The reconciler just toggles the
+// boolean flag.
+function isRemoteCodexCompletionEvent(srcAgentId, srcHost, event) {
+  return srcAgentId === "codex"
+    && !!srcHost
+    && (event === "Stop" || event === "event_msg:task_complete");
+}
+
+function isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event) {
+  return srcAgentId === "codex"
+    && !!srcHost
+    && event === "stale-cleanup";
+}
+
+function reconcileAckFlag(sessionId, srcAgentId, srcHost, event) {
+  const entry = sessions.get(sessionId);
+  if (!entry) return; // session was deleted by this update — nothing to do
+  if (isRemoteCodexCompletionEvent(srcAgentId, srcHost, event)) {
+    entry.requiresCompletionAck = true;
+  } else if (
+    entry.requiresCompletionAck
+    && !isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event)
+  ) {
+    // Strict equality on completion events: any other semantic event
+    // (including null/undefined refreshes) clears the flag. Remote Codex
+    // stale-cleanup is housekeeping from the JSONL monitor, so it must not
+    // erase an unacknowledged completion.
+    entry.requiresCompletionAck = false;
+  }
+}
+
+// User-initiated acknowledgment. Returns true if the session existed AND had
+// the flag set (a meaningful clear happened). Returns false for missing
+// sessions or sessions that aren't pending — both are idempotent no-ops the
+// renderer can safely ignore.
+function ackSessionCompletion(sessionId) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  if (session.requiresCompletionAck !== true) return false;
+  session.requiresCompletionAck = false;
+  session.ackedAt = Date.now();
+  // Force snapshot so the Mark-read button visibility (and any HUD bell
+  // wiring) reaches renderers without waiting for the next debounce.
+  emitSessionSnapshot({ force: true });
+  return true;
 }
 
 // ── Session management ──
@@ -841,7 +915,12 @@ function updateSession(sessionId, state, event, opts = {}) {
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
   const recentEvents = pushRecentEvent(existing, preservedState || state, event);
+  const preserveCompletionAck =
+    existing
+    && existing.requiresCompletionAck === true
+    && isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event);
   const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
+  if (preserveCompletionAck) base.requiresCompletionAck = true;
 
   if (event === "codex-permission") {
     evictOldestSessionIfNeeded(sessionId);
@@ -1017,6 +1096,25 @@ function updateSession(sessionId, state, event, opts = {}) {
   const displayState = resolveDisplayState();
   setState(displayState, getSvgOverride(displayState));
   } finally {
+    try {
+      // Reconcile the ack flag from the LATEST entry view, not the closure
+      // copies taken at the top — early-return paths (state.js Kimi
+      // PermissionRequest gate, SessionEnd, SubagentStop on missing
+      // session) bail out before the resolved srcAgentId/srcHost block
+      // runs. The Object.assign(existing, base) ONESHOT branch can also
+      // rebuild the entry midway. Re-fetch + fall back to raw opts so we
+      // never miss either signal.
+      const entry = sessions.get(sessionId);
+      const srcAgentId = (opts && opts.agentId) || (entry && entry.agentId) || null;
+      const srcHost = (opts && opts.host) || (entry && entry.host) || null;
+      reconcileAckFlag(sessionId, srcAgentId, srcHost, event);
+    } catch (err) {
+      // Defensive: must never let a reconciler throw shadow the outer
+      // error chain. The reconciler is one Map lookup + a boolean toggle,
+      // so this should never fire — log if it does so the regression is
+      // visible.
+      console.warn("reconcileAckFlag threw:", err);
+    }
     emitSessionSnapshot();
   }
 }
@@ -1029,12 +1127,14 @@ function cleanStaleSessions() {
   const now = Date.now();
   let changed = false;
   let snapshotRefreshNeeded = false;
+  const staleConfig = typeof ctx.getStaleConfig === "function" ? ctx.getStaleConfig() : null;
   for (const [id, s] of sessions) {
     const decision = getStaleSessionDecision(s, {
       now,
       isProcessAlive,
       deriveSessionBadge,
       shouldAutoClearDetachedSession,
+      staleConfig,
     });
 
     if (decision.snapshotRefreshNeeded) snapshotRefreshNeeded = true;
@@ -1163,7 +1263,7 @@ function detectRunningAgentProcesses(callback) {
   const { execFile, exec } = require("child_process");
   if (process.platform === "win32") {
     const psScript =
-      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','opencode.exe','pi.exe','hermes.exe'; " +
+      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','agy.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','opencode.exe','pi.exe','hermes.exe'; " +
       "$match = Get-CimInstance Win32_Process | Where-Object { " +
         "$names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') " +
       "} | Select-Object -First 1; " +
@@ -1175,7 +1275,7 @@ function detectRunningAgentProcesses(callback) {
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'kiro-cli' || pgrep -x 'opencode' || pgrep -x 'hermes'", { timeout: 3000 },
+    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'agy' || pgrep -x 'kiro-cli' || pgrep -x 'opencode' || pgrep -x 'hermes'", { timeout: 3000 },
       (err) => done(!err)
     );
   }
@@ -1440,6 +1540,7 @@ return {
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
   dismissSession,
+  ackSessionCompletion,
   clearSessionsByAgent,
   disposeAllKimiPermissionState,
   deriveSessionBadge,

@@ -608,10 +608,14 @@ let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
 let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
+let sessionHudShowStateLabels = _settingsController.get("sessionHudShowStateLabels");
 let sessionHudShowElapsed = _settingsController.get("sessionHudShowElapsed");
 let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
 let sessionHudAutoHide = _settingsController.get("sessionHudAutoHide");
 let sessionHudPinned = _settingsController.get("sessionHudPinned");
+let sessionStaleMs = _settingsController.get("sessionStaleMs");
+let workingStaleMs = _settingsController.get("workingStaleMs");
+let detachedIdleStaleMs = _settingsController.get("detachedIdleStaleMs");
 let soundMuted = _settingsController.get("soundMuted");
 let soundVolume = _settingsController.get("soundVolume");
 let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
@@ -636,6 +640,20 @@ function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
 }
 
+function getThemeSoundPreloadUrls() {
+  const urls = [];
+  for (const name of ["complete", "confirm"]) {
+    const url = themeRuntime.getSoundUrl(name);
+    if (url && !urls.includes(url)) urls.push(url);
+  }
+  return urls;
+}
+
+function syncSoundPreloads() {
+  const urls = getThemeSoundPreloadUrls();
+  if (urls.length) sendToRenderer("preload-sounds", { urls });
+}
+
 function setViewportOffsetY(offsetY) { return petWindowRuntime.setViewportOffsetY(offsetY); }
 function getPetWindowBounds() { return petWindowRuntime.getPetWindowBounds(); }
 function applyPetWindowBounds(bounds) { return petWindowRuntime.applyPetWindowBounds(bounds); }
@@ -651,6 +669,7 @@ function syncHitStateAfterLoad() {
 }
 
 function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
+  syncSoundPreloads();
   sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
@@ -982,6 +1001,11 @@ const _stateCtx = {
     return !!(entry && entry.disabled === true);
   },
   get sessionHudCleanupDetached() { return sessionHudCleanupDetached; },
+  getStaleConfig: () => ({
+    sessionStaleMs,
+    workingStaleMs,
+    detachedIdleStaleMs,
+  }),
   getSessionAliases: () => _settingsController.get("sessionAliases"),
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
@@ -1141,6 +1165,7 @@ const _sessionHud = require("./session-hud")({
   get win() { return win; },
   get petHidden() { return petWindowRuntime.isPetHidden(); },
   get sessionHudEnabled() { return sessionHudEnabled; },
+  get sessionHudShowStateLabels() { return sessionHudShowStateLabels; },
   get sessionHudShowElapsed() { return sessionHudShowElapsed; },
   get sessionHudAutoHide() { return sessionHudAutoHide; },
   get sessionHudPinned() { return sessionHudPinned; },
@@ -1216,6 +1241,16 @@ function sessionLog(msg) {
   const { rotatedAppend } = require("./log-rotate");
   rotatedAppend(sessionDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
 }
+
+ipcMain.on("sound-playback-error", (_event, payload) => {
+  const phase = payload && typeof payload.phase === "string"
+    ? payload.phase.replace(/[^a-z0-9_-]/gi, "").slice(0, 32)
+    : "unknown";
+  const message = payload && typeof payload.message === "string"
+    ? payload.message.replace(/\s+/g, " ").slice(0, 240)
+    : "unknown";
+  sessionLog(`sound playback error phase=${phase || "unknown"} message=${message || "unknown"}`);
+});
 
 function focusLog(msg) {
   if (!focusDebugLog) return;
@@ -1794,8 +1829,11 @@ const SETTINGS_MIRROR_SETTERS = {
   showDock: (v) => { showDock = v; }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
   autoStartWithClaude: (v) => { autoStartWithClaude = v; }, openAtLogin: (v) => { openAtLogin = v; },
   bubbleFollowPet: (v) => { bubbleFollowPet = v; }, sessionHudEnabled: (v) => { sessionHudEnabled = v; },
+  sessionHudShowStateLabels: (v) => { sessionHudShowStateLabels = v; },
   sessionHudShowElapsed: (v) => { sessionHudShowElapsed = v; }, sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
   sessionHudAutoHide: (v) => { sessionHudAutoHide = v; }, sessionHudPinned: (v) => { sessionHudPinned = v; },
+  sessionStaleMs: (v) => { sessionStaleMs = v; }, workingStaleMs: (v) => { workingStaleMs = v; },
+  detachedIdleStaleMs: (v) => { detachedIdleStaleMs = v; },
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
   allowEdgePinning: (v) => { allowEdgePinningCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
 };
@@ -1980,6 +2018,12 @@ registerSettingsIpc({
     ? hardwareBuddyAdapter.getStatus()
     : null),
   testHardwareBuddyApproval: () => sendHardwareBuddyTestApproval(),
+  getQuickCommandPresets: () => hardwareBuddyAdapter && typeof hardwareBuddyAdapter.getQuickCommandPresets === "function"
+    ? hardwareBuddyAdapter.getQuickCommandPresets()
+    : { enabled: false, presets: [] },
+  sendQuickCommand: (payload) => hardwareBuddyAdapter && typeof hardwareBuddyAdapter.createQuickCommand === "function"
+    ? hardwareBuddyAdapter.createQuickCommand(payload)
+    : { status: "error", code: "quick_commands_unavailable", message: "Quick Commands are unavailable" },
   checkForUpdates,
   aboutHeroSvgPath: path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg"),
 });
@@ -1990,6 +2034,7 @@ registerSessionIpc({
   getI18n: () => getDashboardI18nPayload(),
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
+  ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   showDashboard: (options) => showDashboard(options),
   setSessionHudPinned: (value) => {
