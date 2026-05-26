@@ -154,6 +154,39 @@ function hasPermissionAnimationLock() {
   return kimiPermissionHolds.size > 0;
 }
 
+// ── Qwen Code self-submit filter ──
+// qwen 0.16.1 fires a synthetic UserPromptSubmit ~900-1000ms after
+// PostToolUse to feed the tool result back to the model. Without filtering,
+// the mascot flashes "thinking" (typing animation) between working and idle.
+// Measured twice in dogfood: 908ms (non-interactive) and 945ms (interactive).
+// 2000ms window covers the agentic loop with ~2x headroom while still letting
+// real human input through after the loop settles. See
+// project_qwen_0_16_1_event_semantics for the canary.
+//
+// Two timestamps split: `lastToolBoundaryAt` tracks PostToolUse /
+// PostToolUseFailure (where the agentic loop may still self-submit), and
+// `lastStopAt` tracks end-of-turn. Filter only fires when a recent tool
+// boundary has NOT yet been followed by Stop — once Stop arrives, any
+// further UserPromptSubmit is real user input even if the tool boundary
+// is still inside the window. This avoids eating a real "继续" typed
+// within 2s of the happy end animation.
+const QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS = 2000;
+const QWEN_SELF_SUBMIT_WINDOW_MAX_MS = 10000;
+function getQwenSelfSubmitWindowMs() {
+  const raw = process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS;
+  if (typeof raw !== "string" || !raw.trim()) return QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n < 0 || n > QWEN_SELF_SUBMIT_WINDOW_MAX_MS) {
+    return QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS;
+  }
+  return n;
+}
+function isQwenSelfSubmitFilterEnabled() {
+  // Default on. Kill switch for users to disable if qwen ≥0.17 changes the
+  // self-submit behavior in a way that breaks this filter.
+  return process.env.CLAWD_QWEN_SELF_SUBMIT_FILTER !== "0";
+}
+
 // ── Stale cleanup ──
 let staleCleanupTimer = null;
 let _detectInFlight = false;
@@ -910,6 +943,29 @@ function updateSession(sessionId, state, event, opts = {}) {
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
   const preservedState = preserveState && existing ? existing.state : null;
 
+  // Qwen Code 0.16.1 self-submit guard. qwen's agentic loop fires a synthetic
+  // UserPromptSubmit ~900-1000ms after PostToolUse to feed the tool result
+  // back to the model. Dropping it here (before pushRecentEvent / setState)
+  // prevents the mascot from flashing "thinking" between working and idle.
+  // Falls through to normal handling when:
+  //   - No existing session / no tool boundary (cannot prove self-submit)
+  //   - Outside the window (real human input)
+  //   - Stop has fired AFTER the most recent tool boundary (end-of-turn
+  //     reached — any UserPromptSubmit now is real user input)
+  //   - Kill switch CLAWD_QWEN_SELF_SUBMIT_FILTER="0"
+  if (
+    event === "UserPromptSubmit"
+    && srcAgentId === "qwen-code"
+    && existing
+    && Number.isFinite(existing.lastToolBoundaryAt)
+    && (Date.now() - existing.lastToolBoundaryAt) < getQwenSelfSubmitWindowMs()
+    && !(Number.isFinite(existing.lastStopAt) && existing.lastStopAt >= existing.lastToolBoundaryAt)
+    && isQwenSelfSubmitFilterEnabled()
+  ) {
+    debugSession(`qwen self-submit drop sid=${sessionId} elapsed=${Date.now() - existing.lastToolBoundaryAt}ms`);
+    return;
+  }
+
   debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"} source=${hookSource || "-"}`);
 
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
@@ -919,7 +975,24 @@ function updateSession(sessionId, state, event, opts = {}) {
     existing
     && existing.requiresCompletionAck === true
     && isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event);
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
+  // Agent-loop boundary timestamps for the qwen self-submit filter. Two
+  // split fields: `lastToolBoundaryAt` (PostToolUse / PostToolUseFailure)
+  // marks where a synthetic UserPromptSubmit may still follow within the
+  // ~1s window; `lastStopAt` (Stop) marks end-of-turn after which any
+  // UserPromptSubmit is real user input. PostToolUseFailure is a generic
+  // defensive boundary — qwen 0.16.1 does not emit it, but other agents
+  // sharing this state.js do (claude-code, codex), and a future qwen
+  // version may. Propagated through `base` so every sessions.set path
+  // keeps both values until the next bump.
+  const isToolBoundary = event === "PostToolUse" || event === "PostToolUseFailure";
+  const isStopBoundary = event === "Stop";
+  const srcLastToolBoundaryAt = isToolBoundary
+    ? Date.now()
+    : (existing && Number.isFinite(existing.lastToolBoundaryAt) ? existing.lastToolBoundaryAt : null);
+  const srcLastStopAt = isStopBoundary
+    ? Date.now()
+    : (existing && Number.isFinite(existing.lastStopAt) ? existing.lastStopAt : null);
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, sessionTitle: srcSessionTitle, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt };
   if (preserveCompletionAck) base.requiresCompletionAck = true;
 
   if (event === "codex-permission") {
