@@ -89,6 +89,63 @@ describe("package build config", () => {
     });
   });
 
+  describe("macOS architecture targets", () => {
+    function getMacDmgTarget() {
+      const targets = pkg.build.mac && pkg.build.mac.target;
+      return Array.isArray(targets) ? targets.find((target) => target && target.target === "dmg") : null;
+    }
+
+    it("builds native macOS DMGs for x64 and arm64", () => {
+      const target = getMacDmgTarget();
+      assert.ok(target, "build.mac.target should include a dmg target");
+      assert.deepStrictEqual(
+        target.arch.slice().sort(),
+        ["x64", "arm64"].slice().sort(),
+        "macOS builds should publish both x64 and ARM64 DMGs"
+      );
+    });
+
+    it("uses architecture-specific macOS DMG names without spaces", () => {
+      const artifactName = pkg.build.mac && pkg.build.mac.artifactName;
+      assert.strictEqual(
+        typeof artifactName,
+        "string",
+        "build.mac.artifactName should be a string"
+      );
+      assert.match(
+        artifactName,
+        /\$\{arch\}/,
+        "macOS artifactName must include ${arch} so x64 and ARM64 DMGs cannot collide"
+      );
+      assert.doesNotMatch(
+        artifactName,
+        /\s/,
+        "macOS artifactName should not contain spaces so latest-mac.yml URLs match uploaded DMG assets"
+      );
+    });
+  });
+
+  describe("Linux artifact targets", () => {
+    it("uses Linux artifact names without spaces so latest-linux.yml URLs match uploaded assets", () => {
+      const artifactName = pkg.build.linux && pkg.build.linux.artifactName;
+      assert.strictEqual(
+        typeof artifactName,
+        "string",
+        "build.linux.artifactName should be a string"
+      );
+      assert.match(
+        artifactName,
+        /\$\{arch\}/,
+        "Linux artifactName should include ${arch} so architecture-specific assets stay explicit"
+      );
+      assert.doesNotMatch(
+        artifactName,
+        /\s/,
+        "Linux artifactName should not contain spaces so latest-linux.yml URLs match uploaded assets"
+      );
+    });
+  });
+
   // getWindowsShellIconPath has a three-step fallback:
   //   1. resourcesPath/icon.ico            ← extraResources copy
   //   2. resourcesPath/app.asar.unpacked/assets/icon.ico

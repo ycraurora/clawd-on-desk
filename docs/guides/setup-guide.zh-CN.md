@@ -1,6 +1,6 @@
 # 配置指南
 
-[返回 README](../README.zh-CN.md)
+[返回 README](../../README.zh-CN.md)
 
 ## Agent 配置说明
 
@@ -10,7 +10,7 @@
 
 **Docker / devcontainer 里的 VS Code Codex** — Clawd 采用双端 bridge：随应用自动安装的本地 `clawd-terminal-focus` 扩展负责把事件转发到本机 Clawd，而真正读取容器内 `~/.codex/sessions` 的是另一个跑在 remote/workspace 侧的 helper 扩展。这个 helper 目前还不会自动装进容器里的 VS Code Server，测试这条链路时需要先手动安装一次。
 
-**Copilot CLI** — 本地安装仍需手动配置 `~/.copilot/hooks/hooks.json`（Clawd 启动时不自动同步 Copilot）。SSH 远程部署 (`scripts/remote-deploy.sh`) 现在已经自动配置。详见 [copilot-setup.md](copilot-setup.md)。
+**Copilot CLI** — 开箱即用。Clawd 启动时自动在 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json` 注册 hooks（marker-based 合并，你已有的 hook 条目和其他 `hooks/*.json` 文件原样保留）。SSH 远程部署走应用内 **Settings → 远程 SSH → 一键部署** 自动配置。`hooks.json` 或 `settings.json` 顶层 `disableAllHooks: true` 时 doctor 会报 warning 并不挂 Fix 按钮。详见 [copilot-setup.zh-CN.md](copilot-setup.zh-CN.md)（含手动备选与 `COPILOT_HOME` 说明）。
 
 **Gemini CLI** — hooks 配置在 `~/.gemini/settings.json`。如果本机已安装 Gemini，Clawd 启动时会自动注册；也可以手动执行 `npm run install:gemini-hooks`。
 
@@ -24,6 +24,8 @@
 
 **Kimi Code CLI（Kimi-CLI）** — hooks 配置在 `~/.kimi/config.toml`（`[[hooks]]` 条目）。如果本机已安装 Kimi，Clawd 启动时会自动注册；也可以手动执行 `npm run install:kimi-hooks`。在 Clawd 中 Kimi 采用 hook-only 集成：状态和权限提示都来自 hook 事件，不再依赖日志轮询。如果想让权限分类策略在重启后仍然生效，请在执行安装命令之前设置环境变量 `CLAWD_KIMI_PERMISSION_MODE=explicit`（默认）或 `CLAWD_KIMI_PERMISSION_MODE=suspect`，安装脚本会把这个值写进 `~/.kimi/config.toml` 中每条 Kimi hook 的 `command` 字段，后续 Clawd 自动同步也会保留它。注意：自动同步会按预期行重写 `command` 字段，所以你对该字段的手工修改会在下次启动时被静默还原。
 
+**Qwen Code** — hooks 配置在 `~/.qwen/settings.json`。如果本机已安装 Qwen，Clawd 启动时会自动注册；也可以手动执行 `npm run install:qwen-hooks`。Qwen Code 在 Clawd 中采用 hook-only 集成：状态更新和阻塞式 `PermissionRequest` 审批都来自 Qwen hook 事件。如果 Qwen settings 里有 `disableAllHooks: true`，Clawd 可以注册条目，但 Qwen 不会触发它们，直到用户移除该开关。
+
 **opencode** — 使用 `~/.config/opencode/opencode.json` 里的 plugin 配置。如果本机已安装 opencode，Clawd 启动时会自动注册；也可以手动执行 `node hooks/opencode-install.js`。
 
 **Pi** — 使用全局 extension 目录 `~/.pi/agent/extensions/clawd-on-desk`。如果本机已安装 Pi，Clawd 启动时会自动注册；也可以手动执行 `npm run install:pi-extension`。交互式 Pi 会话会向 Clawd 上报生命周期和工具活动，但 Pi 是 state-only：Clawd 不显示权限气泡、不调用 Pi 终端确认，并保留 Pi 默认 YOLO 执行行为。
@@ -32,37 +34,34 @@
 
 **Hermes Agent** — 从 [hermes-agent.org](https://hermes-agent.org/) 或 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 安装 Hermes。Clawd 默认会在 Settings 里显示 Hermes 开关，但启动自动同步会先探测 Hermes 是否已安装；未安装时不会写入 `~/.hermes` 或 `%LOCALAPPDATA%\hermes`。安装 Hermes 后，Clawd 会把 plugin 复制到 Hermes 的托管 plugin 目录，并通过 `hermes plugins enable clawd-on-desk` 启用它。也可以手动执行 `npm run install:hermes-plugin` 强制同步，或执行 `npm run uninstall:hermes-plugin` 移除 Clawd 的 Hermes plugin。
 
+**Hardware Buddy** — 可选的本地审批伙伴集成，对应 [Clawstick 硬件仓库](https://github.com/rullerzhou-afk/clawstick)。Clawd v0.8.1 不内置 Clawstick runtime；请单独安装 / checkout Clawstick，把它放到本仓库相邻目录 `../clawstick`，或通过 `CLAWD_HARDWARE_BUDDY_ROOT` 指向实际路径。Hardware Buddy 默认关闭；只有准备好受支持的 BLE / fake backend 后才需要在 Settings 里启用。默认只发送会话状态快照；要允许它回复权限审批，还需要单独打开 Hardware Buddy 的 permission toggle。
+
 ## 远程 SSH 模式（Claude Code, Codex CLI & Copilot CLI）
 
-<img src="../assets/screenshot-remote-ssh.png" width="560" alt="远程 SSH — 来自树莓派的权限气泡">
+<img src="../../assets/screenshot-remote-ssh.png" width="560" alt="远程 SSH — 来自树莓派的权限气泡">
 
 Clawd 支持通过 SSH 反向端口转发感知远程服务器上的 AI Agent 状态。Hook 事件和权限请求通过 SSH 隧道传回本地 Clawd，无需修改 Clawd 本体代码。
 
-**一键部署：**
+**主流程：应用内 Settings → 远程 SSH → 一键部署**
+
+DMG / 安装包用户的入口是 Clawd 应用内的 **Settings → 远程 SSH**：新增 profile（填 `user@host`、可选私钥、转发端口），点 **一键部署**，Clawd 会自动建立 `ssh -R` 反向隧道并把 hooks 部署到远端。完整步骤、Doctor 边界和故障排查（端口冲突 / 没 Node.js / 远端 session 不显示等）见专门指南：
+
+**→ [docs/guides/guide-remote-ssh.zh-CN.md](guide-remote-ssh.zh-CN.md)**
+
+**工作原理：**
+- **Claude Code** — 远程 hook 将状态 POST 到 `localhost:23333`，SSH 隧道转发回本地 Clawd。权限气泡也能正常弹出——HTTP 往返通过隧道完成。
+- **Codex CLI** — 远程 official hooks 通过同一隧道 POST 状态和权限请求。如果远程 Codex hooks 不可用或被禁用，再使用 fallback 日志监控：`node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
+- **Copilot CLI** — 一键部署会自动写入远程的 `~/.copilot/hooks/hooks.json`（前提是远程已安装 Copilot CLI，即 `~/.copilot/` 存在）。Hook 通过同一隧道 POST 状态和 session title。
+
+远程 hook 以 `CLAWD_REMOTE` 模式运行，跳过 PID 采集（远程 PID 在本地无意义）。远程会话不支持终端聚焦。
+
+**源码用户备选：** 从源码目录运行（`npm start` 调试场景）才需要老脚本：
 
 ```bash
 bash scripts/remote-deploy.sh user@远程主机
 ```
 
-脚本会将 hook 文件复制到远程服务器，以远程模式注册 Claude Code、Codex official 以及 Copilot CLI hooks，并打印 SSH 配置指引。
-
-**SSH 配置**（添加到本地 `~/.ssh/config`）：
-
-```
-Host my-server
-    HostName 远程主机
-    User user
-    RemoteForward 127.0.0.1:23333 127.0.0.1:23333
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-```
-
-**工作原理：**
-- **Claude Code** — 远程 hook 将状态 POST 到 `localhost:23333`，SSH 隧道转发回本地 Clawd。权限气泡也能正常弹出——HTTP 往返通过隧道完成。
-- **Codex CLI** — 远程 official hooks 通过同一隧道 POST 状态和权限请求。如果远程 Codex hooks 不可用或被禁用，再使用 fallback 日志监控：`node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
-- **Copilot CLI** — `scripts/remote-deploy.sh` 会自动写入远程的 `~/.copilot/hooks/hooks.json`（前提是远程已安装 Copilot CLI，即 `~/.copilot/` 存在）。Hook 通过同一隧道 POST 状态和 session title。
-
-远程 hook 以 `CLAWD_REMOTE` 模式运行，跳过 PID 采集（远程 PID 在本地无意义）。远程会话不支持终端聚焦。
+它复制源码树里的 hooks 文件并打印手动 SSH 配置（`~/.ssh/config` 加 `RemoteForward 127.0.0.1:23333 127.0.0.1:23333`）。DMG / 安装包用户不需要源码目录，请用应用内一键部署。
 
 > 感谢 [@Magic-Bytes](https://github.com/Magic-Bytes) 提出 SSH 隧道方案（[#9](https://github.com/rullerzhou-afk/clawd-on-desk/issues/9)）。
 
@@ -91,7 +90,7 @@ node ~/.claude/hooks/codex-install.js --remote
 node ~/.claude/hooks/copilot-install.js --remote
 ```
 
-如果你的 WSL 里开启了 SSH 服务，也可以用一键部署脚本：
+如果你的 WSL 里开启了 SSH 服务，也可以用源码备选脚本：
 
 ```bash
 # 从 Windows 侧执行（Git Bash / PowerShell）：
@@ -137,11 +136,17 @@ node hooks/kiro-install.js
 # Kimi Code CLI（Kimi-CLI）
 node hooks/kimi-install.js
 
+# Qwen Code
+node hooks/qwen-code-install.js
+
 # Cursor Agent
 node hooks/cursor-install.js
 
 # Gemini CLI
 node hooks/gemini-install.js
+
+# Antigravity CLI (agy)
+node hooks/antigravity-install.js
 
 # CodeBuddy
 node hooks/codebuddy-install.js

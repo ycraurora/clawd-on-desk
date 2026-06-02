@@ -11,6 +11,7 @@ const {
 } = require("../src/doctor-detectors/agent-integrations");
 const { GEMINI_HOOK_EVENTS } = require("../hooks/gemini-install");
 const { ANTIGRAVITY_HOOK_EVENTS, __test: antigravityInstallTest } = require("../hooks/antigravity-install");
+const { QWEN_CODE_HOOK_EVENTS, buildQwenCodeHookCommand } = require("../hooks/qwen-code-install");
 
 const tempDirs = [];
 
@@ -47,12 +48,24 @@ function runOne(descriptor, options = {}) {
     fs,
     prefs: options.prefs || {},
     descriptors: [descriptor],
+    server: options.server || null,
     validateCommand: options.validateCommand || (() => ({
       ok: true,
       nodeBin: "/node",
       scriptPath: "/app/hooks/test-hook.js",
     })),
   }).details[0];
+}
+
+function suspiciousShrinkGuardServer() {
+  return {
+    getClaudeHookGuardStatus: () => ({
+      type: "suspicious-shrink",
+      at: 1234,
+      before: { keyCount: 5, hookCount: 12, thirdPartyHookCount: 2 },
+      after: { keyCount: 1, hookCount: 0, thirdPartyHookCount: 0 },
+    }),
+  };
 }
 
 function geminiHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/gemini-hook.js" ${event}`) {
@@ -97,6 +110,32 @@ function antigravityHooksConfig(commandForEvent = (event) => `"/node" "/app/hook
 
 function writeAntigravityHooks(descriptor, hooks = antigravityHooksConfig()) {
   writeJson(descriptor.configPath, hooks);
+}
+
+function qwenDescriptor() {
+  const root = makeTempDir();
+  const parentDir = path.join(root, ".qwen");
+  return baseDescriptor({
+    agentId: "qwen-code",
+    agentName: "Qwen Code",
+    marker: "qwen-code-hook.js",
+    parentDir,
+    configPath: path.join(parentDir, "settings.json"),
+    configMode: "file",
+    nested: true,
+    hookEvents: QWEN_CODE_HOOK_EVENTS,
+  });
+}
+
+function qwenHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/qwen-code-hook.js" ${event}`) {
+  const hooks = {};
+  for (const event of QWEN_CODE_HOOK_EVENTS) {
+    hooks[event] = [{
+      matcher: "*",
+      hooks: [{ name: "clawd", type: "command", command: commandForEvent(event) }],
+    }];
+  }
+  return { hooks };
 }
 
 function codexDescriptor() {
@@ -192,6 +231,83 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.level, "warning");
     assert.strictEqual(detail.configFileExists, false);
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "test-agent" });
+  });
+
+  it("explains Claude hook loss when the suspicious-shrink guard recently fired", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard.type, "suspicious-shrink");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "claude-code" });
+  });
+
+  it("does not show the Claude guard notice for other agents", () => {
+    const descriptor = baseDescriptor();
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /has no test-hook\.js command/);
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
+  });
+
+  it("does not show the Claude guard notice when Claude hooks are connected", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: {
+        Stop: [{
+          matcher: "",
+          hooks: [{ command: '"/node" "/app/hooks/clawd-hook.js" Stop' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "ok");
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
+  });
+
+  it("keeps the original Claude hook loss detail when no guard status is available", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: {},
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /has no clawd-hook\.js command/);
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
   });
 
   it("returns config-corrupt when JSON parsing fails", () => {
@@ -494,6 +610,108 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.hookCommandIssue, "scriptPath-missing");
     assert.strictEqual(detail.brokenAntigravityHookEvent, "PreInvocation");
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "antigravity-cli" });
+  });
+
+  it("validates Qwen Code hooks for every required event", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, qwenHooksConfig());
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        return {
+          ok: true,
+          nodeBin: "/node",
+          scriptPath: "/app/hooks/qwen-code-hook.js",
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, "/app/hooks/qwen-code-hook.js");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "qwen_hooks",
+      value: "enabled",
+      detail: "settings.json allows Clawd Qwen hooks",
+    });
+  });
+
+  it("validates Windows Qwen Code EncodedCommand hooks for every required event", () => {
+    const descriptor = qwenDescriptor();
+    const nodeBin = "C:\\Program Files\\nodejs\\node.exe";
+    const scriptPath = "D:/app/hooks/qwen-code-hook.js";
+    writeJson(descriptor.configPath, qwenHooksConfig((event) =>
+      buildQwenCodeHookCommand(
+        nodeBin,
+        scriptPath,
+        event,
+        {
+          platform: "win32",
+          powerShellBin: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        }
+      )
+    ));
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        assert.strictEqual(command.includes("qwen-code-hook.js"), false);
+        return {
+          ok: true,
+          nodeBin,
+          scriptPath,
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, scriptPath);
+  });
+
+  it("warns when Qwen Code is missing any required hook event", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, {
+      hooks: {
+        PreToolUse: [{
+          matcher: "*",
+          hooks: [{ name: "clawd", type: "command", command: '"/node" "/app/hooks/qwen-code-hook.js" PreToolUse' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.ok(detail.missingQwenHookEvents.includes("SessionStart"));
+    assert.ok(detail.missingQwenHookEvents.includes("PermissionRequest"));
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "qwen-code" });
+  });
+
+  it("does not offer automatic repair when Qwen hooks are disabled globally", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, {
+      ...qwenHooksConfig(),
+      disableAllHooks: true,
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.strictEqual(detail.detail, "Qwen Code hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "qwen_hooks",
+      value: "disabled-global",
+      detail: "disableAllHooks is true",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
   });
 
   it("does not offer automatic repair when Antigravity Clawd hooks are disabled", () => {
@@ -985,10 +1203,12 @@ describe("checkAgentIntegrations", () => {
   });
 
   it("aggregates all-info states as critical when no integration is ok", () => {
+    // none-global agents (info status `manual-only`) + missing agents only:
+    // no real `ok` integrations means the overall summary is critical.
     const result = checkAgentIntegrations({
       fs,
       descriptors: [
-        baseDescriptor({ agentId: "copilot-cli", configMode: "none-global" }),
+        baseDescriptor({ agentId: "hypothetical-none-global", configMode: "none-global" }),
         baseDescriptor({ agentId: "missing-agent" }),
       ],
     });

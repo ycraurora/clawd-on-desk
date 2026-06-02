@@ -102,6 +102,7 @@ describe("permission telegram remote approval", () => {
   it("sends a conservative payload and resolves allow without a message", async () => {
     let resolveApproval;
     const requests = [];
+    const resolved = [];
     const client = {
       isEnabled: () => true,
       requestApproval: (payload, options) => {
@@ -109,7 +110,10 @@ describe("permission telegram remote approval", () => {
         return new Promise((resolve) => { resolveApproval = resolve; });
       },
     };
-    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const perm = initPermission(makeCtx({
+      getTelegramApprovalClient: () => client,
+      onPermissionResolved: (entry, meta) => resolved.push({ entry, meta }),
+    }));
     const entry = makePermEntry({
       toolInput: {
         command: "npm test -- --token sk-1234567890123456",
@@ -135,8 +139,75 @@ describe("permission telegram remote approval", () => {
     await flush();
 
     assert.equal(perm.pendingPermissions.length, 0);
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].entry, entry);
+    assert.deepEqual(resolved[0].meta, {
+      reason: "resolved",
+      hasPendingForSession: false,
+    });
     const body = JSON.parse(entry.res.captured.body);
     assert.deepEqual(body.hookSpecificOutput.decision, { behavior: "allow" });
+  });
+
+  it("turns Telegram suggestion decisions into updatedPermissions for rich agents", async () => {
+    let resolveApproval;
+    const requests = [];
+    const client = {
+      isEnabled: () => true,
+      requestApproval: (payload, options) => {
+        requests.push({ payload, options });
+        return new Promise((resolve) => { resolveApproval = resolve; });
+      },
+    };
+    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const suggestion = {
+      type: "addRules",
+      destination: "localSettings",
+      behavior: "allow",
+      rules: [{ toolName: "Bash", ruleContent: "npm test" }],
+    };
+    const entry = makePermEntry({
+      suggestions: [
+        suggestion,
+        { type: "setMode", mode: "acceptEdits", destination: "localSettings" },
+      ],
+    });
+    perm.pendingPermissions.push(entry);
+
+    assert.equal(perm.maybeStartRemoteApproval(entry), true);
+    assert.deepEqual(requests[0].payload.suggestions, [
+      { index: 0, label: "Always Bash" },
+      { index: 1, label: "Auto edits" },
+    ]);
+
+    resolveApproval({ action: "suggestion", index: 0 });
+    await flush();
+    await flush();
+
+    assert.equal(perm.pendingPermissions.length, 0);
+    const body = JSON.parse(entry.res.captured.body);
+    assert.deepEqual(body.hookSpecificOutput.decision, {
+      behavior: "allow",
+      updatedPermissions: [suggestion],
+    });
+  });
+
+  it("keeps legacy remote deny strings working", async () => {
+    const client = {
+      isEnabled: () => true,
+      requestApproval: () => Promise.resolve("deny"),
+    };
+    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const entry = makePermEntry();
+    perm.pendingPermissions.push(entry);
+
+    assert.equal(perm.maybeStartRemoteApproval(entry), true);
+    await flush();
+    await flush();
+
+    assert.equal(perm.pendingPermissions.length, 0);
+    const body = JSON.parse(entry.res.captured.body);
+    assert.deepEqual(body.hookSpecificOutput.decision, { behavior: "deny" });
   });
 
   it("leaves the local permission pending on remote timeout or errors", async () => {
@@ -154,6 +225,78 @@ describe("permission telegram remote approval", () => {
 
     assert.equal(perm.pendingPermissions.length, 1);
     assert.equal(entry.res.captured.ended, false);
+  });
+
+  it("does not expose or accept rich suggestions for unsupported agents", async () => {
+    const requests = [];
+    const client = {
+      isEnabled: () => true,
+      requestApproval: (payload) => {
+        requests.push(payload);
+        return Promise.resolve({ action: "suggestion", index: 0 });
+      },
+    };
+    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const entry = makePermEntry({
+      agentId: "codex",
+      isCodex: true,
+      suggestions: [{ type: "setMode", mode: "default", destination: "localSettings" }],
+    });
+    perm.pendingPermissions.push(entry);
+
+    assert.equal(perm.maybeStartRemoteApproval(entry), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(requests[0], "suggestions"), false);
+    await flush();
+    await flush();
+
+    assert.equal(perm.pendingPermissions.length, 1);
+    assert.equal(entry.res.captured.ended, false);
+  });
+
+  it("ignores stale Telegram decisions after the local permission resolves first", async () => {
+    let resolveApproval;
+    const client = {
+      isEnabled: () => true,
+      requestApproval: () => new Promise((resolve) => { resolveApproval = resolve; }),
+    };
+    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const entry = makePermEntry({
+      suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "localSettings" }],
+    });
+    perm.pendingPermissions.push(entry);
+
+    assert.equal(perm.maybeStartRemoteApproval(entry), true);
+    perm.resolvePermissionEntry(entry, "deny");
+    const bodyBeforeRemote = entry.res.captured.body;
+
+    resolveApproval({ action: "suggestion", index: 0 });
+    await flush();
+    await flush();
+
+    assert.equal(perm.pendingPermissions.length, 0);
+    assert.equal(entry.res.captured.body, bodyBeforeRemote);
+    assert.deepEqual(JSON.parse(entry.res.captured.body).hookSpecificOutput.decision, { behavior: "deny" });
+  });
+
+  it("ignores invalid Telegram suggestion indexes for rich agents without resolving locally", async () => {
+    const client = {
+      isEnabled: () => true,
+      requestApproval: () => Promise.resolve({ action: "suggestion", index: 9 }),
+    };
+    const perm = initPermission(makeCtx({ getTelegramApprovalClient: () => client }));
+    const entry = makePermEntry({
+      agentId: "codebuddy",
+      suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "localSettings" }],
+    });
+    perm.pendingPermissions.push(entry);
+
+    assert.equal(perm.maybeStartRemoteApproval(entry), true);
+    await flush();
+    await flush();
+
+    assert.equal(perm.pendingPermissions.length, 1);
+    assert.equal(entry.res.captured.ended, false);
+    assert.equal(entry.resolvedSuggestion, null);
   });
 
   it("aborts the remote request when the local permission resolves first", async () => {

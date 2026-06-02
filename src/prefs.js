@@ -38,7 +38,7 @@ const {
 } = require("./bubble-policy");
 const { normalizeSessionAliases } = require("./session-alias");
 
-const CURRENT_VERSION = 4;
+const CURRENT_VERSION = 8;
 
 // ── Schema ──
 // Each field has: type, default OR defaultFactory, optional enum/normalize/validate.
@@ -99,7 +99,6 @@ const SCHEMA = {
   sessionHudShowStateLabels: { type: "boolean", default: true },
   sessionHudShowElapsed: { type: "boolean", default: true },
   sessionHudCleanupDetached: { type: "boolean", default: false },
-  sessionHudAutoHide: { type: "boolean", default: true },
   sessionHudPinned: { type: "boolean", default: false },
   // Stale-cleanup intervals (ms). Defaults match the historical constants in
   // state-stale-cleanup.js so upgrading users see no behavioral change.
@@ -143,7 +142,21 @@ const SCHEMA = {
     default: 1,
     validate: (v) => Number.isFinite(v) && v >= 0 && v <= 1,
   },
+  flashTaskbarOnComplete: { type: "boolean", default: true },
+  flashIntervalMs: {
+    type: "number",
+    default: 500,
+    validate: (v) => Number.isInteger(v) && v >= 200 && v <= 2000,
+  },
+  flashDurationMs: {
+    type: "number",
+    default: 5000,
+    validate: (v) => Number.isInteger(v) && v >= 0 && v <= 60000,
+  },
   lowPowerIdleMode: { type: "boolean", default: false },
+  // When true, prevent the OS from sleeping while any agent task is in
+  // progress (working/thinking/etc.); allow sleep again once tasks finish.
+  keepAwakeWhileWorking: { type: "boolean", default: false },
   allowEdgePinning: { type: "boolean", default: false },
   // When true, moving the pet between displays does not trigger a
   // proportional pixel-size recomputation. The pet keeps its current
@@ -161,7 +174,7 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => ({
       "claude-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept" },
+      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
       "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
@@ -177,7 +190,7 @@ const SCHEMA = {
       "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "pi": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
       "openclaw": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
-      "hermes": { enabled: true },
+      "hermes": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
@@ -212,10 +225,55 @@ const SCHEMA = {
     defaultFactory: () => cloneDefaultTelegramApproval(),
     normalize: normalizeTelegramApproval,
   },
+  // v0.9.0 migration state. transport defaults to null (undecided) so v0.8.x
+  // users upgrading without this key fall onto the "detect legacy artefacts"
+  // path inside the migration reducer.
+  tgMigration: {
+    type: "object",
+    defaultFactory: () => ({
+      transport: null,
+      nativeVerifiedAt: null,
+      legacyEnabled: null,
+      migration: { importedAt: null, importError: null },
+    }),
+    normalize: (value) => {
+      if (!value || typeof value !== "object") {
+        return { transport: null, nativeVerifiedAt: null, legacyEnabled: null, migration: { importedAt: null, importError: null } };
+      }
+      return {
+        transport: ["legacy", "native", "off"].includes(value.transport) ? value.transport : null,
+        nativeVerifiedAt: typeof value.nativeVerifiedAt === "number" ? value.nativeVerifiedAt : null,
+        legacyEnabled: typeof value.legacyEnabled === "boolean" ? value.legacyEnabled : null,
+        migration: value.migration && typeof value.migration === "object"
+          ? {
+              importedAt: typeof value.migration.importedAt === "number" ? value.migration.importedAt : null,
+              importError: typeof value.migration.importError === "string" ? value.migration.importError : null,
+            }
+          : { importedAt: null, importError: null },
+      };
+    },
+  },
   hardwareBuddy: {
     type: "object",
     defaultFactory: () => ({ ...DEFAULT_HARDWARE_BUDDY_SETTINGS }),
     normalize: normalizeHardwareBuddySettings,
+  },
+  // Background update-check toggle. When true, the scheduler in updater.js
+  // runs a quiet GitHub discovery on a 12-hour cycle (packaged builds only).
+  // Default on per #329.
+  autoUpdateCheck: { type: "boolean", default: true },
+  // Last version the scheduler discovered that is newer than the running
+  // app. Empty string = none pending. Surfaced in the tray label and the
+  // About version-row hint. Cleared on install or by
+  // reconcilePendingOnStartup() when app.getVersion() catches up.
+  pendingUpdateVersion: { type: "string", default: "" },
+  // Versions the user explicitly dismissed (clicked Later on the scheduler
+  // bubble after actually seeing it). Object map of `{ "v0.9.0": true }`
+  // because prefs.js does not support `type: "array"` (see isValidValue).
+  dismissedUpdateVersions: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeDismissedUpdateVersions,
   },
 };
 
@@ -368,6 +426,45 @@ function migrate(raw) {
     };
     out.version = 4;
   }
+  // v4 → v5: Session HUD hover/auto-hide mode removed in favor of explicit
+  // click-to-reveal. Users who explicitly opted out of auto-hide (
+  // `sessionHudAutoHide === false`, meaning "always show") get auto-pinned so
+  // their visual behavior is preserved. The deprecated field is dropped.
+  if (out.version < 5) {
+    if (out.sessionHudAutoHide === false && out.sessionHudPinned !== true) {
+      out.sessionHudPinned = true;
+    }
+    delete out.sessionHudAutoHide;
+    out.version = 5;
+  }
+  // v5 → v6: introduce autoUpdateCheck / pendingUpdateVersion /
+  // dismissedUpdateVersions for the #329 scheduler. No data conversion
+  // needed — new keys fill in from schema defaults via validate(); the
+  // version bump just records that the schema grew.
+  if (out.version < 6) {
+    out.version = 6;
+  }
+  // v6 → v7: Codex Native permission prompt sound now defaults off. Early
+  // builds may have written the old default true into prefs, so reset that
+  // default-like value during migration; users can turn the switch back on.
+  if (out.version < 7) {
+    if (out.agents && typeof out.agents === "object") {
+      const codex = out.agents.codex;
+      if (codex && typeof codex === "object") {
+        codex.nativeNotificationSoundEnabled = false;
+      }
+    }
+    out.version = 7;
+  }
+  // v7 -> v8: bare Telegram completion pings now default off. There was no
+  // UI for this flag, so a persisted true is overwhelmingly the old default
+  // rather than an explicit user opt-in.
+  if (out.version < 8) {
+    if (out.tgApproval && typeof out.tgApproval === "object") {
+      out.tgApproval.notifyOnComplete = false;
+    }
+    out.version = 8;
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }
@@ -375,8 +472,17 @@ function migrate(raw) {
   return out;
 }
 
-const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled"];
+const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled", "nativeNotificationSoundEnabled"];
 const CODEX_PERMISSION_MODES = ["native", "intercept"];
+
+function normalizeDismissedUpdateVersions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (typeof key === "string" && key && value[key] === true) out[key] = true;
+  }
+  return out;
+}
 
 function normalizePositionDisplay(value) {
   if (!isValidDisplaySnapshot(value)) return null;

@@ -26,6 +26,13 @@ import { homedir, platform } from "os";
 import { join } from "path";
 import { randomBytes, timingSafeEqual } from "crypto";
 import { execFileSync, execSync } from "child_process";
+import {
+  DEFAULT_SESSION_ID,
+  getEventSessionId,
+  normalizeOpencodeSessionId,
+  resolveOpencodeSessionId,
+  shouldDropMappedEventWithoutSessionId,
+} from "./session-ids.mjs";
 
 const CLAWD_DIR = join(homedir(), ".clawd");
 const RUNTIME_CONFIG_PATH = join(CLAWD_DIR, "runtime.json");
@@ -37,12 +44,7 @@ const STATE_PATH = "/state";
 // (main → renderer → main) ran under load and silently timed out.
 const POST_TIMEOUT_MS = 1000;
 const AGENT_ID = "opencode";
-
-// opencode emits session.status=busy between every tool call as the LLM
-// deliberates the next step; without this gate the pet would flash
-// thinking ↔ working on every invocation. Active states listed here
-// suppress the "back to thinking" regression.
-const ACTIVE_STATES_BLOCKING_THINKING = new Set(["working", "sweeping"]);
+const HOOK_SOURCE = "opencode-plugin";
 
 // Process tree walk config — mirrors hooks/clawd-hook.js exactly, minus the
 // Claude-specific detection. See docs/plans/plan-opencode-integration.md Phase 4.
@@ -76,8 +78,14 @@ const EDITOR_MAP_LINUX = { "code": "code", "cursor": "cursor", "code-insiders": 
 
 // Per plugin-instance state (scoped to one opencode process).
 let _cachedPort = null;
-let _lastState = null;
-let _lastSessionId = null;
+// Per-session last-state tracking. Keyed by sessionId so that subagent
+// sessions (spawned by the `task` tool) don't clobber the root session's
+// dedup state. Each value is the last Clawd state sent for that session.
+const _lastStatePerSession = new Map();
+// Fallback session ID for permission.asked events, which lack sessionID
+// in their properties. Updated on every session.*/message.part.updated
+// event so it stays fresh. Not used for state dedup.
+let _lastSeenSessionId = null;
 let _reqCounter = 0;
 // Phase 3: opencode subtasks are full child sessions (not subtask parts). The
 // parent session's `task` tool spawns a `session.created` with a new sessionID
@@ -328,31 +336,36 @@ function postPermissionToClawd(body) {
   postToClawd("/permission", body, `PERM tool=${body.tool_name} req=${body.request_id}`);
 }
 
+function buildStateBody(state, eventName, sessionId) {
+  if (!state || !eventName) return null;
+  const clawdSessionId = normalizeOpencodeSessionId(sessionId) || DEFAULT_SESSION_ID;
+  return {
+    state,
+    session_id: clawdSessionId,
+    event: eventName,
+    agent_id: AGENT_ID,
+    hook_source: HOOK_SOURCE,
+  };
+}
+
 // Clawd uses PascalCase event names matching Claude Code's hook vocabulary so
 // state.js transition rules (e.g. SubagentStop → working whitelist) are
 // reusable across agents.
 function sendState(state, eventName, sessionId) {
-  if (!state || !eventName) return;
+  const body = buildStateBody(state, eventName, sessionId);
+  if (!body) return;
 
-  if (state === "thinking" && ACTIVE_STATES_BLOCKING_THINKING.has(_lastState)) {
-    debugLog(`GATE busy→thinking blocked (lastState=${_lastState}, session=${sessionId})`);
+  const lastState = _lastStatePerSession.get(body.session_id) || null;
+
+  // Per-session dedup: skip only if the SAME session repeats the SAME state.
+  if (body.state === lastState) {
     return;
   }
 
-  if (state === _lastState && sessionId === _lastSessionId) {
-    return;
-  }
+  debugLog(`SEND ${lastState || "null"} → ${body.state} event=${body.event} session=${body.session_id}`);
+  _lastStatePerSession.set(body.session_id, body.state);
 
-  debugLog(`SEND ${_lastState || "null"} → ${state} event=${eventName} session=${sessionId}`);
-  _lastState = state;
-  _lastSessionId = sessionId;
-
-  postStateToClawd({
-    state,
-    session_id: sessionId || "default",
-    event: eventName,
-    agent_id: AGENT_ID,
-  });
+  postStateToClawd(body);
 }
 
 // Translate an opencode event into a Clawd (state, eventName) pair, or null
@@ -362,6 +375,7 @@ function sendState(state, eventName, sessionId) {
 function translateEvent(event) {
   if (!event || typeof event.type !== "string") return null;
   const props = event.properties || {};
+  const sessionId = getEventSessionId(event);
 
   switch (event.type) {
     case "session.created":
@@ -401,16 +415,17 @@ function translateEvent(event) {
     case "session.compacted":
       return { state: "sweeping", event: "PreCompact" };
 
-    case "session.idle":
+    case "session.idle": {
       // Phase 3 (plan A): only the root session's idle fires the happy
       // animation. Subtask sessions (spawned by the `task` tool) end with
       // SessionEnd so Clawd removes them from its tracking map — no happy
       // flash, no menu pollution. If _rootSessionId is null (no session
       // seen yet, should never happen), fall through to old behavior.
-      if (_rootSessionId && props.sessionID && props.sessionID !== _rootSessionId) {
+      if (_rootSessionId && sessionId && sessionId !== _rootSessionId) {
         return { state: "sleeping", event: "SessionEnd" };
       }
       return { state: "attention", event: "Stop" };
+    }
 
     case "session.error":
       return { state: "error", event: "StopFailure" };
@@ -424,6 +439,11 @@ function translateEvent(event) {
   }
 }
 
+export const __test = {
+  buildStateBody,
+  translateEvent,
+};
+
 // Normalize ctx.serverUrl into a string with a trailing slash. opencode passes
 // a URL object in practice but we coerce defensively in case future versions
 // hand us a plain string. Trailing slash lets Clawd concat cleanly:
@@ -436,10 +456,10 @@ function normalizeServerUrl(raw) {
 
 // Handle v2 permission.asked event — see Phase 2 Spike in
 // docs/plans/plan-opencode-integration.md. The payload has no sessionID in its
-// properties (only `id` = requestID), so we borrow _lastSessionId which is
-// kept fresh by session.*/message.part.updated events. Phase 1 dedup/state
-// machine logic does not run for permission events — they ride a parallel
-// channel and never translate to a Clawd state transition.
+// properties (only `id` = requestID), so we use _lastSeenSessionId (the most
+// recently seen session from state events) as a fallback, then _rootSessionId.
+// Phase 1 dedup/state machine logic does not run for permission events — they
+// ride a parallel channel and never translate to a Clawd state transition.
 function handlePermissionAsked(event) {
   const p = (event && event.properties) || {};
   const requestId = p.id;
@@ -449,11 +469,12 @@ function handlePermissionAsked(event) {
   }
   postPermissionToClawd({
     agent_id: AGENT_ID,
+    hook_source: HOOK_SOURCE,
     tool_name: p.permission || "unknown",
     tool_input: p.metadata || {},
     patterns: Array.isArray(p.patterns) ? p.patterns : [],
     always: Array.isArray(p.always) ? p.always : [],
-    session_id: _lastSessionId || "default",
+    session_id: resolveOpencodeSessionId(null, _lastSeenSessionId || _rootSessionId),
     request_id: requestId,
     server_url: _serverUrl,         // debug only, not used for replies
     bridge_url: _bridgeUrl,         // ← Clawd POSTs decisions here
@@ -583,11 +604,14 @@ export default async (ctx) => {
         // Phase 3: capture the root session on first sighting. Any later
         // sessionID is a subtask spawned by the parent's `task` tool, and
         // its session.idle will be downgraded to SessionEnd in translateEvent.
-        const sid = event.properties && event.properties.sessionID;
+        // The session ID may be in event.properties.sessionID (most events)
+        // or event.sessionID (session.created in some runtimes).
+        const sid = getEventSessionId(event);
         if (sid && !_rootSessionId) {
           _rootSessionId = sid;
           debugLog(`ROOT session captured id=${sid}`);
         }
+        if (sid) _lastSeenSessionId = sid;
 
         // Phase 2: permission.asked rides a parallel channel — forward to Clawd
         // and skip state translation. Clawd replies directly to opencode's own
@@ -609,7 +633,14 @@ export default async (ctx) => {
           }
           return;
         }
-        const sessionId = (event.properties && event.properties.sessionID) || "default";
+        if (shouldDropMappedEventWithoutSessionId(event, mapped)) {
+          debugLog(`DROP ${event.type} event=${mapped.event} reason=no-session-id`);
+          return;
+        }
+        const sessionId = resolveOpencodeSessionId(
+          getEventSessionId(event),
+          _lastSeenSessionId || _rootSessionId
+        );
         debugLog(`MAP ${event.type} → state=${mapped.state} event=${mapped.event}`);
         sendState(mapped.state, mapped.event, sessionId);
       } catch (err) {

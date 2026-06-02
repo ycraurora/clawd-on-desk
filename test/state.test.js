@@ -39,6 +39,7 @@ function makeCtx(overrides = {}) {
     resolvePermissionEntry: () => {},
     dismissPermissionsForDnd: () => {},
     focusTerminalWindow: () => {},
+    focusHostPlatform: "darwin",
     // Default: all pids dead
     processKill: () => { const e = new Error("ESRCH"); e.code = "ESRCH"; throw e; },
     getCursorScreenPoint: () => ({ x: 100, y: 100 }),
@@ -811,6 +812,56 @@ describe("updateSession()", () => {
     assert.ok(api.sessions.get("s1").updatedAt >= t1);
   });
 
+  it("defaulted Claude attribution does not overwrite a remembered agent id", () => {
+    api.updateSession("opencode-s1", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      cwd: "/repo",
+    });
+    api.updateSession("opencode-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+      agentIdDefaulted: true,
+    });
+
+    assert.strictEqual(api.sessions.get("opencode-s1").agentId, "opencode");
+  });
+
+  it("explicit attribution can replace a remembered agent id for a reused session id", () => {
+    api.updateSession("shared-s1", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      cwd: "/repo",
+    });
+    api.updateSession("shared-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+    });
+
+    assert.strictEqual(api.sessions.get("shared-s1").agentId, "claude-code");
+  });
+
+  it("defaulted Claude attribution is still used for new legacy sessions", () => {
+    api.updateSession("legacy-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+      agentIdDefaulted: true,
+    });
+
+    assert.strictEqual(api.sessions.get("legacy-s1").agentId, "claude-code");
+  });
+
+  it("opencode namespaced ids do not collide with bare Claude session ids", () => {
+    api.updateSession("opencode:shared-sid", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      sessionTitle: "hello",
+    });
+    api.updateSession("shared-sid", "attention", "Stop", {
+      agentId: "claude-code",
+      sessionTitle: "hi",
+    });
+
+    assert.strictEqual(api.sessions.get("opencode:shared-sid").agentId, "opencode");
+    assert.strictEqual(api.sessions.get("opencode:shared-sid").sessionTitle, "hello");
+    assert.strictEqual(api.sessions.get("shared-sid").agentId, "claude-code");
+    assert.strictEqual(api.sessions.get("shared-sid").sessionTitle, "hi");
+  });
+
   it("juggling + working (non-SubagentStop) → keeps juggling", () => {
     update(api, { id: "s1", state: "juggling", event: "SubagentStart" });
     assert.strictEqual(api.sessions.get("s1").state, "juggling");
@@ -906,6 +957,36 @@ describe("updateSession()", () => {
     });
   });
 
+  it("Codex Desktop focus metadata downgrades on Windows", () => {
+    api = require("../src/state")(makeCtx({ focusHostPlatform: "win32" }));
+
+    update(api, {
+      id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      agentPid: 456,
+      codexOriginator: "Codex Desktop",
+    });
+    update(api, {
+      id: "codex:019e115b-4df2-7ed0-b90e-8e6345aca777",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      codexOriginator: "Codex Desktop",
+    });
+
+    const byId = new Map(api.getLastSessionSnapshot().sessions.map((entry) => [entry.id, entry]));
+    assert.strictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
+    assert.deepStrictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
+      type: "terminal",
+      url: null,
+    });
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, false);
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, null);
+  });
+
   it("keeps wtHwnd sticky when later events do not provide one", () => {
     update(api, {
       id: "s1",
@@ -946,6 +1027,153 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.size, 20);
     assert.ok(api.sessions.has("codex:019e115a-4df2-7ed0-b90e-8e6345aca777"));
     assert.ok(!api.sessions.has("s0"));
+  });
+
+  it("Codex PermissionRequest without an existing session does not persist notification", () => {
+    update(api, {
+      id: "codex:new-permission",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+    });
+
+    assert.strictEqual(api.getCurrentState(), "notification");
+    assert.strictEqual(api.sessions.get("codex:new-permission").state, "idle");
+    assert.strictEqual(api.resolveDisplayState(), "idle");
+
+    mock.timers.tick(5000);
+
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("Codex transient PermissionRequest preserves focus without keeping a waiting tail", () => {
+    update(api, { id: "codex:native", state: "working", event: "PreToolUse", agentId: "codex" });
+
+    api.updateSession("codex:native", "notification", "PermissionRequest", {
+      agentId: "codex",
+      sourcePid: 456,
+      transientPermissionEvent: true,
+    });
+
+    const session = api.sessions.get("codex:native");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.sourcePid, 456);
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.ok(!session.recentEvents.some((entry) => entry.event === "PermissionRequest"));
+  });
+
+  it("stores one-shot visuals as idle while permission prompts preserve active work", () => {
+    update(api, { id: "notify", state: "notification", event: "Notification", agentId: "claude-code" });
+    assert.strictEqual(api.sessions.get("notify").state, "idle");
+
+    update(api, { id: "done", state: "attention", event: "Stop", agentId: "claude-code" });
+    assert.strictEqual(api.sessions.get("done").state, "idle");
+
+    update(api, { id: "perm-active", state: "working", event: "PreToolUse", agentId: "codex" });
+    update(api, {
+      id: "perm-active",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+    });
+
+    assert.strictEqual(api.sessions.get("perm-active").state, "working");
+  });
+
+  it("clearPermissionNotification releases a persisted notification session immediately", () => {
+    api.sessions.set("codex:stale-permission", rawSession("notification", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+    }));
+    api.setState("notification");
+
+    assert.strictEqual(api.getCurrentState(), "notification");
+
+    assert.strictEqual(api.clearPermissionNotification("codex:stale-permission"), true);
+
+    assert.strictEqual(api.sessions.get("codex:stale-permission").state, "idle");
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("clearPermissionNotification removes a resolved PermissionRequest tail event", () => {
+    update(api, { id: "perm-active", state: "working", event: "PreToolUse", agentId: "codex" });
+    update(api, {
+      id: "perm-active",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+    });
+
+    assert.strictEqual(api.sessions.get("perm-active").recentEvents.at(-1).event, "PermissionRequest");
+
+    assert.strictEqual(api.clearPermissionNotification("perm-active"), true);
+
+    const session = api.sessions.get("perm-active");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.strictEqual(api.resolveDisplayState(), "working");
+  });
+
+  it("clearPermissionNotification restores Codex work state after stale idle downgrade", () => {
+    api.sessions.set("codex:stale-approved", rawSession("idle", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 360000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 350000 },
+      ],
+    }));
+
+    assert.strictEqual(api.clearPermissionNotification("codex:stale-approved"), true);
+
+    const session = api.sessions.get("codex:stale-approved");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.strictEqual(api.getCurrentState(), "working");
+  });
+
+  it("clearPermissionNotification keeps the tail while another permission is pending", () => {
+    api.sessions.set("codex:stacked", rawSession("working", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 2000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 1000 },
+      ],
+    }));
+
+    assert.strictEqual(
+      api.clearPermissionNotification("codex:stacked", { hasPendingForSession: true }),
+      false,
+    );
+
+    const session = api.sessions.get("codex:stacked");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PermissionRequest");
+  });
+
+  it("clearPermissionNotification also strips a resolved remote Codex tail", () => {
+    api.sessions.set("codex:remote-approved", rawSession("idle", {
+      agentId: "codex",
+      host: "ssh://devbox",
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 360000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 350000 },
+      ],
+    }));
+
+    assert.strictEqual(api.clearPermissionNotification("codex:remote-approved"), true);
+
+    const session = api.sessions.get("codex:remote-approved");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
   });
 
   it("SessionEnd + sweeping → plays sweeping even with other active sessions", () => {

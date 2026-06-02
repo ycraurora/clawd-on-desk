@@ -18,11 +18,14 @@ CHANGELOG-draft.md
 docs/**
 !docs/guides/
 !docs/guides/copilot-setup.md
+!docs/guides/copilot-setup.zh-CN.md
 !docs/guides/guide-theme-creation.md
 !docs/guides/known-limitations.md
 !docs/guides/known-limitations.zh-CN.md
 !docs/guides/setup-guide.md
 !docs/guides/setup-guide.zh-CN.md
+!docs/guides/guide-remote-ssh.md
+!docs/guides/guide-remote-ssh.zh-CN.md
 !docs/guides/state-mapping.md
 !docs/guides/state-mapping.zh-CN.md
 !docs/guides/telegram-approval.md
@@ -52,6 +55,7 @@ docs/**
 
 # Temp files from testing
 .tmp_*
+.tmp-*
 *.tmp
 
 # Root-level scratch files (tmp-*.md / tmp-*.json / tmp-*.sh etc.)

@@ -164,6 +164,9 @@ function registerSettingsIpc(options = {}) {
     if (!payload || typeof payload !== "object") {
       return { status: "error", message: "settings:update payload must be { key, value }" };
     }
+    if (payload.key === "tgMigration") {
+      return { status: "error", message: "tgMigration is internal; use telegramMigration.dispatch" };
+    }
     return settingsController.applyUpdate(payload.key, payload.value);
   });
   handle("settings:begin-size-preview", () => settingsSizePreviewSession.begin());
@@ -390,6 +393,12 @@ function registerSettingsIpc(options = {}) {
     } catch (err) {
       console.warn("Clawd: failed to read about hero SVG:", err && err.message);
     }
+    let pendingUpdateVersion = "";
+    let autoUpdateCheck = true;
+    try {
+      pendingUpdateVersion = String(settingsController.get("pendingUpdateVersion") || "");
+      autoUpdateCheck = settingsController.get("autoUpdateCheck") !== false;
+    } catch {}
     return {
       version: app.getVersion(),
       repoUrl: "https://github.com/rullerzhou-afk/clawd-on-desk",
@@ -398,6 +407,8 @@ function registerSettingsIpc(options = {}) {
       authorName: "Ruller_Lulu / \u9e7f\u9e7f",
       authorUrl: "https://github.com/rullerzhou-afk",
       heroSvgContent,
+      pendingUpdateVersion,
+      autoUpdateCheck,
     };
   });
 

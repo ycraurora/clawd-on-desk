@@ -168,11 +168,55 @@ describe("server-route-state POST", () => {
         codexSource: "vscode",
         displayHint: "display.svg",
         sessionTitle: "Work title",
+        assistantLastOutput: null,
+        assistantLastOutputTruncated: false,
         permissionSuspect: true,
         preserveState: true,
         hookSource: "codex-official",
       },
     ]]);
+  });
+
+  it("passes assistant last output metadata to updateSession", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "attention",
+      session_id: "sid",
+      event: "Stop",
+      assistant_last_output: "  Done.\nsecret=abc123  ",
+      assistant_last_output_truncated: true,
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutput, "Done.\nsecret=abc123");
+    assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutputTruncated, true);
+  });
+
+  it("marks missing agent_id as a defaulted Claude Code attribution", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "legacy-sid",
+      event: "PreToolUse",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    const opts = res.calls.updateSession[0][3];
+    assert.strictEqual(opts.agentId, "claude-code");
+    assert.strictEqual(opts.agentIdDefaulted, true);
+  });
+
+  it("infers opencode from hook_source when agent_id is missing", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "opencode-sid",
+      event: "PreToolUse",
+      hook_source: "opencode-plugin",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    const opts = res.calls.updateSession[0][3];
+    assert.strictEqual(opts.agentId, "opencode");
+    assert.strictEqual(opts.hookSource, "opencode-plugin");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(opts, "agentIdDefaulted"), false);
   });
 
   it("uses basename for explicit svg state overrides", async () => {

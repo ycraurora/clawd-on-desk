@@ -59,8 +59,10 @@ function createHarness(options = {}) {
     refreshUpdateBubbleAutoClose: () => calls.push(["refreshUpdateBubbleAutoClose"]),
     repositionFloatingBubbles: () => calls.push(["repositionFloatingBubbles"]),
     syncSessionHudVisibility: () => calls.push(["syncSessionHudVisibility"]),
+    handleSessionHudPinnedChanged: (next) => calls.push(["handleSessionHudPinnedChanged", next]),
     reclampPetAfterEdgePinningChange: () => calls.push(["reclampPetAfterEdgePinningChange"]),
     rebuildAllMenus: () => calls.push(["rebuildAllMenus"]),
+    reconcilePowerSaveBlocker: () => calls.push(["reconcilePowerSaveBlocker"]),
     logWarn: (...args) => logs.push(args),
     ...(options.routerOptions || {}),
   });
@@ -139,6 +141,23 @@ describe("settings-effect-router", () => {
     ]);
   });
 
+  it("reconciles the power save blocker when keepAwakeWhileWorking changes", () => {
+    const { calls, emit } = createHarness();
+
+    emit({ keepAwakeWhileWorking: true });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { keepAwakeWhileWorking: true }],
+      ["reconcilePowerSaveBlocker"],
+    ]);
+
+    calls.length = 0;
+    emit({ keepAwakeWhileWorking: false });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { keepAwakeWhileWorking: false }],
+      ["reconcilePowerSaveBlocker"],
+    ]);
+  });
+
   it("routes language, session alias, and session HUD effects", () => {
     const { calls, emit } = createHarness();
 
@@ -183,17 +202,27 @@ describe("settings-effect-router", () => {
     ]);
 
     calls.length = 0;
-    emit({ sessionHudAutoHide: true });
-    assert.deepStrictEqual(calls, [
-      ["updateMirrors", { sessionHudAutoHide: true }],
-      ["syncSessionHudVisibility"],
-      ["repositionFloatingBubbles"],
-    ]);
-
-    calls.length = 0;
     emit({ sessionHudPinned: true });
     assert.deepStrictEqual(calls, [
       ["updateMirrors", { sessionHudPinned: true }],
+      ["handleSessionHudPinnedChanged", true],
+    ]);
+
+    calls.length = 0;
+    emit({ sessionHudPinned: false });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { sessionHudPinned: false }],
+      ["handleSessionHudPinnedChanged", false],
+    ]);
+  });
+
+  it("orders combined HUD changes as handlePinnedChanged before generic sync", () => {
+    const { calls, emit } = createHarness();
+
+    emit({ sessionHudPinned: true, sessionHudEnabled: true });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { sessionHudPinned: true, sessionHudEnabled: true }],
+      ["handleSessionHudPinnedChanged", true],
       ["syncSessionHudVisibility"],
       ["repositionFloatingBubbles"],
     ]);

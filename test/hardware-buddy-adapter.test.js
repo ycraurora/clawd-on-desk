@@ -8,6 +8,9 @@ const path = require("node:path");
 const {
   createHardwareBuddyAdapter,
   isEnabledFromEnv,
+  classifyHardwareBuddyIssue,
+  sanitizeHardwareBuddyPayload,
+  buildSidecarSpawnOptions,
 } = require("../src/hardware-buddy-adapter");
 
 class FakeSidecarClient {
@@ -273,6 +276,34 @@ describe("hardware buddy adapter", () => {
     }), false);
   });
 
+  it("defaults the development hardware core checkout to clawstick", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "src", "hardware-buddy-adapter.js"), "utf8");
+    assert.match(source, /path\.resolve\(__dirname,\s*"\.\.",\s*"\.\.",\s*"clawstick"\)/);
+    assert.doesNotMatch(source, /ClaudeBuddy/);
+  });
+
+  it("sanitizes unpaired surrogates in hardware payload strings", () => {
+    const sanitized = sanitizeHardwareBuddyPayload({
+      msg: "run \udcae now",
+      entries: ["ok \ud83d\ude80", "bad \udcad"],
+      prompt: { tool: "\udcaeBash", hint: "file \ud800" },
+    });
+
+    assert.deepStrictEqual(sanitized, {
+      msg: "run \ufffd now",
+      entries: ["ok \ud83d\ude80", "bad \ufffd"],
+      prompt: { tool: "\ufffdBash", hint: "file \ufffd" },
+    });
+  });
+
+  it("starts the Python sidecar with replacement stdout encoding", () => {
+    const env = buildSidecarSpawnOptions({ spawnOptions: { env: { EXTRA: "1" } } }, { PATH: "bin" }).env;
+
+    assert.strictEqual(env.PATH, "bin");
+    assert.strictEqual(env.EXTRA, "1");
+    assert.strictEqual(env.PYTHONIOENCODING, "utf-8:replace");
+  });
+
   it("does not load or start core modules when disabled", () => {
     resetFakes();
     const adapter = createHardwareBuddyAdapter({
@@ -286,6 +317,29 @@ describe("hardware buddy adapter", () => {
     assert.strictEqual(adapter.start(), false);
     assert.strictEqual(FakeSidecarClient.instances.length, 0);
     assert.strictEqual(FakeHardwareBuddyController.instances.length, 0);
+  });
+
+  it("reports a missing Clawstick core checkout without throwing during startup", () => {
+    resetFakes();
+    const adapter = createHardwareBuddyAdapter({
+      settings: {
+        enabled: true,
+        backend: "bleak",
+        address: "",
+        namePrefix: "Clawstick",
+        permissionsEnabled: false,
+      },
+      coreRoot: path.join(__dirname, "missing-clawstick-core"),
+    });
+
+    assert.strictEqual(adapter.start(), false);
+    assert.strictEqual(adapter.isStarted(), false);
+    assert.strictEqual(adapter.getSidecar(), null);
+    assert.strictEqual(adapter.getController(), null);
+    const status = adapter.getStatus();
+    assert.strictEqual(status.lastError.category, "core_missing");
+    assert.strictEqual(status.lastError.retryable, false);
+    assert.match(status.lastError.hint, /github\.com\/rullerzhou-afk\/clawstick/);
   });
 
   it("starts state-only controller and suppresses pending permissions by default", () => {
@@ -395,6 +449,31 @@ describe("hardware buddy adapter", () => {
 
     sidecar.setSecure(false);
     assert.ok(!Object.prototype.hasOwnProperty.call(sidecar.lastSent().snapshot, "prompt"));
+    adapter.stop();
+  });
+
+  it("sanitizes prompt snapshots before writing to the sidecar transport", () => {
+    resetFakes();
+    const perm = { toolName: "Bash \udcae" };
+    const adapter = createHardwareBuddyAdapter({
+      env: { CLAWD_HARDWARE_BUDDY: "1" },
+      permissionsEnabled: true,
+      coreModules: {
+        HardwareBuddyController: PromptingHardwareBuddyController,
+        SidecarClient: FakeSidecarClient,
+      },
+      getPendingPermissions: () => [perm],
+      resolvePermissionEntry: () => {},
+    });
+
+    adapter.start();
+    const sidecar = FakeSidecarClient.instances[0];
+    sidecar.setConnected(true);
+    sidecar.setSecure(true);
+
+    assert.strictEqual(sidecar.lastSent().snapshot.msg, "approve: Bash \ufffd");
+    assert.strictEqual(sidecar.lastSent().snapshot.prompt.tool, "Bash \ufffd");
+    assert.doesNotMatch(JSON.stringify(sidecar.lastSent().snapshot), /\\udcae/i);
     adapter.stop();
   });
 
@@ -863,6 +942,18 @@ describe("hardware buddy adapter", () => {
     assert.strictEqual(status.lastError.category, "missing_bleak");
     assert.strictEqual(status.lastError.retryable, false);
     assert.strictEqual(fakeTimers.timers.filter((timer) => !timer.cleared).length, 1);
+  });
+
+  it("classifies Windows canceled BLE prompts as pairing required", () => {
+    const issue = classifyHardwareBuddyIssue({
+      code: "UNHANDLED",
+      message: "[WinError -2147023673] \u64cd\u4f5c\u5df2\u88ab\u7528\u6237\u53d6\u6d88\u3002",
+    });
+
+    assert.strictEqual(issue.code, "AUTH_REQUIRED");
+    assert.strictEqual(issue.category, "auth_required");
+    assert.strictEqual(issue.retryable, true);
+    assert.match(issue.hint, /accept the connection prompt/);
   });
 
   it("passes the fake secure setting through to the sidecar", () => {

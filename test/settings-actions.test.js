@@ -6,6 +6,7 @@ const assert = require("node:assert");
 const {
   updateRegistry,
   commandRegistry,
+  MANAGED_CLEANUP_AGENT_IDS,
   requireBoolean,
   requireFiniteNumber,
   requireEnum,
@@ -78,7 +79,7 @@ describe("updateRegistry pure-data validators", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
       "sessionHudEnabled", "sessionHudShowElapsed", "sessionHudCleanupDetached",
-      "sessionHudShowStateLabels", "sessionHudAutoHide", "sessionHudPinned",
+      "sessionHudShowStateLabels", "sessionHudPinned",
       "miniMode", "openAtLoginHydrated", "soundMuted", "bubbleFollowPet",
       "hideBubbles", "permissionBubblesEnabled", "lowPowerIdleMode",
       "allowEdgePinning", "keepSizeAcrossDisplays",
@@ -222,6 +223,19 @@ describe("updateRegistry pure-data validators", () => {
       enabled: true,
       allowedTgUserId: "123456789",
       targetSessionKey: "telegram:0",
+    }, deps).status, "error");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "full",
+      r3DirectSendEnabled: true,
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "summary",
     }, deps).status, "error");
   });
 
@@ -487,6 +501,59 @@ describe("telegram approval commands", () => {
 
     const missing = await commandRegistry["telegramApproval.tokenInfo"](null, {});
     assert.equal(missing.status, "error");
+  });
+
+  it("telegramApproval.deleteTokenFile proxies the guarded main-process helper", async () => {
+    const calls = [];
+    const result = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => {
+        calls.push(true);
+        return { status: "ok", deleted: true };
+      },
+    });
+    assert.deepStrictEqual(result, { status: "ok", deleted: true });
+    assert.deepStrictEqual(calls, [true]);
+
+    const guarded = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => ({
+        status: "error",
+        code: "TOKEN_FILE_IN_USE",
+        message: "Native Telegram currently uses the shared token file.",
+      }),
+    });
+    assert.strictEqual(guarded.status, "error");
+    assert.strictEqual(guarded.code, "TOKEN_FILE_IN_USE");
+
+    const missing = await commandRegistry["telegramApproval.deleteTokenFile"](null, {});
+    assert.equal(missing.status, "error");
+  });
+
+  it("telegramMigration.dispatch only accepts renderer-callable user events", async () => {
+    const calls = [];
+    const deps = {
+      telegramMigration: {
+        getSnapshot: () => ({ state: "TESTING_NATIVE" }),
+        dispatch: async (event) => {
+          calls.push(event);
+          return { ok: true, state: "TESTING_NATIVE" };
+        },
+      },
+    };
+
+    const allowed = await commandRegistry["telegramMigration.dispatch"](
+      { type: "USER_TEST_NATIVE" },
+      deps,
+    );
+    assert.strictEqual(allowed.status, "ok");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
+
+    const blocked = await commandRegistry["telegramMigration.dispatch"](
+      { type: "TEST_SUCCESS", at: 123 },
+      deps,
+    );
+    assert.strictEqual(blocked.status, "error");
+    assert.strictEqual(blocked.errorCode, "EVENT_NOT_ALLOWED");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
   });
 });
 
@@ -775,6 +842,33 @@ describe("hook commands", () => {
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
   });
+
+  it("cleanupIntegrations disables all managed agents before running cleanup", async () => {
+    const calls = [];
+    const snapshot = prefs.getDefaults();
+    const result = await commandRegistry.cleanupIntegrations(null, {
+      snapshot,
+      stopIntegrationForAgent: (agentId) => calls.push(["stopIntegration", agentId]),
+      stopMonitorForAgent: (agentId) => calls.push(["stopMonitor", agentId]),
+      clearSessionsByAgent: (agentId) => calls.push(["clearSessions", agentId]),
+      dismissPermissionsByAgent: (agentId) => calls.push(["dismissPermissions", agentId]),
+      cleanupIntegrations: (options) => {
+        calls.push(["cleanup", options.source]);
+        return {
+          mode: "apply",
+          summary: { agentsChecked: 14, agentsAffected: 2, entriesRemoved: 3, skipped: 12, failed: 0 },
+        };
+      },
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.cleanup.summary.entriesRemoved, 3);
+    for (const agentId of MANAGED_CLEANUP_AGENT_IDS) {
+      assert.strictEqual(result.commit.agents[agentId].enabled, false, `${agentId} should be disabled`);
+    }
+    assert.deepStrictEqual(calls.at(-1), ["cleanup", "about"]);
+    assert.deepStrictEqual(calls[0], ["stopIntegration", "claude-code"]);
+  });
 });
 
 describe("doctor repair commands", () => {
@@ -808,16 +902,18 @@ describe("doctor repair commands", () => {
     assert.deepStrictEqual(calls, [{ agentId: "codex", options: { forceCodexHooksFeature: true } }]);
   });
 
-  it("rejects Copilot CLI because it is manual-only", async () => {
+  it("accepts Copilot CLI through the standard auto-repair path", async () => {
     const calls = [];
     const r = await commandRegistry.repairAgentIntegration({ agentId: "copilot-cli" }, {
       snapshot: prefs.getDefaults(),
-      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+      repairIntegrationForAgent: (agentId) => {
+        calls.push(agentId);
+        return { status: "ok", added: 10, updated: 0 };
+      },
     });
 
-    assert.strictEqual(r.status, "error");
-    assert.match(r.message, /manual/i);
-    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, ["copilot-cli"]);
   });
 
   it("does not repair disabled agents", async () => {

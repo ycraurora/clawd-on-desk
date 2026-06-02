@@ -15,6 +15,7 @@ const EVENT_LABEL_KEYS = {
   AfterAgent: "eventLabelAfterAgent",
   Stop: "eventLabelStop",
   StopFailure: "eventLabelStopFailure",
+  ApiError: "eventLabelApiError",
   SubagentStart: "eventLabelSubagentStart",
   SubagentStop: "eventLabelSubagentStop",
   PreCompress: "eventLabelPreCompress",
@@ -53,6 +54,17 @@ function sessionUpdatedAt(session) {
   return Number.isFinite(updatedAt) ? updatedAt : 0;
 }
 
+// A persisted session counts as "in progress" when it is non-headless and its
+// stored state is anything other than idle/sleeping (mirrors deriveSessionBadge's
+// "running" semantics). One-shot visuals like attention/notification are
+// normally stored as idle by updateSession(); permission prompts stay awake by
+// preserving the prior working/thinking state.
+function isSessionInProgress(session) {
+  if (!session || session.headless) return false;
+  if (session.state === "idle" || session.state === "sleeping") return false;
+  return true;
+}
+
 function deriveSessionBadge(session) {
   if (!session) return "idle";
   if (session.state !== "idle" && session.state !== "sleeping") return "running";
@@ -61,7 +73,7 @@ function deriveSessionBadge(session) {
   const events = Array.isArray(session.recentEvents) ? session.recentEvents : [];
   const latest = events.length ? events[events.length - 1] : null;
   const latestEvent = latest && latest.event;
-  if (latestEvent === "StopFailure" || latestEvent === "PostToolUseFailure") return "interrupted";
+  if (latestEvent === "StopFailure" || latestEvent === "PostToolUseFailure" || latestEvent === "ApiError") return "interrupted";
   if (isDoneEvent(latestEvent)) return "done";
   return "idle";
 }
@@ -158,7 +170,9 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
   const state = (session && session.state) || "idle";
   const hiddenFromHud = shouldAutoClearDetachedSession(session, badge, options);
   const focusTarget = session && !session.headless && state !== "sleeping" && !hiddenFromHud
-    ? getSessionFocusTarget({ ...(session || {}), id })
+    ? getSessionFocusTarget({ ...(session || {}), id }, {
+      osPlatform: options.focusHostPlatform || options.osPlatform,
+    })
     : { canFocus: false, type: null, url: null };
   return {
     id,
@@ -174,6 +188,7 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     updatedAt: sessionUpdatedAt(session),
     sourcePid: (session && session.sourcePid) || null,
     wtHwnd: (session && session.wtHwnd) || null,
+    editor: (session && session.editor) || null,
     canFocus: focusTarget.canFocus === true,
     focusTarget: focusTarget.type ? { type: focusTarget.type, url: focusTarget.url || null } : null,
     host: (session && session.host) || null,
@@ -183,6 +198,10 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     provider: (session && session.provider) || null,
     codexOriginator: (session && session.codexOriginator) || null,
     codexSource: (session && session.codexSource) || null,
+    assistantLastOutput: (session && typeof session.assistantLastOutput === "string")
+      ? session.assistantLastOutput
+      : null,
+    assistantLastOutputTruncated: !!(session && session.assistantLastOutputTruncated === true),
     lastEvent: latestEvent ? {
       labelKey: rawEvent ? (EVENT_LABEL_KEYS[rawEvent] || null) : null,
       rawEvent,
@@ -291,6 +310,8 @@ function sessionSnapshotSignature(snapshot) {
       provider: entry.provider,
       codexOriginator: entry.codexOriginator,
       codexSource: entry.codexSource,
+      assistantLastOutput: entry.assistantLastOutput,
+      assistantLastOutputTruncated: !!entry.assistantLastOutputTruncated,
       lastEventLabelKey: entry.lastEvent ? entry.lastEvent.labelKey : null,
       lastEventRawEvent: entry.lastEvent ? entry.lastEvent.rawEvent : null,
       lastEventAt: entry.lastEvent ? entry.lastEvent.at : null,
@@ -304,6 +325,7 @@ module.exports = {
   SESSION_TITLE_MAX,
   normalizeTitle,
   sessionUpdatedAt,
+  isSessionInProgress,
   deriveSessionBadge,
   shouldAutoClearDetachedSession,
   getSessionAliasEntry,

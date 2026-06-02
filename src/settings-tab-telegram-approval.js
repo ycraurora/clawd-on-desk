@@ -33,6 +33,14 @@
       enabled: !!(cfg && cfg.enabled),
       allowedTgUserId: cfg && typeof cfg.allowedTgUserId === "string" ? cfg.allowedTgUserId : "",
       targetSessionKey: cfg && typeof cfg.targetSessionKey === "string" ? cfg.targetSessionKey : "",
+      // Preserve notifyOnComplete across saves: recipient/toggle payloads are
+      // built from this object, so omitting it would let normalize() reset a
+      // user's explicit bare-ping choice on the next save.
+      notifyOnComplete: !!(cfg && cfg.notifyOnComplete === true),
+      completionOutputMode: !cfg || cfg.completionOutputMode === undefined || cfg.completionOutputMode === "full"
+        ? "full"
+        : (cfg.completionOutputMode === "tail" ? "full" : "off"),
+      r3DirectSendEnabled: !!(cfg && cfg.r3DirectSendEnabled === true),
     };
   }
 
@@ -117,6 +125,7 @@
     const s = status && typeof status === "object" ? status : {};
     return [
       s.status || "",
+      s.transport || "",
       s.enabled === true ? "1" : "0",
       s.configured === true ? "1" : "0",
       s.reason || "",
@@ -143,10 +152,246 @@
     subtitle.textContent = t("remoteApprovalSubtitle");
     parent.appendChild(subtitle);
 
+    // v0.9.0 migration: native vs sidecar transport selector. Lives ABOVE the
+    // legacy Telegram card so users see migration progress before the legacy
+    // setup steps.
+    parent.appendChild(buildTelegramMigrationCard());
+
     // Each remote approval channel renders as its own collapsible card so the
     // page can stay tidy as external approval channels grow.
     parent.appendChild(buildTelegramChannelCard());
     parent.appendChild(buildHardwareBuddyChannelCard());
+  }
+
+  // ── v0.9.0 migration card ──────────────────────────────────────────────────
+  let migrationSnapshot = null;
+  let migrationCardEl = null;
+  let migrationPending = false;
+  let migrationSnapshotSeq = 0;
+
+  function migrationState() {
+    return migrationSnapshot && typeof migrationSnapshot.state === "string"
+      ? migrationSnapshot.state
+      : "";
+  }
+
+  function isNativeMigrationSelected() {
+    const s = migrationState();
+    return s === "NATIVE_ACTIVE"
+      || s === "TESTING_NATIVE"
+      || !!(migrationSnapshot && migrationSnapshot.transport === "native");
+  }
+
+  function isNativeMigrationActive() {
+    const s = migrationState();
+    const owner = migrationSnapshot && migrationSnapshot.ownerSnapshot
+      ? migrationSnapshot.ownerSnapshot
+      : {};
+    return s === "NATIVE_ACTIVE" || s === "TESTING_NATIVE" || owner.nativePolling === true;
+  }
+
+  function canStartNativeFromSwitch() {
+    const s = migrationState();
+    return s === "IDLE" || s === "NEEDS_SETUP" || s === "LEGACY_ACTIVE";
+  }
+
+  function statusIndicatesNativeApprovalActive() {
+    const s = view.status || {};
+    return s.transport === "native"
+      && (s.enabled === true || s.status === "running" || s.status === "starting");
+  }
+
+  function effectiveTelegramApprovalEnabled(cfg) {
+    return !!(cfg && cfg.enabled) || isNativeMigrationActive() || statusIndicatesNativeApprovalActive();
+  }
+
+  function migrationSnapshotRenderKey(snapshot) {
+    const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
+    const owner = snap.ownerSnapshot && typeof snap.ownerSnapshot === "object"
+      ? snap.ownerSnapshot
+      : {};
+    return [
+      snap.state || "",
+      snap.transport || "",
+      owner.nativePolling === true ? "1" : "0",
+      owner.sidecarRunning === true ? "1" : "0",
+      snap.nativeVerifiedAt || "",
+    ].join("\x1f");
+  }
+
+  function buildTelegramMigrationCard() {
+    migrationCardEl = document.createElement("div");
+    migrationCardEl.className = "tg-migration-card";
+    renderMigrationCard();
+    refreshMigrationSnapshot();
+    return migrationCardEl;
+  }
+
+  function refreshMigrationSnapshot() {
+    if (migrationPending) return;
+    const seq = ++migrationSnapshotSeq;
+    callCommand("telegramMigration.snapshot").then((res) => {
+      if (seq !== migrationSnapshotSeq || migrationPending) return;
+      if (res && res.status === "ok") {
+        const previousKey = migrationSnapshotRenderKey(migrationSnapshot);
+        migrationSnapshot = res.snapshot;
+        renderMigrationCard();
+        if (migrationSnapshotRenderKey(migrationSnapshot) !== previousKey
+          && state.activeTab === "telegram-approval") {
+          ops.requestRender({ content: true });
+        }
+      }
+    });
+  }
+
+  function migrationDispatch(eventType, extra = {}) {
+    if (migrationPending) return;
+    migrationPending = true;
+    renderMigrationCard();
+    callCommand("telegramMigration.dispatch", { type: eventType, ...extra }).then((res) => {
+      migrationPending = false;
+      if (res && res.snapshot) migrationSnapshot = res.snapshot;
+      if (res && res.status !== "ok" && res.errorCode) {
+        ops.showToast(`Telegram migration: ${res.errorCode}`, { error: true });
+      }
+      renderMigrationCard();
+      // Status of the legacy sidecar may change as a side-effect (start/stop).
+      refreshStatus({ forceRender: true });
+    });
+  }
+
+  function renderMigrationCard() {
+    if (!migrationCardEl) return;
+    migrationCardEl.innerHTML = "";
+    const snap = migrationSnapshot;
+    if (!snap) {
+      migrationCardEl.textContent = "Loading migration status…";
+      return;
+    }
+    const state = snap.state;
+    const title = document.createElement("h3");
+    title.textContent = "Telegram bot transport (v0.9.0 spike)";
+    migrationCardEl.appendChild(title);
+
+    const stateLine = document.createElement("p");
+    stateLine.className = "tg-migration-state";
+    stateLine.textContent = `State: ${state}` +
+      (snap.runtimeStatus && snap.runtimeStatus.status === "failed"
+        ? ` (runtime: failed — ${snap.runtimeStatus.reason || "unknown"})`
+        : "");
+    migrationCardEl.appendChild(stateLine);
+
+    const ownerLine = document.createElement("p");
+    ownerLine.className = "tg-migration-owner";
+    const o = snap.ownerSnapshot || {};
+    ownerLine.textContent = `Owner: sidecar=${o.sidecarRunning ? "running" : "stopped"}, native=${o.nativePolling ? "polling" : "stopped"}`;
+    migrationCardEl.appendChild(ownerLine);
+
+    const body = document.createElement("div");
+    body.className = "tg-migration-body";
+    migrationCardEl.appendChild(body);
+
+    const importErr = snap.migrationInfo && snap.migrationInfo.importError;
+    if (importErr && state === "LEGACY_ACTIVE") {
+      const banner = document.createElement("div");
+      banner.className = "tg-migration-banner";
+      banner.textContent = `Native config import failed: ${importErr}`;
+      body.appendChild(banner);
+      body.appendChild(migrationButton("Retry import", () =>
+        migrationDispatch("USER_TEST_NATIVE")));
+    }
+
+    switch (state) {
+      case "IDLE":
+      case "NEEDS_SETUP":
+        body.appendChild(migrationCopy(
+          "Configure the Telegram bot below, then choose how to run it:",
+        ));
+        body.appendChild(migrationButton("Test native bot and switch", () =>
+          migrationDispatch("USER_TEST_NATIVE")));
+        body.appendChild(migrationButton("Enable legacy sidecar", () =>
+          migrationDispatch("USER_ENABLE_LEGACY")));
+        break;
+      case "LEGACY_ACTIVE":
+        if (snap.runtimeStatus && snap.runtimeStatus.status === "failed") {
+          body.appendChild(migrationCopy("Legacy sidecar failed to start."));
+          body.appendChild(migrationButton("Retry legacy sidecar", () =>
+            migrationDispatch("USER_ENABLE_LEGACY")));
+        }
+        if (!snap.nativeVerifiedAt) {
+          body.appendChild(migrationCopy(
+            "Native Telegram bot is available. Test it to switch over — legacy stays as fallback.",
+          ));
+          body.appendChild(migrationButton("Test native and switch", () =>
+            migrationDispatch("USER_TEST_NATIVE")));
+        } else {
+          body.appendChild(migrationCopy("Legacy sidecar is active."));
+        }
+        body.appendChild(migrationButton("Disable Telegram approval", () =>
+          migrationDispatch("USER_DISABLE")));
+        break;
+      case "TESTING_NATIVE":
+        body.appendChild(migrationCopy("Waiting for your Telegram tap… (60s timeout)"));
+        break;
+      case "NATIVE_ACTIVE":
+        body.appendChild(migrationCopy(
+          "Native Telegram is active. Legacy files kept for rollback.",
+        ));
+        body.appendChild(migrationButton("Roll back to legacy", () =>
+          migrationDispatch("USER_ROLLBACK_TO_LEGACY")));
+        body.appendChild(migrationButton("Delete legacy token file", deleteLegacyTokenFile));
+        body.appendChild(migrationButton("Disable Telegram approval", () =>
+          migrationDispatch("USER_DISABLE")));
+        break;
+      case "SWITCHING_TO_LEGACY":
+        body.appendChild(migrationCopy("Switching to legacy approval…"));
+        break;
+    }
+    if (migrationPending) {
+      const pending = document.createElement("p");
+      pending.className = "tg-migration-pending";
+      pending.textContent = "Working…";
+      migrationCardEl.appendChild(pending);
+    }
+  }
+
+  function migrationCopy(text) {
+    const p = document.createElement("p");
+    p.className = "tg-migration-copy";
+    p.textContent = text;
+    return p;
+  }
+
+  function migrationButton(label, handler) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tg-migration-btn";
+    btn.textContent = label;
+    btn.disabled = migrationPending;
+    btn.addEventListener("click", handler);
+    return btn;
+  }
+
+  function deleteLegacyTokenFile() {
+    if (migrationPending) return;
+    migrationPending = true;
+    renderMigrationCard();
+    callCommand("telegramApproval.deleteTokenFile").then((res) => {
+      migrationPending = false;
+      if (res && res.status === "ok") {
+        ops.showToast(res.deleted === false
+          ? "Telegram token file was already removed."
+          : "Telegram token file deleted.");
+      } else {
+        ops.showToast((res && res.message) || "Telegram token file delete failed", { error: true });
+      }
+      view.tokenInfo = null;
+      view.status = null;
+      renderMigrationCard();
+      refreshTokenInfo({ forceRender: true });
+      refreshStatus({ forceRender: true });
+      refreshMigrationSnapshot();
+    });
   }
 
   function buildTelegramChannelCard() {
@@ -432,6 +677,9 @@
         // `telegram:` prefix. Private-chat scenarios always have chat_id ===
         // user_id in Telegram, so this is correct for the supported path.
         targetSessionKey: raw,
+        notifyOnComplete: currentConfig().notifyOnComplete,
+        completionOutputMode: currentConfig().completionOutputMode,
+        r3DirectSendEnabled: currentConfig().r3DirectSendEnabled,
       });
     });
 
@@ -455,6 +703,8 @@
       rows.push(buildPrerequisitesRow({ tokenConfigured, recipientConfigured }));
     }
     rows.push(buildEnabledRow({ ready }));
+    rows.push(buildCompletionOutputRow());
+    rows.push(buildDirectSendRow({ ready }));
     rows.push(buildTestRow({ ready }));
     return helpers.buildSection(t("telegramApprovalStep3Title"), rows);
   }
@@ -481,6 +731,7 @@
 
   function buildEnabledRow({ ready }) {
     const cfg = currentConfig();
+    const effectiveEnabled = effectiveTelegramApprovalEnabled(cfg);
     const row = document.createElement("div");
     row.className = "row";
     if (!ready) row.classList.add("tg-approval-row-disabled");
@@ -503,13 +754,36 @@
     sw.className = "switch";
     sw.setAttribute("role", "switch");
     sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, cfg.enabled, { pending: view.configPending });
-    if (!ready) {
+    helpers.setSwitchVisual(sw, effectiveEnabled, { pending: view.configPending || migrationPending });
+    const canToggle = ready && !migrationPending && (effectiveEnabled || migrationSnapshot);
+    if (!canToggle) {
       sw.classList.add("disabled");
       sw.setAttribute("aria-disabled", "true");
       sw.removeAttribute("tabindex");
     } else {
-      const toggle = () => saveConfig({ ...cfg, enabled: !cfg.enabled }, { resetDraft: false });
+      const toggle = () => {
+        const turningOff = effectiveEnabled === true;
+        // Stop-the-bleed (zombie switch — see docs audit-r1a-notification-switch-2026-05-30):
+        // this toggle only writes tgApproval.enabled, but v0.9.0 native runtime
+        // (completion notifications + approval transport) is owned by the migration
+        // state machine and never reads that field. Turning the switch OFF must also
+        // dispatch USER_DISABLE, otherwise the native poller + completion pings keep
+        // running and the user thinks they switched it off when they didn't. The
+        // ON path now goes through the same native Test flow as the migration
+        // card instead of reviving the legacy sidecar flag.
+        if (turningOff) {
+          if (cfg.enabled === true) {
+            saveConfig({ ...cfg, enabled: false }, { resetDraft: false });
+          }
+          migrationDispatch("USER_DISABLE");
+          return;
+        }
+        if (migrationSnapshot && canStartNativeFromSwitch()) {
+          ops.requestRender({ content: true });
+          migrationDispatch("USER_TEST_NATIVE");
+          return;
+        }
+      };
       sw.addEventListener("click", toggle);
       sw.addEventListener("keydown", (ev) => {
         if (ev.key === " " || ev.key === "Enter") {
@@ -523,10 +797,107 @@
     return row;
   }
 
+  function buildDirectSendRow({ ready }) {
+    const cfg = currentConfig();
+    const row = document.createElement("div");
+    row.className = "row tg-approval-direct-send-row";
+    if (!ready) row.classList.add("tg-approval-row-disabled");
+
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("telegramApprovalDirectSend");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    desc.textContent = t("telegramApprovalDirectSendDesc");
+    text.appendChild(label);
+    text.appendChild(desc);
+    row.appendChild(text);
+
+    const ctrl = document.createElement("div");
+    ctrl.className = "row-control";
+    const sw = document.createElement("div");
+    sw.className = "switch";
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("tabindex", "0");
+    helpers.setSwitchVisual(sw, cfg.r3DirectSendEnabled === true, { pending: view.configPending });
+    if (!ready || view.configPending) {
+      sw.classList.add("disabled");
+      sw.setAttribute("aria-disabled", "true");
+      sw.removeAttribute("tabindex");
+    } else {
+      const toggle = () => {
+        saveConfig({ ...cfg, r3DirectSendEnabled: cfg.r3DirectSendEnabled !== true }, { resetDraft: false });
+      };
+      sw.addEventListener("click", toggle);
+      sw.addEventListener("keydown", (ev) => {
+        if (ev.key === " " || ev.key === "Enter") {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    }
+    ctrl.appendChild(sw);
+    row.appendChild(ctrl);
+    return row;
+  }
+
+  function buildCompletionOutputRow() {
+    const cfg = currentConfig();
+    const mode = ["off", "full"].includes(cfg.completionOutputMode)
+      ? cfg.completionOutputMode
+      : "off";
+    const row = document.createElement("div");
+    row.className = "row tg-approval-completion-output-row";
+
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("telegramApprovalCompletionOutput");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    desc.textContent = t("telegramApprovalCompletionOutputDesc");
+    text.appendChild(label);
+    text.appendChild(desc);
+    row.appendChild(text);
+
+    const ctrl = document.createElement("div");
+    ctrl.className = "row-control";
+    const select = document.createElement("select");
+    select.className = "tg-approval-input tg-approval-output-select";
+    select.disabled = view.configPending;
+    for (const value of ["off", "full"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = t("telegramApprovalCompletionOutput_" + value);
+      select.appendChild(option);
+    }
+    select.value = mode;
+    select.addEventListener("change", () => {
+      const nextMode = ["off", "full"].includes(select.value) ? select.value : "off";
+      if (nextMode === mode) return;
+      if (nextMode === "full") {
+        const ok = window.confirm(t("telegramApprovalCompletionOutputFullConfirm"));
+        if (!ok) {
+          select.value = mode;
+          return;
+        }
+      }
+      saveConfig({ ...cfg, completionOutputMode: nextMode }, { resetDraft: false });
+    });
+    ctrl.appendChild(select);
+    row.appendChild(ctrl);
+    return row;
+  }
+
   function buildTestRow({ ready }) {
     const s = view.status || {};
     const runtimeReady = s.configured === true;
-    const testDisabled = view.testPending || !ready || !runtimeReady;
+    const nativeStatus = s.transport === "native" || isNativeMigrationSelected();
+    const nativeReady = !nativeStatus || (migrationState() === "NATIVE_ACTIVE" && s.status === "running");
+    const testDisabled = view.testPending || !ready || !runtimeReady || !nativeReady;
     const row = document.createElement("div");
     row.className = "row";
     if (!ready) row.classList.add("tg-approval-row-disabled");

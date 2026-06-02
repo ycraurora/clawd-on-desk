@@ -150,7 +150,8 @@ describe("Agent Registry", () => {
 
     const copilot = registry.getAgent("copilot-cli");
     assert.strictEqual(copilot.capabilities.httpHook, false);
-    assert.strictEqual(copilot.capabilities.permissionApproval, false);
+    assert.strictEqual(copilot.capabilities.permissionApproval, true);
+    assert.strictEqual(copilot.capabilities.interactiveBubble, true);
     assert.strictEqual(copilot.capabilities.sessionEnd, true);
     assert.strictEqual(copilot.capabilities.subagent, true);
 
@@ -199,8 +200,8 @@ describe("Agent Registry", () => {
 
     const hermes = registry.getAgent("hermes");
     assert.strictEqual(hermes.capabilities.httpHook, false);
-    assert.strictEqual(hermes.capabilities.permissionApproval, false);
-    assert.strictEqual(hermes.capabilities.interactiveBubble, false);
+    assert.strictEqual(hermes.capabilities.permissionApproval, true);
+    assert.strictEqual(hermes.capabilities.interactiveBubble, true);
     assert.strictEqual(hermes.capabilities.sessionEnd, true);
     assert.strictEqual(hermes.capabilities.subagent, false);
 

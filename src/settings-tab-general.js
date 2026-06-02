@@ -4,13 +4,16 @@
   const GENERAL_IN_PLACE_KEYS = new Set([
     "size",
     "soundMuted",
+    "flashTaskbarOnComplete",
+    "flashIntervalMs",
+    "flashDurationMs",
     "soundVolume",
     "lowPowerIdleMode",
+    "keepAwakeWhileWorking",
     "sessionHudEnabled",
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
     "sessionHudCleanupDetached",
-    "sessionHudAutoHide",
     "allowEdgePinning",
     "keepSizeAcrossDisplays",
     "manageClaudeHooksAutomatically",
@@ -36,6 +39,10 @@
     "workingStaleMs",
     "detachedIdleStaleMs",
   ]);
+  const FLASH_NUMBER_KEYS = new Set([
+    "flashIntervalMs",
+    "flashDurationMs",
+  ]);
   const SESSION_CLEANUP_DEFAULTS = {
     sessionStaleMs: 600_000,
     workingStaleMs: 300_000,
@@ -45,13 +52,11 @@
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
     "sessionHudCleanupDetached",
-    "sessionHudAutoHide",
   ];
   const SESSION_HUD_SUMMARY_KEYS = new Set([
     "sessionHudEnabled",
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
-    "sessionHudAutoHide",
     "sessionHudCleanupDetached",
   ]);
   const CLAUDE_HOOK_MANAGEMENT_CHILD_SWITCH_KEYS = [
@@ -89,6 +94,12 @@
         labelKey: "rowLowPowerIdleMode",
         descKey: "rowLowPowerIdleModeDesc",
       }),
+      helpers.buildSwitchRow({
+        key: "keepAwakeWhileWorking",
+        labelKey: "rowKeepAwakeWhileWorking",
+        descKey: "rowKeepAwakeWhileWorkingDesc",
+      }),
+      buildFlashGroup(),
       helpers.buildSwitchRow({
         key: "allowEdgePinning",
         labelKey: "rowAllowEdgePinning",
@@ -391,12 +402,6 @@
         disabled: !sessionHudControlsEnabled,
       }),
       helpers.buildSwitchRow({
-        key: "sessionHudAutoHide",
-        labelKey: "rowSessionHudAutoHide",
-        descKey: "rowSessionHudAutoHideDesc",
-        disabled: !sessionHudControlsEnabled,
-      }),
-      helpers.buildSwitchRow({
         key: "sessionHudCleanupDetached",
         labelKey: "rowSessionHudCleanupDetached",
         descKey: "rowSessionHudCleanupDetachedDesc",
@@ -437,13 +442,6 @@
             snapshot.sessionHudShowElapsed !== false ? onLabel : offLabel
           ),
           accent: snapshot.sessionHudShowElapsed !== false,
-        });
-        items.push({
-          text: t("sessionHudSummaryAutoHide").replace(
-            "{state}",
-            snapshot.sessionHudAutoHide === true ? onLabel : offLabel
-          ),
-          accent: snapshot.sessionHudAutoHide === true,
         });
         items.push({
           text: t("sessionHudSummaryCleanup").replace(
@@ -553,6 +551,47 @@
       children: [buildOptionList("sound-option-list", [
         buildSoundEnabledRow(summaryControl),
         buildVolumeSliderRow(),
+      ])],
+    });
+  }
+
+  function buildFlashGroup() {
+    return helpers.buildCollapsibleGroup({
+      id: "general:flash",
+      title: t("rowFlash"),
+      desc: t("rowFlashDesc"),
+      defaultCollapsed: true,
+      className: "flash-collapsible",
+      children: [buildOptionList("flash-option-list", [
+        helpers.buildSwitchRow({
+          key: "flashTaskbarOnComplete",
+          labelKey: "rowFlashTaskbarOnComplete",
+          descKey: "rowFlashTaskbarOnCompleteDesc",
+        }),
+        helpers.buildNumberInputRow({
+          key: "flashIntervalMs",
+          labelKey: "rowFlashInterval",
+          descKey: "rowFlashIntervalDesc",
+          unitKey: "unitMilliseconds",
+          toDisplay: (ms) => ms,
+          fromDisplay: (v) => Math.max(200, Math.min(2000, Math.round(v))),
+          min: 200,
+          max: 2000,
+        }).row,
+        helpers.buildNumberInputRow({
+          key: "flashDurationMs",
+          labelKey: "rowFlashDuration",
+          descKey: "rowFlashDurationDesc",
+          unitKey: "unitMilliseconds",
+          toDisplay: (ms) => ms,
+          fromDisplay: (v) => {
+            const n = parseInt(v, 10);
+            return Number.isFinite(n) ? Math.max(0, Math.min(60000, Math.round(n))) : 0;
+          },
+          min: 0,
+          max: 60000,
+          zeroLabelKey: "valueAlways",
+        }).row,
       ])],
     });
   }
@@ -1491,6 +1530,13 @@
         if (!meta || !document.body.contains(meta.row)) return false;
       }
     }
+    if (keys.some((key) => FLASH_NUMBER_KEYS.has(key))) {
+      for (const key of keys) {
+        if (!FLASH_NUMBER_KEYS.has(key)) continue;
+        const meta = state.mountedControls.sessionCleanupControls.get(key);
+        if (!meta || !document.body.contains(meta.row)) return false;
+      }
+    }
     for (const key of keys) {
       if (key === "size" || key === "soundVolume") continue;
       if (BUBBLE_POLICY_KEYS.has(key)) {
@@ -1499,6 +1545,7 @@
         continue;
       }
       if (SESSION_CLEANUP_NUMBER_KEYS.has(key)) continue;
+      if (FLASH_NUMBER_KEYS.has(key)) continue;
       const meta = state.mountedControls.generalSwitches.get(key);
       if (!meta || !document.body.contains(meta.element)) return false;
     }
@@ -1513,6 +1560,10 @@
         continue;
       }
       if (SESSION_CLEANUP_NUMBER_KEYS.has(key)) {
+        state.mountedControls.sessionCleanupControls.get(key).syncFromSnapshot();
+        continue;
+      }
+      if (FLASH_NUMBER_KEYS.has(key)) {
         state.mountedControls.sessionCleanupControls.get(key).syncFromSnapshot();
         continue;
       }

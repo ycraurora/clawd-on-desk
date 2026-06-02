@@ -241,6 +241,10 @@ test("settings IPC delegates controller and size preview handlers", async () => 
     key: "size",
     value: "P:20",
   });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:update", { key: "tgMigration", value: { transport: "native" } }), {
+    status: "error",
+    message: "tgMigration is internal; use telegramMigration.dispatch",
+  });
   assert.deepStrictEqual(await ipcMain.invoke("settings:command", { action: "resizePet", payload: "P:30" }), {
     status: "ok",
   });
@@ -626,6 +630,8 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
       authorName: "Ruller_Lulu / \u9e7f\u9e7f",
       authorUrl: "https://github.com/rullerzhou-afk",
       heroSvgContent: "<svg id=\"hero\"></svg>",
+      pendingUpdateVersion: "",
+      autoUpdateCheck: true,
     });
     assert.deepStrictEqual(await ipcMain.invoke("settings:confirm-remove-theme", "user-theme"), {
       confirmed: true,

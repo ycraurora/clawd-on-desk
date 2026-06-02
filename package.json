@@ -1,6 +1,6 @@
 {
   "name": "clawd-on-desk",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "A desktop pet that reacts to your Claude Code sessions in real-time.",
   "main": "src/main.js",
   "scripts": {
@@ -45,6 +45,7 @@
     "uninstall:codex-debug-hooks": "node hooks/codex-debug-install.js --uninstall",
     "install:hermes-plugin": "node hooks/hermes-install.js",
     "uninstall:hermes-plugin": "node hooks/hermes-install.js --uninstall",
+    "cleanup:integrations": "node hooks/cleanup-integrations.js --apply",
     "register-protocol:dev": "node launch.js --register-protocol"
   },
   "keywords": [
@@ -69,6 +70,7 @@
     ],
     "mac": {
       "icon": "assets/icon.png",
+      "artifactName": "Clawd-on-Desk-${version}-${arch}.${ext}",
       "target": [
         {
           "target": "dmg",
@@ -101,6 +103,7 @@
       "maintainer": "rullerzhou-afk <rullerzhou-afk@users.noreply.github.com>",
       "icon": "assets/icons",
       "category": "Utility",
+      "artifactName": "Clawd-on-Desk-${version}-${arch}.${ext}",
       "target": [
         {
           "target": "AppImage",
