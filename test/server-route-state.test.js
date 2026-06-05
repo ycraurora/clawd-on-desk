@@ -140,6 +140,7 @@ describe("server-route-state POST", () => {
       provider: "openai",
       codex_originator: "Codex Desktop",
       codex_source: "vscode",
+      ghostty_terminal_id: "ghostty-term-7",
       session_title: "  Work title  ",
       permission_suspect: true,
       preserve_state: true,
@@ -166,6 +167,7 @@ describe("server-route-state POST", () => {
         provider: "openai",
         codexOriginator: "Codex Desktop",
         codexSource: "vscode",
+        ghosttyTerminalId: "ghostty-term-7",
         displayHint: "display.svg",
         sessionTitle: "Work title",
         assistantLastOutput: null,
@@ -173,6 +175,9 @@ describe("server-route-state POST", () => {
         permissionSuspect: true,
         preserveState: true,
         hookSource: "codex-official",
+        backgroundTasksCount: 0,
+        sessionCronsCount: 0,
+        stopHookActive: false,
       },
     ]]);
   });

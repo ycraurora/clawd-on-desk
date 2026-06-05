@@ -3,6 +3,10 @@
 const path = require("path");
 const { sessionAliasKey } = require("./session-alias");
 const { getSessionFocusTarget } = require("./session-focus");
+const {
+  buildLatestLocalCodexProcessIds,
+  isSupersededLocalCodexProcessSession,
+} = require("./state-session-dedupe");
 const { readCodexThreadName } = require("../hooks/codex-session-index");
 
 const EVENT_LABEL_KEYS = {
@@ -28,7 +32,9 @@ const EVENT_LABEL_KEYS = {
   "stale-cleanup": "eventLabelStaleCleanup",
 };
 
-const DONE_EVENTS = new Set(["Stop", "PostCompact", "event_msg:task_complete"]);
+// PostCompact intentionally excluded (#406): compaction finishing is not turn
+// completion, so it must not raise the "done" badge.
+const DONE_EVENTS = new Set(["Stop", "event_msg:task_complete"]);
 
 function isDoneEvent(event) {
   return DONE_EVENTS.has(event);
@@ -168,7 +174,8 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     ? options.getAgentIconUrl
     : () => null;
   const state = (session && session.state) || "idle";
-  const hiddenFromHud = shouldAutoClearDetachedSession(session, badge, options);
+  const hiddenFromHud = shouldAutoClearDetachedSession(session, badge, options)
+    || isSupersededLocalCodexProcessSession(id, session, options.latestLocalCodexProcessIds);
   const focusTarget = session && !session.headless && state !== "sleeping" && !hiddenFromHud
     ? getSessionFocusTarget({ ...(session || {}), id }, {
       osPlatform: options.focusHostPlatform || options.osPlatform,
@@ -225,8 +232,12 @@ function buildSessionSnapshot(sessions, options = {}) {
   const sessionAliases = options.sessionAliases && typeof options.sessionAliases === "object"
     ? options.sessionAliases
     : {};
+  const latestLocalCodexProcessIds = buildLatestLocalCodexProcessIds(sessions);
   for (const [id, session] of normalizeSessionsIterable(sessions)) {
-    entries.push(buildSessionSnapshotEntry(id, session, sessionAliases, options));
+    entries.push(buildSessionSnapshotEntry(id, session, sessionAliases, {
+      ...options,
+      latestLocalCodexProcessIds,
+    }));
   }
 
   const dashboardEntries = entries.slice().sort(sessionUpdatedAtComparator);

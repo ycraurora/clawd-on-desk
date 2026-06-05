@@ -14,6 +14,8 @@ const { registerSettingsIpc } = require("./settings-ipc");
 const createSettingsEffectRouter = require("./settings-effect-router");
 const { registerSessionIpc } = require("./session-ipc");
 const { registerPetInteractionIpc } = require("./pet-interaction-ipc");
+const { launchClaudeSession } = require("./launch-claude");
+const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
 const { registerPermissionIpc } = initPermission;
 const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar");
@@ -48,6 +50,7 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const createMacHideController = require("./mac-hide");
 const { createHardwareBuddyAdapter } = require("./hardware-buddy-adapter");
 const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
@@ -696,8 +699,25 @@ function getAllBubblesHidden() {
   return isAllBubblesHidden(_settingsController.getSnapshot());
 }
 
-function togglePetVisibility() { return petWindowRuntime.togglePetVisibility(); }
-function bringPetToPrimaryDisplay() { return petWindowRuntime.bringPetToPrimaryDisplay(); }
+let macHideController = null; // macOS app-hidden ↔ pet visibility bridge (#416); created in whenReady
+// Shared mac prep for any manual "show / move the pet" entry point (tray,
+// shortcut, bring-to-primary): release OS-hide ownership so a later
+// activate/unhide won't falsely restore, and if the app is OS-hidden, unhide it
+// first to avoid a "window shown but app still hidden" limbo.
+function prepManualPetVisibility() {
+  if (macHideController) macHideController.noteManualChange();
+  if (isMac && petWindowRuntime.isPetHidden() && typeof app.isHidden === "function" && app.isHidden()) {
+    try { app.show(); } catch (_) {}
+  }
+}
+function togglePetVisibility() {
+  prepManualPetVisibility();
+  return petWindowRuntime.togglePetVisibility();
+}
+function bringPetToPrimaryDisplay() {
+  prepManualPetVisibility();
+  return petWindowRuntime.bringPetToPrimaryDisplay();
+}
 
 function sendToRenderer(channel, ...args) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
@@ -1279,7 +1299,13 @@ const { startMainTick, resetIdleTimer } = _tick;
 
 // ── Terminal focus — delegated to src/focus.js ──
 const _focus = require("./focus")({ _allowSetForeground, focusLog });
-const { initFocusHelper, killFocusHelper, focusTerminalWindow, clearMacFocusCooldownTimer } = _focus;
+const {
+  initFocusHelper,
+  killFocusHelper,
+  focusTerminalWindow,
+  captureGhosttyTerminalId,
+  clearMacFocusCooldownTimer,
+} = _focus;
 
 function getFocusableLocalHudSessionIds() {
   if (!_state || typeof _state.buildSessionSnapshot !== "function") return [];
@@ -1294,6 +1320,7 @@ function focusTerminalSession(session, sessionId, requestSource) {
     cwd: session.cwd,
     editor: session.editor,
     pidChain: session.pidChain,
+    ghosttyTerminalId: session.ghosttyTerminalId,
     sessionId: String(sessionId),
     agentId: session.agentId,
     requestSource,
@@ -1396,6 +1423,7 @@ agentRuntime = createAgentRuntimeMain({
   getPermissionRuntime: () => _perm,
   isAgentEnabled: (agentId) => _isAgentEnabled(_settingsController.getSnapshot(), agentId),
   updateSession: (sessionId, state, event, opts) => updateSession(sessionId, state, event, opts),
+  captureGhosttyTerminalId,
   showCodexNotifyBubble: (payload) => showCodexNotifyBubble(payload),
   clearCodexNotifyBubbles: (...args) => clearCodexNotifyBubbles(...args),
 });
@@ -2353,6 +2381,106 @@ unsubscribeHardwareBuddySettings = _settingsController.subscribeKey("hardwareBud
 // effects that used to live inside setters (e.g.
 // `syncPermissionShortcuts()` for hideBubbles) are now reactive and live in
 // the subscriber too.
+
+async function confirmDangerousMode(t) {
+  const parent = win && !win.isDestroyed() ? win : null;
+  const result = await electronDialog.showMessageBox(parent, {
+    type: "warning",
+    buttons: [t("confirm") || "Confirm", t("cancel") || "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    title: t("dangerousConfirmTitle") || "Confirm Dangerous Mode",
+    message: t("dangerousConfirmMessage") || "Dangerous mode skips ALL permission checks.",
+  });
+  return result.response === 0;
+}
+
+// Await launchClaudeSession and surface failures instead of swallowing them:
+// show a localized error dialog so the user knows nothing happened, and log
+// for diagnosis. Never throws.
+async function runLaunchClaudeSession(t, mode, cwd, sessionId) {
+  let res;
+  try {
+    res = await launchClaudeSession(mode, cwd, sessionId);
+  } catch (err) {
+    console.error("[launch-claude] launch threw:", err);
+    res = { ok: false, message: (err && err.message) || String(err) };
+  }
+  if (res && res.ok) return res;
+  console.error("[launch-claude] launch failed:", res && res.message);
+  try {
+    const parent = win && !win.isDestroyed() ? win : null;
+    await electronDialog.showMessageBox(parent, {
+      type: "error",
+      buttons: [t("dismiss") || "OK"],
+      title: t("newSession") || "New Session",
+      message: t("launchFailed") || "Failed to launch Claude Code.",
+      detail: (res && res.message) || "",
+    });
+  } catch (err) {
+    console.error("[launch-claude] failed to show error dialog:", err);
+  }
+  return res;
+}
+
+function showResumeInput(t) {
+  return new Promise((resolve) => {
+    const inputWin = new BrowserWindow({
+      width: 420,
+      height: 180,
+      resizable: false,
+      alwaysOnTop: true,
+      frame: false,
+      transparent: true,
+      skipTaskbar: true,
+      parent: win && !win.isDestroyed() ? win : undefined,
+      modal: true,
+      webPreferences: { nodeIntegration: false, contextIsolation: true },
+    });
+    const title = t("resumeSessionTitle") || "Resume Session";
+    const hint = t("resumeSessionHint") || "Enter Session ID";
+    const confirmLabel = t("confirm") || "OK";
+    const cancelLabel = t("dismiss") || "Cancel";
+    const html = `<!DOCTYPE html><html><head><style>
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{font-family:system-ui,-apple-system,sans-serif;background:#1e1e2e;color:#cdd6f4;display:flex;flex-direction:column;height:100vh;padding:16px;border-radius:12px;overflow:hidden}
+      .title{font-size:14px;font-weight:600;margin-bottom:12px}
+      input{width:100%;padding:8px 12px;border:1px solid #45475a;border-radius:6px;background:#313244;color:#cdd6f4;font-size:13px;outline:none}
+      input:focus{border-color:#89b4fa}
+      input::placeholder{color:#6c7086}
+      .btns{display:flex;gap:8px;margin-top:14px;justify-content:flex-end}
+      button{padding:6px 16px;border:none;border-radius:6px;font-size:12px;cursor:pointer}
+      .ok{background:#89b4fa;color:#1e1e2e;font-weight:600}
+      .cancel{background:#45475a;color:#cdd6f4}
+    </style></head><body>
+      <div class="title">${title}</div>
+      <input id="sid" type="text" placeholder="${hint}" autofocus />
+      <div class="btns">
+        <button class="cancel" onclick="result(null)">${cancelLabel}</button>
+        <button class="ok" onclick="result(document.getElementById('sid').value)">${confirmLabel}</button>
+      </div>
+      <script>
+        function result(v){window._resolve(v)}
+        document.getElementById('sid').addEventListener('keydown',e=>{
+          if(e.key==='Enter')result(document.getElementById('sid').value);
+          if(e.key==='Escape')result(null);
+        });
+      </script>
+    </body></html>`;
+    inputWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    inputWin.webContents.on("did-finish-load", () => {
+      inputWin.webContents.executeJavaScript(
+        "new Promise(r=>{window._resolve=r})"
+      ).then((val) => {
+        const sessionId = typeof val === "string" ? val.trim() : "";
+        resolve(sessionId || null);
+        try { inputWin.close(); } catch {}
+      });
+    });
+    inputWin.on("closed", () => resolve(null));
+  });
+}
+
 const _menuCtx = {
   get win() { return win; },
   get sessions() { return sessions; },
@@ -2404,6 +2532,76 @@ const _menuCtx = {
   checkForUpdates: (...args) => checkForUpdates(...args),
   getUpdateMenuItem: () => getUpdateMenuItem(),
   openDashboard: () => showDashboard(),
+  launchClaudeSession: (mode, cwd, sessionId) => launchClaudeSession(mode, cwd, sessionId),
+  newSessionWithFolder: async (t) => {
+    const parent = win && !win.isDestroyed() ? win : null;
+    const result = await electronDialog.showOpenDialog(parent, {
+      title: t("selectFolder"),
+      properties: ["openDirectory"],
+    });
+    if (result.canceled || !result.filePaths.length) return;
+    const folder = result.filePaths[0];
+    const mode = await electronDialog.showMessageBox(parent, {
+      type: "question",
+      buttons: [t("newSessionNormal"), t("newSessionDangerous"), t("newSessionContinue"), t("newSessionResume"), t("dismiss")],
+      defaultId: 0,
+      cancelId: 4,
+      title: t("newSession"),
+      message: t("newSession"),
+      detail: folder,
+    });
+    if (mode.response === 4) return;
+    if (mode.response === 3) {
+      const sessionId = await showResumeInput(t);
+      if (!sessionId) return;
+      const resumeMode = await electronDialog.showMessageBox(parent, {
+        type: "question",
+        buttons: [t("modeNormal"), t("modeDangerous"), t("dismiss")],
+        defaultId: 0,
+        cancelId: 2,
+        title: t("newSessionResume"),
+        message: sessionId,
+      });
+      if (resumeMode.response === 2) return;
+      if (resumeMode.response === 1 && !(await confirmDangerousMode(t))) return;
+      await runLaunchClaudeSession(t, resumeMode.response === 1 ? "resume-dangerous" : "resume", folder, sessionId);
+      return;
+    }
+    if (mode.response === 1 && !(await confirmDangerousMode(t))) return;
+    const modes = ["normal", "dangerous", "continue"];
+    await runLaunchClaudeSession(t, modes[mode.response], folder);
+  },
+  newSessionInCurrentDir: async (t) => {
+    const parent = win && !win.isDestroyed() ? win : null;
+    const mode = await electronDialog.showMessageBox(parent, {
+      type: "question",
+      buttons: [t("newSessionNormal"), t("newSessionDangerous"), t("newSessionContinue"), t("newSessionResume"), t("dismiss")],
+      defaultId: 0,
+      cancelId: 4,
+      title: t("newSession"),
+      message: t("newSession"),
+    });
+    if (mode.response === 4) return;
+    if (mode.response === 3) {
+      const sessionId = await showResumeInput(t);
+      if (!sessionId) return;
+      const resumeMode = await electronDialog.showMessageBox(parent, {
+        type: "question",
+        buttons: [t("modeNormal"), t("modeDangerous"), t("dismiss")],
+        defaultId: 0,
+        cancelId: 2,
+        title: t("newSessionResume"),
+        message: sessionId,
+      });
+      if (resumeMode.response === 2) return;
+      if (resumeMode.response === 1 && !(await confirmDangerousMode(t))) return;
+      await runLaunchClaudeSession(t, resumeMode.response === 1 ? "resume-dangerous" : "resume", undefined, sessionId);
+      return;
+    }
+    if (mode.response === 1 && !(await confirmDangerousMode(t))) return;
+    const modes = ["normal", "dangerous", "continue"];
+    await runLaunchClaudeSession(t, modes[mode.response]);
+  },
   // The settings controller is the only writer of persisted prefs. Toggle
   // setters above route through it; resize/sendToDisplay use
   // flushRuntimeStateToPrefs to capture window bounds after movement.
@@ -2435,7 +2633,7 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 // ── Settings effect router ──
 const SETTINGS_MIRROR_SETTERS = {
   lang: (v) => { lang = v; }, size: (v) => { currentSize = v; }, showTray: (v) => { showTray = v; },
-  showDock: (v) => { showDock = v; }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
+  showDock: (v) => { showDock = v; if (macHideController) macHideController.noteManualChange(); }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
   autoStartWithClaude: (v) => { autoStartWithClaude = v; }, openAtLogin: (v) => { openAtLogin = v; },
   bubbleFollowPet: (v) => { bubbleFollowPet = v; }, sessionHudEnabled: (v) => { sessionHudEnabled = v; },
   sessionHudShowStateLabels: (v) => { sessionHudShowStateLabels = v; },
@@ -3048,9 +3246,11 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(() => {
-    // macOS: override the dock icon with a version that fills the canvas
-    // (the build-time icon.png has transparent margins that make the icon
-    // appear smaller than other apps in the dock).
+    // macOS: override the dock icon with a version padded to the macOS icon
+    // grid (~80.5% of the canvas, ~100px transparent margin per side) so the
+    // Dock tile matches neighbor apps. The build-time icon.png sits ~72.6%
+    // (looks small); the earlier full-bleed dock-icon.png looked oversized
+    // (issue #416). Source preserved at assets/source/dock-icon-fullbleed.png.
     if (isMac && app.dock && _settingsController.get("showDock") !== false) {
       try {
         app.dock.setIcon(path.join(__dirname, "..", "assets", "dock-icon.png"));
@@ -3079,6 +3279,21 @@ if (!gotTheLock) {
       console.warn("Clawd: migration controller init failed:", err && err.message);
     });
     createWindow();
+    // macOS: bridge the OS app-hidden state (⌘H / Dock right-click → 隐藏) to the
+    // pet. Pet windows are setCanHide:NO, so the OS marks the app hidden but the
+    // windows refuse to vanish, and an inactive-app Dock Hide fires no
+    // did-resign-active — so we poll app.isHidden() and drive setPetHidden(). (#416)
+    if (isMac) {
+      macHideController = createMacHideController({
+        isMac,
+        app,
+        getShowDock: () => showDock,
+        isPetHidden: () => petWindowRuntime.isPetHidden(),
+        setPetHidden: (hidden) => petWindowRuntime.setPetHidden(hidden),
+      });
+      macHideController.start();
+      app.on("activate", () => { if (macHideController) macHideController.onActivate(); });
+    }
     if (shouldOpenSettingsWindowFromArgv(process.argv)) {
       settingsWindowRuntime.open();
     }
@@ -3139,6 +3354,7 @@ if (!gotTheLock) {
     _state.cleanup();
     _tick.cleanup();
     _mini.cleanup();
+    if (macHideController) macHideController.stop();
     _sessionHud.cleanup();
     agentRuntime.cleanup();
     topmostRuntime.cleanup();

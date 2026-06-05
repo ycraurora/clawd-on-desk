@@ -117,6 +117,9 @@ function handleStatePost(req, res, options) {
       const codexSource = typeof data.codex_source === "string" && data.codex_source.trim()
         ? data.codex_source.trim()
         : null;
+      const ghosttyTerminalId = typeof data.ghostty_terminal_id === "string" && data.ghostty_terminal_id.trim()
+        ? data.ghostty_terminal_id.trim()
+        : null;
       const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : null;
       const toolUseId = normalizeHookToolUseId(
         data.tool_use_id ?? data.toolUseId ?? data.toolUseID
@@ -134,6 +137,13 @@ function handleStatePost(req, res, options) {
       const permissionSuspect = data.permission_suspect === true;
       const preserveState = data.preserve_state === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
+      // #406 completion-gate inputs from the Claude Stop hook. Counts / boolean
+      // only — the hook never forwards task command or description text.
+      const backgroundTasksCount = Number.isFinite(data.background_tasks_count)
+        ? data.background_tasks_count : 0;
+      const sessionCronsCount = Number.isFinite(data.session_crons_count)
+        ? data.session_crons_count : 0;
+      const stopHookActive = data.stop_hook_active === true;
       // Agent gate: user disabled this agent in the settings panel. Drop
       // with 204 so hook scripts get a quick no-op response instead of
       // hanging on our HTTP connection. Still surfaces as a success code
@@ -265,6 +275,7 @@ function handleStatePost(req, res, options) {
             provider,
             codexOriginator,
             codexSource,
+            ghosttyTerminalId,
             displayHint: display_svg,
             sessionTitle,
             assistantLastOutput,
@@ -272,6 +283,9 @@ function handleStatePost(req, res, options) {
             permissionSuspect,
             preserveState,
             hookSource,
+            backgroundTasksCount,
+            sessionCronsCount,
+            stopHookActive,
             ...(agentIdentity.defaulted ? { agentIdDefaulted: true } : {}),
           });
         }
