@@ -98,6 +98,7 @@ const SCHEMA = {
   sessionHudEnabled: { type: "boolean", default: true },
   sessionHudShowStateLabels: { type: "boolean", default: true },
   sessionHudShowElapsed: { type: "boolean", default: true },
+  sessionHudShowContextUsage: { type: "boolean", default: true },
   sessionHudCleanupDetached: { type: "boolean", default: false },
   sessionHudPinned: { type: "boolean", default: false },
   // Stale-cleanup intervals (ms). Defaults match the historical constants in
@@ -159,6 +160,7 @@ const SCHEMA = {
   // progress (working/thinking/etc.); allow sleep again once tasks finish.
   keepAwakeWhileWorking: { type: "boolean", default: false },
   allowEdgePinning: { type: "boolean", default: false },
+  disableMiniMode: { type: "boolean", default: false },
   // When true, moving the pet between displays does not trigger a
   // proportional pixel-size recomputation. The pet keeps its current
   // window size; the size slider still works (per-display proportional).

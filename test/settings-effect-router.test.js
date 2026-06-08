@@ -187,6 +187,14 @@ describe("settings-effect-router", () => {
     ]);
 
     calls.length = 0;
+    emit({ sessionHudShowContextUsage: false });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { sessionHudShowContextUsage: false }],
+      ["syncSessionHudVisibility"],
+      ["repositionFloatingBubbles"],
+    ]);
+
+    calls.length = 0;
     emit({ sessionHudCleanupDetached: true });
     assert.deepStrictEqual(calls, [
       ["updateMirrors", { sessionHudCleanupDetached: true }],
@@ -236,6 +244,39 @@ describe("settings-effect-router", () => {
     assert.deepStrictEqual(calls, [
       ["updateMirrors", { allowEdgePinning: false }],
       ["reclampPetAfterEdgePinningChange"],
+    ]);
+  });
+
+  it("exits current mini mode when mini mode is disabled", () => {
+    const { calls, emit } = createHarness({
+      routerOptions: {
+        getMiniMode: () => true,
+        exitMiniMode: () => calls.push(["exitMiniMode"]),
+      },
+    });
+
+    emit({ disableMiniMode: true });
+
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { disableMiniMode: true }],
+      ["exitMiniMode"],
+      ["rebuildAllMenus"],
+    ]);
+  });
+
+  it("does not enter mini mode when mini mode is re-enabled", () => {
+    const { calls, emit } = createHarness({
+      routerOptions: {
+        getMiniMode: () => false,
+        exitMiniMode: () => calls.push(["exitMiniMode"]),
+      },
+    });
+
+    emit({ disableMiniMode: false });
+
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { disableMiniMode: false }],
+      ["rebuildAllMenus"],
     ]);
   });
 

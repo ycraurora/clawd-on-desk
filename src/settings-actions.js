@@ -194,6 +194,7 @@ const updateRegistry = {
   sessionHudEnabled: requireBoolean("sessionHudEnabled"),
   sessionHudShowStateLabels: requireBoolean("sessionHudShowStateLabels"),
   sessionHudShowElapsed: requireBoolean("sessionHudShowElapsed"),
+  sessionHudShowContextUsage: requireBoolean("sessionHudShowContextUsage"),
   sessionHudCleanupDetached: requireBoolean("sessionHudCleanupDetached"),
   sessionHudPinned: requireBoolean("sessionHudPinned"),
   hideBubbles: requireBoolean("hideBubbles"),
@@ -249,6 +250,7 @@ const updateRegistry = {
   },
   detachedIdleStaleMs: requireIntegerInRange("detachedIdleStaleMs", 5_000, 300_000),
   allowEdgePinning: requireBoolean("allowEdgePinning"),
+  disableMiniMode: requireBoolean("disableMiniMode"),
   keepSizeAcrossDisplays: requireBoolean("keepSizeAcrossDisplays"),
   mobilePreviewEnabled: requireBoolean("mobilePreviewEnabled"),
 

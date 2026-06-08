@@ -679,6 +679,7 @@ let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
 let sessionHudShowStateLabels = _settingsController.get("sessionHudShowStateLabels");
 let sessionHudShowElapsed = _settingsController.get("sessionHudShowElapsed");
+let sessionHudShowContextUsage = _settingsController.get("sessionHudShowContextUsage");
 let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
 let sessionHudPinned = _settingsController.get("sessionHudPinned");
 let sessionStaleMs = _settingsController.get("sessionStaleMs");
@@ -689,6 +690,7 @@ let soundVolume = _settingsController.get("soundVolume");
 let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
 let keepAwakeWhileWorking = _settingsController.get("keepAwakeWhileWorking");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
+let disableMiniModeCached = _settingsController.get("disableMiniMode");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
 
 function getRuntimeBubblePolicy(kind) {
@@ -1397,6 +1399,7 @@ const _sessionHud = require("./session-hud")({
   get sessionHudEnabled() { return sessionHudEnabled; },
   get sessionHudShowStateLabels() { return sessionHudShowStateLabels; },
   get sessionHudShowElapsed() { return sessionHudShowElapsed; },
+  get sessionHudShowContextUsage() { return sessionHudShowContextUsage; },
   get sessionHudPinned() { return sessionHudPinned; },
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
@@ -1915,6 +1918,7 @@ async function initTelegramMigrationController() {
     createWindowsPasteOnlyDeliveryAdapter,
   } = require("./telegram-direct-send");
   const { createTelegramNativeRunner } = require("./telegram-native-runner");
+  const { createTelegramFetchTransport } = require("./telegram-fetch-transport");
   const tokenStore = envFileTokenStore({ filePath: paths.tokenEnvFilePath });
   telegramDirectSend = createTelegramDirectSend({
     getSessionSnapshot: () => _state && typeof _state.buildSessionSnapshot === "function"
@@ -1922,7 +1926,10 @@ async function initTelegramMigrationController() {
       : { sessions: [] },
     getPendingPermissions: () => pendingPermissions,
     focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
-    deliveryAdapter: isWin ? createWindowsPasteOnlyDeliveryAdapter({ clipboard }) : undefined,
+    deliveryAdapter: createWindowsPasteOnlyDeliveryAdapter({
+      clipboard,
+      restoreClipboardOnSuccess: true,
+    }),
     fallbackAdapter: createClipboardFallbackDeliveryAdapter({ clipboard }),
     isEnabled: () => {
       const snap = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
@@ -1936,7 +1943,14 @@ async function initTelegramMigrationController() {
   });
   const nativeRunner = createTelegramNativeRunner({
     tokenStore,
-    transport: makeFetchTransport({ tokenStore }),
+    // issue #359: route the bot's HTTP through Electron's Chromium net stack so
+    // it follows the OS system proxy (and PAC/SOCKS), instead of Node's global
+    // fetch which ignores system/env proxy. Dedicated in-memory session.
+    transport: createTelegramFetchTransport({
+      tokenStore,
+      sessionFactory: () => require("electron").session.fromPartition("clawd-telegram", { cache: false }),
+      log: telegramApprovalLog,
+    }),
     getDispatch: () => _telegramMigrationController && _telegramMigrationController.dispatch,
     getChatId: () => {
       const cfg = getTelegramApprovalPrefs();
@@ -1975,7 +1989,7 @@ async function initTelegramMigrationController() {
   telegramCompanion = createTelegramCompanion({
     getClient: () => getTelegramCompanionClient(),
     getLang: () => _settingsController.get("lang") || lang || "en",
-    getCompletionOutputMode: () => getTelegramApprovalPrefs().completionOutputMode || "full",
+    getCompletionOutputMode: () => getTelegramApprovalPrefs().completionOutputMode || "off",
     getNotifyOnComplete: () => getTelegramApprovalPrefs().notifyOnComplete === true,
     // Native-active client present. The companion still advances its dedupe map
     // while native is inactive, and internally decides whether to send a bare
@@ -2013,46 +2027,6 @@ async function initTelegramMigrationController() {
 
   await _telegramMigrationController.init();
   return _telegramMigrationController;
-}
-
-// Minimal fetch-based transport for the native client. Closes over the token
-// (no per-call token argument) so logging or debug serialization of request
-// args cannot leak the secret.
-function makeFetchTransport({ tokenStore }) {
-  return async ({ method, payload, signal }) => {
-    const token = await tokenStore.getToken();
-    if (!token) {
-      return { ok: false, status: null, error_code: "TOKEN_MISSING", description: "no token" };
-    }
-    const url = `https://api.telegram.org/bot${token}/${method}`;
-    let res;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload || {}),
-        signal,
-      });
-    } catch (err) {
-      if (err && err.name === "AbortError") throw err;
-      throw Object.assign(new Error(err && err.message ? err.message : String(err)), {
-        code: (err && (err.code || (err.cause && err.cause.code))) || undefined,
-        causeCode: err && err.cause && err.cause.code,
-      });
-    }
-    const status = res.status;
-    let body;
-    try { body = await res.json(); } catch { body = null; }
-    if (!body) return { ok: false, status, error_code: status, description: res.statusText || "" };
-    if (body.ok) return { ok: true, result: body.result };
-    return {
-      ok: false,
-      status,
-      error_code: body.error_code || status,
-      description: body.description || "",
-      parameters: body.parameters || {},
-    };
-  };
 }
 
 function stopTelegramApprovalSidecar() {
@@ -2524,8 +2498,11 @@ const _menuCtx = {
   set contextMenu(v) { contextMenu = v; },
   enableDoNotDisturb: () => enableDoNotDisturb(),
   disableDoNotDisturb: () => disableDoNotDisturb(),
-  enterMiniViaMenu: () => enterMiniViaMenu(),
+  enterMiniViaMenu: () => {
+    if (!disableMiniModeCached) enterMiniViaMenu();
+  },
   exitMiniMode: () => exitMiniMode(),
+  getDisableMiniMode: () => disableMiniModeCached,
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
   miniHandleResize: (sizeKey) => _mini.handleResize(sizeKey),
@@ -2637,13 +2614,15 @@ const SETTINGS_MIRROR_SETTERS = {
   autoStartWithClaude: (v) => { autoStartWithClaude = v; }, openAtLogin: (v) => { openAtLogin = v; },
   bubbleFollowPet: (v) => { bubbleFollowPet = v; }, sessionHudEnabled: (v) => { sessionHudEnabled = v; },
   sessionHudShowStateLabels: (v) => { sessionHudShowStateLabels = v; },
-  sessionHudShowElapsed: (v) => { sessionHudShowElapsed = v; }, sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
+  sessionHudShowElapsed: (v) => { sessionHudShowElapsed = v; },
+  sessionHudShowContextUsage: (v) => { sessionHudShowContextUsage = v; },
+  sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
   sessionHudPinned: (v) => { sessionHudPinned = v; },
   sessionStaleMs: (v) => { sessionStaleMs = v; }, workingStaleMs: (v) => { workingStaleMs = v; },
   detachedIdleStaleMs: (v) => { detachedIdleStaleMs = v; },
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
   keepAwakeWhileWorking: (v) => { keepAwakeWhileWorking = v; },
-  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
+  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
 };
 
 function updateSettingsMirrors(changes) { for (const [key, value] of Object.entries(changes)) if (SETTINGS_MIRROR_SETTERS[key]) SETTINGS_MIRROR_SETTERS[key](value); }
@@ -2685,6 +2664,8 @@ const settingsEffectRouter = createSettingsEffectRouter({
     }
   },
   reclampPetAfterEdgePinningChange,
+  exitMiniMode: () => exitMiniMode(),
+  getMiniMode: () => _mini.getMiniMode(),
   rebuildAllMenus,
   reconcilePowerSaveBlocker,
   logWarn: console.warn,
@@ -3011,6 +2992,7 @@ function createWindow() {
     syncHitWin: () => syncHitWin(),
     isMiniMode: () => _mini.getMiniMode(),
     checkMiniModeSnap: () => checkMiniModeSnap(),
+    getDisableMiniMode: () => disableMiniModeCached,
     hasPetWindow: () => !!(win && !win.isDestroyed()),
     getPetWindowBounds: () => getPetWindowBounds(),
     getKeepSizeAcrossDisplays: () => keepSizeAcrossDisplaysCached,

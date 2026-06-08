@@ -48,10 +48,12 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.autoStartWithClaude, false);
     assert.strictEqual(d.lowPowerIdleMode, false);
     assert.strictEqual(d.allowEdgePinning, false);
+    assert.strictEqual(d.disableMiniMode, false);
     assert.strictEqual(d.keepSizeAcrossDisplays, false);
     assert.strictEqual(d.sessionHudEnabled, true);
     assert.strictEqual(d.sessionHudShowStateLabels, true);
     assert.strictEqual(d.sessionHudShowElapsed, true);
+    assert.strictEqual(d.sessionHudShowContextUsage, true);
     assert.strictEqual(d.sessionHudCleanupDetached, false);
     assert.strictEqual("sessionHudAutoHide" in d, false);
     assert.strictEqual(d.sessionHudPinned, false);
@@ -66,7 +68,7 @@ describe("prefs.getDefaults", () => {
       allowedTgUserId: "",
       targetSessionKey: "",
       notifyOnComplete: false,
-      completionOutputMode: "full",
+      completionOutputMode: "off",
       r3DirectSendEnabled: false,
     });
   });
@@ -149,12 +151,14 @@ describe("prefs.validate", () => {
       sessionHudEnabled: "yes",
       sessionHudShowStateLabels: "yes",
       sessionHudShowElapsed: "yes",
+      sessionHudShowContextUsage: "yes",
       sessionHudCleanupDetached: "yes",
       hideBubbles: 0,        // wrong type
       permissionBubblesEnabled: "yes",
       notificationBubbleAutoCloseSeconds: -1,
       updateBubbleAutoCloseSeconds: 3601,
       allowEdgePinning: "yes",
+      disableMiniMode: "yes",
       savedPixelWidth: -1,
       savedPixelHeight: "286",
     });
@@ -168,12 +172,14 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.sessionHudEnabled, true);
     assert.strictEqual(v.sessionHudShowStateLabels, true);
     assert.strictEqual(v.sessionHudShowElapsed, true);
+    assert.strictEqual(v.sessionHudShowContextUsage, true);
     assert.strictEqual(v.sessionHudCleanupDetached, false);
     assert.strictEqual(v.hideBubbles, false);
     assert.strictEqual(v.permissionBubblesEnabled, true);
     assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(v.updateBubbleAutoCloseSeconds, 9);
     assert.strictEqual(v.allowEdgePinning, false);
+    assert.strictEqual(v.disableMiniMode, false);
     assert.strictEqual(v.savedPixelWidth, 0);
     assert.strictEqual(v.savedPixelHeight, 0);
   });
@@ -266,7 +272,7 @@ describe("prefs.validate", () => {
       allowedTgUserId: "123456789",
       targetSessionKey: "telegram:987654321",
       notifyOnComplete: false,
-      completionOutputMode: "full",
+      completionOutputMode: "off",
       r3DirectSendEnabled: false,
     });
     assert.strictEqual(Object.prototype.hasOwnProperty.call(v.tgApproval, "botToken"), false);
@@ -282,8 +288,10 @@ describe("prefs.validate", () => {
       sessionHudEnabled: false,
       sessionHudShowStateLabels: false,
       sessionHudShowElapsed: false,
+      sessionHudShowContextUsage: false,
       sessionHudCleanupDetached: true,
       allowEdgePinning: true,
+      disableMiniMode: true,
       keepSizeAcrossDisplays: true,
       savedPixelWidth: 286,
       savedPixelHeight: 286,
@@ -301,8 +309,10 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.sessionHudEnabled, false);
     assert.strictEqual(v.sessionHudShowStateLabels, false);
     assert.strictEqual(v.sessionHudShowElapsed, false);
+    assert.strictEqual(v.sessionHudShowContextUsage, false);
     assert.strictEqual(v.sessionHudCleanupDetached, true);
     assert.strictEqual(v.allowEdgePinning, true);
+    assert.strictEqual(v.disableMiniMode, true);
     assert.strictEqual(v.keepSizeAcrossDisplays, true);
     assert.strictEqual(v.savedPixelWidth, 286);
     assert.strictEqual(v.savedPixelHeight, 286);
@@ -840,7 +850,7 @@ describe("prefs.migrate v7 → v8 (Telegram bare completion default)", () => {
     assert.strictEqual(validated.version, prefs.CURRENT_VERSION);
     assert.strictEqual(validated.lang, "zh");
     assert.strictEqual(validated.tgApproval.notifyOnComplete, false);
-    assert.strictEqual(validated.tgApproval.completionOutputMode, "full");
+    assert.strictEqual(validated.tgApproval.completionOutputMode, "off");
   });
 });
 

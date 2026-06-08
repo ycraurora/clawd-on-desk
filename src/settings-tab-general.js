@@ -13,8 +13,10 @@
     "sessionHudEnabled",
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
+    "sessionHudShowContextUsage",
     "sessionHudCleanupDetached",
     "allowEdgePinning",
+    "disableMiniMode",
     "keepSizeAcrossDisplays",
     "manageClaudeHooksAutomatically",
     "openAtLogin",
@@ -51,12 +53,14 @@
   const SESSION_HUD_CHILD_SWITCH_KEYS = [
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
+    "sessionHudShowContextUsage",
     "sessionHudCleanupDetached",
   ];
   const SESSION_HUD_SUMMARY_KEYS = new Set([
     "sessionHudEnabled",
     "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
+    "sessionHudShowContextUsage",
     "sessionHudCleanupDetached",
   ]);
   const CLAUDE_HOOK_MANAGEMENT_CHILD_SWITCH_KEYS = [
@@ -104,6 +108,11 @@
         key: "allowEdgePinning",
         labelKey: "rowAllowEdgePinning",
         descKey: "rowAllowEdgePinningDesc",
+      }),
+      helpers.buildSwitchRow({
+        key: "disableMiniMode",
+        labelKey: "rowDisableMiniMode",
+        descKey: "rowDisableMiniModeDesc",
       }),
       helpers.buildSwitchRow({
         key: "keepSizeAcrossDisplays",
@@ -402,6 +411,12 @@
         disabled: !sessionHudControlsEnabled,
       }),
       helpers.buildSwitchRow({
+        key: "sessionHudShowContextUsage",
+        labelKey: "rowSessionHudContextUsage",
+        descKey: "rowSessionHudContextUsageDesc",
+        disabled: !sessionHudControlsEnabled,
+      }),
+      helpers.buildSwitchRow({
         key: "sessionHudCleanupDetached",
         labelKey: "rowSessionHudCleanupDetached",
         descKey: "rowSessionHudCleanupDetachedDesc",
@@ -442,6 +457,13 @@
             snapshot.sessionHudShowElapsed !== false ? onLabel : offLabel
           ),
           accent: snapshot.sessionHudShowElapsed !== false,
+        });
+        items.push({
+          text: t("sessionHudSummaryContextUsage").replace(
+            "{state}",
+            snapshot.sessionHudShowContextUsage !== false ? onLabel : offLabel
+          ),
+          accent: snapshot.sessionHudShowContextUsage !== false,
         });
         items.push({
           text: t("sessionHudSummaryCleanup").replace(
