@@ -277,7 +277,7 @@ const _settingsController = createSettingsController({
       : false,
     restartClawd: _restartClawdNow,
     clearSessionsByAgent: (id) => agentRuntime ? agentRuntime.clearSessionsByAgent(id) : 0,
-    dismissPermissionsByAgent: (id) => agentRuntime ? agentRuntime.dismissPermissionsByAgent(id) : 0,
+    dismissPermissionsByAgent: (id, options) => agentRuntime ? agentRuntime.dismissPermissionsByAgent(id, options) : 0,
     resizePet: _deferredResizePet,
     getActiveSessionAliasKeys: () =>
       _state && typeof _state.getActiveSessionAliasKeys === "function"
@@ -995,6 +995,7 @@ const {
 const {
   isAgentEnabled: _isAgentEnabled,
   isAgentPermissionsEnabled: _isAgentPermissionsEnabled,
+  isAgentSubagentPermissionsEnabled: _isAgentSubagentPermissionsEnabled,
   isAgentNotificationHookEnabled: _isAgentNotificationHookEnabled,
   isCodexNativeNotificationSoundEnabled: _isCodexNativeNotificationSoundEnabled,
   isCodexPermissionInterceptEnabled: _isCodexPermissionInterceptEnabled,
@@ -1017,6 +1018,13 @@ const _permCtx = {
   reapplyMacVisibility,
   isAgentPermissionsEnabled: (agentId) =>
     _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  // DANGER "auto-pilot": when true, showPermissionBubble auto-approves every
+  // request instead of rendering a bubble. DND / per-agent / headless gates
+  // run earlier in the route, so they still win — this only fires once a
+  // bubble would otherwise show. Headless fallback stays agent-specific
+  // (no-decision/native fallback, opencode silent TUI fallback, or CC deny).
+  isAutoApproveAllEnabled: () =>
+    _settingsController.get("autoApproveAllPermissions") === true,
   focusTerminalForSession: (sessionId, options = {}) => {
     focusDashboardSession(sessionId, {
       requestSource: options.requestSource || "permission-bubble",
@@ -1446,6 +1454,7 @@ const _serverCtx = {
   get sessions() { return sessions; },
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  isAgentSubagentPermissionsEnabled: (agentId) => _isAgentSubagentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   isCodexNativeNotificationSoundEnabled: () => _isCodexNativeNotificationSoundEnabled({ agents: _settingsController.get("agents") }),
   isCodexPermissionInterceptEnabled: () => _isCodexPermissionInterceptEnabled({ agents: _settingsController.get("agents") }),
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),
@@ -2500,6 +2509,16 @@ const _menuCtx = {
   set hideBubbles(v) { _settingsController.applyCommand("setAllBubblesHidden", { hidden: !!v }).catch((err) => {
     console.warn("Clawd: setAllBubblesHidden failed:", err && err.message);
   }); },
+  get autoApproveAllPermissions() { return _settingsController.get("autoApproveAllPermissions") === true; },
+  // Route through the gated command. The menu shows its own native danger
+  // confirm before setting true, so it passes confirmed:true; disabling needs
+  // no confirmation. applyUpdate is intentionally NOT used — the field is
+  // gated so the confirm dialog is a real boundary, not UI-only.
+  set autoApproveAllPermissions(v) {
+    _settingsController.applyCommand("setAutoApproveAll", { enabled: !!v, confirmed: true }).catch((err) => {
+      console.warn("Clawd: setAutoApproveAll failed:", err && err.message);
+    });
+  },
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get soundVolume() { return soundVolume; },

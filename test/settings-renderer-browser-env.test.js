@@ -2602,7 +2602,7 @@ describe("settings renderer browser environment", () => {
 
     const sections = generalHarness.content.querySelectorAll(".section");
     const sectionTitles = sections.map((section) => section.querySelector(".section-title").textContent);
-    assert.deepStrictEqual(sectionTitles, ["Appearance", "Session management", "Startup", "Bubbles"]);
+    assert.deepStrictEqual(sectionTitles, ["Appearance", "Session management", "System", "Startup", "Bubbles", "Permissions"]);
     assert.strictEqual(generalHarness.content.querySelector(".hardware-buddy-collapsible"), null);
 
     const remoteHarness = loadTelegramApprovalTabForTest({
@@ -2893,6 +2893,29 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("claudeHooksDisableConfirmTitle"));
     assert.ok(i18nSource.includes("claudeHooksDisableConfirmKeep"));
     assert.ok(i18nSource.includes("claudeHooksDisconnectConfirmKeep"));
+  });
+
+  it("wires the danger auto-pilot toggle with a confirm modal and red label", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    // Row is registered with danger:true and routes the enable path through a confirm.
+    assert.ok(generalSource.includes('key: "autoApproveAllPermissions"'));
+    assert.ok(generalSource.includes("danger: true"));
+    assert.ok(generalSource.includes("confirmAutoApproveAll"));
+    assert.ok(generalSource.includes("showAutoApproveAllConfirmModal"));
+    assert.ok(generalSource.includes('{ id: "enable", label: t("autoApproveAllConfirmEnable"), tone: "danger" }'));
+    // buildSwitchRow honors danger by painting the label red.
+    assert.ok(coreSource.includes("row-label-danger"));
+    assert.ok(css.includes(".row-label.row-label-danger"));
+    // Simple title + localized confirm strings exist.
+    assert.ok(i18nSource.includes('rowAutoApproveAll: "Auto-pilot"'));
+    assert.ok(i18nSource.includes('rowAutoApproveAll: "自动驾驶"'));
+    assert.ok(i18nSource.includes("autoApproveAllConfirmTitle"));
+    // Lives in its own Permissions section, not under Bubbles.
+    assert.ok(generalSource.includes('t("sectionPermissions")'));
+    assert.ok(i18nSource.includes('sectionPermissions: "Permissions"'));
   });
 
   it("clears successful switch transient state so rerenders do not keep wait cursors", () => {
@@ -3963,6 +3986,98 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(soundSwitch.element.classList.contains("disabled"), false);
     assert.strictEqual(soundSwitch.element.attributes["aria-disabled"], "false");
     assert.strictEqual(soundSwitch.element.attributes.tabindex, "0");
+  });
+
+  it("mounts the Claude subagent permission switch and greys it with the permission gate (#451)", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "claude-code": {
+            enabled: true,
+            permissionsEnabled: true,
+            subagentPermissionsEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "claude-code",
+        name: "Claude Code",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:claude-code": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const subagentSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "claude-code" && meta.flag === "subagentPermissionsEnabled");
+    assert.ok(subagentSwitch, "Claude subagent permission switch should be mounted");
+    assert.strictEqual(subagentSwitch.element.classList.contains("disabled"), false);
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          "claude-code": {
+            enabled: true,
+            permissionsEnabled: false,
+            subagentPermissionsEnabled: true,
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          "claude-code": {
+            enabled: true,
+            permissionsEnabled: false,
+            subagentPermissionsEnabled: true,
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(subagentSwitch.element.classList.contains("disabled"), true);
+    assert.strictEqual(subagentSwitch.element.attributes["aria-disabled"], "true");
+    assert.strictEqual(subagentSwitch.element.attributes.tabindex, "-1");
+  });
+
+  it("does not render the subagent permission switch for non-Claude agents (#451)", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codebuddy: {
+            enabled: true,
+            permissionsEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codebuddy",
+        name: "CodeBuddy",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codebuddy": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const subagentSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.flag === "subagentPermissionsEnabled");
+    assert.strictEqual(subagentSwitch, undefined);
+    const permissionsSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "codebuddy" && meta.flag === "permissionsEnabled");
+    assert.ok(permissionsSwitch, "CodeBuddy permission switch should still be mounted");
   });
 
   it("slides the Codex permission mode pill when mode broadcasts patch in place", () => {
