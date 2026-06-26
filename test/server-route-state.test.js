@@ -54,6 +54,7 @@ function callStatePost(body, overrides = {}) {
     };
     const ctx = {
       STATE_SVGS: {
+        idle: "x.svg",
         working: "x.svg",
         attention: "x.svg",
         notification: "x.svg",
@@ -144,6 +145,8 @@ describe("server-route-state POST", () => {
       codex_source: "vscode",
       ghostty_terminal_id: "ghostty-term-7",
       session_title: "  Work title  ",
+      tool_name: "Read",
+      transcript_path: "/Users/tester/.claude/projects/repo/session.jsonl",
       permission_suspect: true,
       preserve_state: true,
       hook_source: "codex-official",
@@ -177,6 +180,8 @@ describe("server-route-state POST", () => {
         contextUsage: null,
         assistantLastOutput: null,
         assistantLastOutputTruncated: false,
+        toolName: "Read",
+        transcriptPath: "/Users/tester/.claude/projects/repo/session.jsonl",
         permissionSuspect: true,
         preserveState: true,
         hookSource: "codex-official",
@@ -199,6 +204,21 @@ describe("server-route-state POST", () => {
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutput, "Done.\nsecret=abc123");
     assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutputTruncated, true);
+  });
+
+  it("celebrates Codex official no-tool Stop when assistant output is present", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      session_id: "codex:sid",
+      event: "Stop",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      assistant_last_output: "Short answer.",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.calls.updateSession[0][1], "attention");
+    assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutput, "Short answer.");
   });
 
   it("passes valid context_usage to updateSession", async () => {
