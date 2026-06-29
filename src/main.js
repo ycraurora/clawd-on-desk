@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, clipboard } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard } = require("electron");
 // ── Linux/Wayland: relaunch under XWayland so the pet is draggable (issue #441) ──
 // Native Wayland ignores client-side window positioning and blocks global cursor
 // queries, so the pet spawns centered, can't be dragged, and has no tracking;
@@ -83,6 +83,8 @@ const { registerSettingsIpc } = require("./settings-ipc");
 const createSettingsEffectRouter = require("./settings-effect-router");
 const { registerSessionIpc } = require("./session-ipc");
 const { registerPetInteractionIpc } = require("./pet-interaction-ipc");
+const { createSystemWakeRecovery } = require("./system-wake-recovery");
+const { formatLocalTimestamp } = require("./log-timestamp");
 const { launchClaudeSession, openTerminalAt } = require("./launch-claude");
 const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
@@ -162,6 +164,15 @@ if (isWin) {
     console.warn("Clawd: koffi/AllowSetForegroundWindow not available:", err.message);
   }
 }
+
+// ── Windows: foreground-fullscreen probe (suppress topmost over games) ──
+// Best-effort; degrades to "never fullscreen" if koffi/user32 is unavailable,
+// so a broken probe can never hide the pet.
+const { createForegroundFullscreenProbe } = require("./win-fullscreen-detect");
+const _isForegroundFullscreen = createForegroundFullscreenProbe({
+  isWin,
+  onError: (err) => console.warn("Clawd: win-fullscreen-detect not available:", err && err.message),
+});
 
 // ── Windows: switch the dev console to UTF-8 ──
 //
@@ -297,6 +308,7 @@ function _restartClawdNow() {
 let shortcutRuntime = null;
 let themeRuntime = null;
 let agentRuntime = null;
+let systemWakeRecovery = null;
 let floatingWindowRuntime = null;
 let codexPetMain = null;
 let telegramApprovalSidecar = null;
@@ -448,6 +460,21 @@ function flushRuntimeStateToPrefs() {
   if (!win || win.isDestroyed()) return;
   const bounds = getPetWindowBounds();
   const theme = getActiveTheme();
+  // #408: persist the frozen keep-size, not the live window bounds — otherwise a
+  // bounds value inflated by a DPI flux gets saved and restored on relaunch.
+  const isFrozenActive = keepSizeAcrossDisplaysCached && isProportionalMode();
+  const persistPx = isFrozenActive
+    ? getEffectiveCurrentPixelSize()
+    : { width: bounds.width, height: bounds.height };
+  // #408 round-2: also persist the frozen-origin work area (kept independent
+  // of positionDisplay; see the schema comment on savedPixelWorkArea). Calling
+  // getEffectiveCurrentPixelSize above already lazy-seeded the origin if it
+  // wasn't seeded yet.
+  const persistOriginWa = isFrozenActive
+    ? (keepSizeFrozenOriginWa
+        ? { width: keepSizeFrozenOriginWa.width, height: keepSizeFrozenOriginWa.height }
+        : null)
+    : null;
   _settingsController.applyBulk({
     x: bounds.x,
     y: bounds.y,
@@ -455,8 +482,9 @@ function flushRuntimeStateToPrefs() {
     positionThemeId: theme ? theme._id : "",
     positionVariantId: theme ? theme._variantId : "",
     positionDisplay: captureCurrentDisplaySnapshot(bounds),
-    savedPixelWidth: bounds.width,
-    savedPixelHeight: bounds.height,
+    savedPixelWidth: persistPx.width,
+    savedPixelHeight: persistPx.height,
+    savedPixelWorkArea: persistOriginWa,
     size: currentSize,
     miniMode: _mini.getMiniMode(),
     miniEdge: _mini.getMiniEdge(),
@@ -749,15 +777,55 @@ function getCurrentPixelSize(overrideWa) {
   return getPixelSizeFor(currentSize, overrideWa);
 }
 
+// #408: while keepSizeAcrossDisplays is ON, the frozen pixel size is held in
+// memory (keepSizeFrozenPx) rather than re-read from win.getBounds() on every
+// access. Re-reading the live bounds let a transiently-wrong value during a
+// Windows sleep/wake DPI flux get laundered back through setBounds(), ratcheting
+// the pet larger each cycle ("the longer it sleeps, the bigger it gets"). Seeded
+// at launch and lazily on first use; cleared (→ re-seeded from the proportional
+// size) whenever the size or the keepSize toggle changes.
+let keepSizeFrozenPx = null;
+// #408 round-2: track the *origin* display's work area alongside the frozen
+// pixel size so a legitimate cross-display keep-size (set on a large display,
+// later moved to a smaller one via "Send to display") is not mis-clamped on
+// the next launch — positionDisplay tracks the LAST-FLUSH display, which after
+// a send diverges from the actual frozen origin. Lifecycle mirrors
+// keepSizeFrozenPx (lazy-seeded together, reset together, persisted together).
+let keepSizeFrozenOriginWa = null;
+
+function resetKeepSizeFrozen() {
+  keepSizeFrozenPx = null;
+  keepSizeFrozenOriginWa = null;
+}
+
+function snapshotKeepSizeOriginWa(wa) {
+  if (!wa || typeof wa !== "object") return null;
+  const w = Number(wa.width);
+  const h = Number(wa.height);
+  if (!Number.isFinite(w) || w <= 0) return null;
+  if (!Number.isFinite(h) || h <= 0) return null;
+  return { width: w, height: h };
+}
+
 function getEffectiveCurrentPixelSize(overrideWa) {
-  if (
-    keepSizeAcrossDisplaysCached &&
-    isProportionalMode() &&
-    win &&
-    !win.isDestroyed()
-  ) {
-    const bounds = getPetWindowBounds();
-    return { width: bounds.width, height: bounds.height };
+  if (keepSizeAcrossDisplaysCached && isProportionalMode()) {
+    // #408: seed from the CURRENT display's proportional size, never from an
+    // overrideWa — callers like sendToDisplay/bringPetToPrimaryDisplay pass a
+    // *target* display's work area, and seeding from that would freeze the
+    // pet at the target's proportional size instead of its realized size.
+    if (!keepSizeFrozenPx) {
+      // Mirror getPixelSizeFor's wa resolution so the captured origin matches
+      // the display we actually sized from.
+      let seedWa = null;
+      if (win && !win.isDestroyed()) {
+        const { x, y, width, height } = getPetWindowBounds();
+        seedWa = getNearestWorkArea(x + width / 2, y + height / 2);
+      }
+      if (!seedWa) seedWa = getPrimaryWorkAreaSafe() || SYNTHETIC_WORK_AREA;
+      keepSizeFrozenPx = getProportionalPixelSize(getProportionalRatio(), seedWa);
+      keepSizeFrozenOriginWa = snapshotKeepSizeOriginWa(seedWa);
+    }
+    return { width: keepSizeFrozenPx.width, height: keepSizeFrozenPx.height };
   }
   return getCurrentPixelSize(overrideWa);
 }
@@ -789,6 +857,7 @@ let keepAwakeWhileWorking = _settingsController.get("keepAwakeWhileWorking");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
 let disableMiniModeCached = _settingsController.get("disableMiniMode");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
+let fullscreenOverlayCached = _settingsController.get("fullscreenOverlay");
 let textScale = _settingsController.get("textScale");
 let textScaleByDisplay = _settingsController.get("textScaleByDisplay");
 // Transient slider-drag override for ONE display — the one the settings
@@ -1153,6 +1222,20 @@ function beginDragSnapshot() { return petWindowRuntime.beginDragSnapshot(); }
 function clearDragSnapshot() { return petWindowRuntime.clearDragSnapshot(); }
 function moveWindowForDrag() { return petWindowRuntime.moveWindowForDrag(); }
 
+// Windows-only (#538 drag focus-steal): the topmost watchdog calls this each
+// tick with the inverse of the fullscreen state. While a fullscreen app owns
+// the foreground we drop the hit window's activation so a click on the pet
+// can't steal focus from an exclusive-fullscreen game and minimize it; we
+// restore it when fullscreen ends because dragging needs activation (#545).
+// Idempotent via isFocusable() so the per-tick call is a no-op when unchanged.
+function setHitWinFocusable(focusable) {
+  if (!isWin) return;
+  if (!hitWin || hitWin.isDestroyed() || typeof hitWin.setFocusable !== "function") return;
+  const next = !!focusable;
+  if (typeof hitWin.isFocusable === "function" && hitWin.isFocusable() === next) return;
+  hitWin.setFocusable(next);
+}
+
 // ── Mini Mode — delegated to src/mini.js ──
 // Initialized after state module (needs applyState, resolveDisplayState, etc.)
 // See _mini initialization below
@@ -1173,6 +1256,9 @@ const topmostRuntime = createTopmostRuntime({
   isDragLocked: () => petWindowRuntime.isDragLocked(),
   isMiniAnimating: () => _mini.getIsAnimating(),
   isMiniTransitioning: () => _mini.getMiniTransitioning(),
+  isForegroundFullscreen: () => _isForegroundFullscreen(),
+  getFullscreenOverlay: () => fullscreenOverlayCached,
+  setHitWinFocusable,
   keepOutOfTaskbar,
   setForceEyeResend,
   applyPetWindowPosition,
@@ -1185,6 +1271,7 @@ const {
   scheduleHwndRecovery,
   guardAlwaysOnTop,
   startTopmostWatchdog,
+  startFocusablePoll,
 } = topmostRuntime;
 
 // ── Permission bubble — delegated to src/permission.js ──
@@ -1483,6 +1570,7 @@ const _tickCtx = {
   get dragLocked() { return petWindowRuntime.isDragLocked(); },
   get menuOpen() { return menuOpen; },
   get idlePaused() { return idlePaused; },
+  get lowPowerIdleMode() { return lowPowerIdleMode; },
   get lowPowerIdlePaused() { return lowPowerIdlePaused; },
   get isAnimating() { return _mini.getIsAnimating(); },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
@@ -1814,7 +1902,7 @@ function updateLog(msg) {
 function sessionLog(msg) {
   if (!sessionDebugLog) return;
   const { rotatedAppend } = require("./log-rotate");
-  rotatedAppend(sessionDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
+  rotatedAppend(sessionDebugLog, `[${formatLocalTimestamp()}] ${msg}\n`);
 }
 
 ipcMain.on("sound-playback-error", (_event, payload) => {
@@ -2974,7 +3062,7 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 
 // ── Settings effect router ──
 const SETTINGS_MIRROR_SETTERS = {
-  lang: (v) => { lang = v; }, size: (v) => { currentSize = v; }, showTray: (v) => { showTray = v; },
+  lang: (v) => { lang = v; }, size: (v) => { currentSize = v; resetKeepSizeFrozen(); }, showTray: (v) => { showTray = v; },
   showDock: (v) => { showDock = v; if (macHideController) macHideController.noteManualChange(); }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
   autoStartWithClaude: (v) => { autoStartWithClaude = v; }, openAtLogin: (v) => { openAtLogin = v; },
   bubbleFollowPet: (v) => { bubbleFollowPet = v; }, sessionHudEnabled: (v) => { sessionHudEnabled = v; },
@@ -2987,7 +3075,8 @@ const SETTINGS_MIRROR_SETTERS = {
   detachedIdleStaleMs: (v) => { detachedIdleStaleMs = v; },
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
   keepAwakeWhileWorking: (v) => { keepAwakeWhileWorking = v; },
-  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
+  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; resetKeepSizeFrozen(); },
+  fullscreenOverlay: (v) => { fullscreenOverlayCached = v; },
   freeRoam: (v) => { _roam.setEnabled(v); },
   textScale: (v) => { textScale = v; textScalePreview = null; },
   textScaleByDisplay: (v) => { textScaleByDisplay = v; textScalePreview = null; },
@@ -3306,6 +3395,20 @@ function createWindow() {
   // keepSizeAcrossDisplays preserves the last realized pixel size across restarts.
   const proportionalSize = getCurrentPixelSize(launchSizingWorkArea);
   const size = getLaunchPixelSize(prefs, proportionalSize);
+  // #408: seed the in-memory frozen keep-size from the realized launch size, so
+  // display events reuse it instead of re-reading transiently-wrong live bounds.
+  if (keepSizeAcrossDisplaysCached && isProportionalMode()) {
+    keepSizeFrozenPx = { width: size.width, height: size.height };
+    // #408 round-2: restore the frozen origin Wa too. Prefer the dedicated
+    // savedPixelWorkArea (post-fix prefs); fall back to positionDisplay.workArea
+    // for legacy prefs — the next flush will rewrite with the new field.
+    const persistedOrigin = snapshotKeepSizeOriginWa(prefs.savedPixelWorkArea);
+    if (persistedOrigin) {
+      keepSizeFrozenOriginWa = persistedOrigin;
+    } else if (prefs.positionDisplay && prefs.positionDisplay.workArea) {
+      keepSizeFrozenOriginWa = snapshotKeepSizeOriginWa(prefs.positionDisplay.workArea);
+    }
+  }
 
   const {
     initialVirtualBounds,
@@ -3381,6 +3484,7 @@ function createWindow() {
     getPetWindowBounds: () => getPetWindowBounds(),
     getKeepSizeAcrossDisplays: () => keepSizeAcrossDisplaysCached,
     getCurrentPixelSize: () => getCurrentPixelSize(),
+    getEffectiveCurrentPixelSize: () => getEffectiveCurrentPixelSize(),
     computeDragEndBounds: (virtualBounds, size) =>
       computeFinalDragBounds(virtualBounds, size, clampToScreenVisual),
     applyPetWindowBounds: (bounds) => applyPetWindowBounds(bounds),
@@ -3443,8 +3547,23 @@ function createWindow() {
 
   guardAlwaysOnTop(win);
   startTopmostWatchdog();
+  startFocusablePoll();
 
-  screen.on("display-metrics-changed", () => petWindowRuntime.handleDisplayMetricsChanged());
+  // display-metrics-changed fires in bursts during DPI changes and RDP
+  // reconnects, and each one re-clamps/repositions the pet — running them all
+  // makes the pet visibly jitter mid-transition. Debounce the geometry handler
+  // to the settled state, mirroring the textScale debounce below. (Keep
+  // display-removed/added immediate: those rescue the pet off a vanished
+  // display and must not be delayed.)
+  let displayMetricsGeometryTimer = null;
+  const reapplyDisplayGeometryAfterMetricsChange = () => {
+    if (displayMetricsGeometryTimer) clearTimeout(displayMetricsGeometryTimer);
+    displayMetricsGeometryTimer = setTimeout(() => {
+      displayMetricsGeometryTimer = null;
+      petWindowRuntime.handleDisplayMetricsChanged();
+    }, 400);
+  };
+  screen.on("display-metrics-changed", reapplyDisplayGeometryAfterMetricsChange);
   screen.on("display-removed", () => petWindowRuntime.handleDisplayRemoved());
   screen.on("display-added", () => petWindowRuntime.handleDisplayAdded());
 
@@ -3703,6 +3822,23 @@ if (!gotTheLock) {
       console.warn("Clawd: migration controller init failed:", err && err.message);
     });
     createWindow();
+    systemWakeRecovery = createSystemWakeRecovery({
+      powerMonitor,
+      ipcMain,
+      sendToRenderer,
+      onRecovered: () => {
+        setLowPowerIdlePaused(false);
+        // The main mirror can already be false while the renderer still owns a
+        // paused SVG. Always resend the latest cursor position after receipt.
+        setForceEyeResend(true);
+      },
+      log: sessionLog,
+      onError: (err) => safeConsoleError(
+        "Clawd: system wake recovery failed:",
+        err && err.message ? err.message : err
+      ),
+    });
+    systemWakeRecovery.start();
     // macOS: bridge the OS app-hidden state (⌘H / Dock right-click → 隐藏) to the
     // pet. Pet windows are setCanHide:NO, so the OS marks the app hidden but the
     // windows refuse to vanish, and an inactive-app Dock Hide fires no
@@ -3769,6 +3905,7 @@ if (!gotTheLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    if (systemWakeRecovery) systemWakeRecovery.dispose();
     try { stopUpdateScheduler(); } catch {}
     releasePowerSaveBlocker();
     flushRuntimeStateToPrefs();
