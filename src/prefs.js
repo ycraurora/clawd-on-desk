@@ -27,6 +27,10 @@ const {
   normalizeTelegramApproval,
 } = require("./telegram-approval-settings");
 const {
+  cloneDefaultFeishuApproval,
+  normalizeFeishuApproval,
+} = require("./feishu-approval-settings");
+const {
   DEFAULT_HARDWARE_BUDDY_SETTINGS,
   normalizeHardwareBuddySettings,
 } = require("./hardware-buddy-settings");
@@ -115,6 +119,13 @@ const SCHEMA = {
   showDock: { type: "boolean", default: false },
   manageClaudeHooksAutomatically: { type: "boolean", default: true },
   autoStartWithClaude: { type: "boolean", default: false },
+  // Codex approval awareness depends entirely on the official PermissionRequest
+  // hook (JSONL no longer infers approvals). These surface its health: the
+  // toggle gates the startup nudge, and LastNotified is the edge-trigger dedup
+  // signature (empty = healthy/never-warned) so a broken hook nags at most once
+  // per distinct breakage, not every launch. See codex-hook-health.js.
+  codexHookHealthNotifyEnabled: { type: "boolean", default: true },
+  codexHookHealthLastNotified: { type: "string", default: "" },
   // System-backed: actual truth lives in OS login items / autostart files.
   // `openAtLoginHydrated` starts false; main.js's startup hydrate helper imports
   // the current system value into prefs on first run, then flips this flag.
@@ -276,6 +287,8 @@ const SCHEMA = {
       // Qoder is state-only (Phase 1) — permission bubbles default off.
       "qoder": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
       "reasonix": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // QoderWork is state-only (Phase 1) — permission bubbles default off.
+      "qoderwork": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
@@ -319,6 +332,11 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => cloneDefaultTelegramApproval(),
     normalize: normalizeTelegramApproval,
+  },
+  feishuApproval: {
+    type: "object",
+    defaultFactory: () => cloneDefaultFeishuApproval(),
+    normalize: normalizeFeishuApproval,
   },
   // v0.9.0 migration state. transport defaults to null (undecided) so v0.8.x
   // users upgrading without this key fall onto the "detect legacy artefacts"

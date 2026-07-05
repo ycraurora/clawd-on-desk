@@ -91,6 +91,8 @@ const initPermission = require("./permission");
 const { registerPermissionIpc } = initPermission;
 const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar");
 const telegramApprovalSettings = require("./telegram-approval-settings");
+const { FeishuApprovalClient } = require("./feishu-approval-client");
+const feishuApprovalSettings = require("./feishu-approval-settings");
 const {
   buildTelegramApprovalStatus,
   isNativeTelegramApprovalSelected,
@@ -320,6 +322,10 @@ let telegramNativeRunner = null;
 let telegramCompanion = null;
 let telegramDirectSend = null;
 let suppressTelegramApprovalSidecarSync = 0;
+let feishuApprovalClient = null;
+let feishuApprovalSyncPromise = Promise.resolve();
+let feishuApprovalConfigSignature = "";
+let feishuApprovalSecretsRevision = 0;
 let hardwareBuddyAdapter = null;
 let hardwareBuddyStatus = null;
 let hardwareBuddyTestApprovalPromise = null;
@@ -370,6 +376,10 @@ const _settingsController = createSettingsController({
     getTelegramApprovalTokenInfo: () => getTelegramApprovalTokenInfo(),
     sendTelegramApprovalTest: () => sendTelegramApprovalTest(),
     deleteTelegramApprovalTokenFile: () => deleteTelegramApprovalTokenFile(),
+    writeFeishuApprovalSecrets: (secrets) => writeFeishuApprovalSecrets(secrets),
+    getFeishuApprovalStatus: () => getFeishuApprovalStatus(),
+    getFeishuApprovalSecretInfo: () => getFeishuApprovalSecretInfo(),
+    sendFeishuApprovalTest: () => sendFeishuApprovalTest(),
     // Lazy getter so settings-actions can use the controller even though it's
     // instantiated below (forward-reference).
     get telegramMigration() {
@@ -993,6 +1003,14 @@ function sendToRenderer(channel, ...args) {
 function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
 }
+function broadcastSettingsWindow(channel, payload) {
+  try {
+    const settingsWin = getSettingsWindow();
+    if (!settingsWin || settingsWin.isDestroyed()) return;
+    if (!settingsWin.webContents || settingsWin.webContents.isDestroyed()) return;
+    settingsWin.webContents.send(channel, payload);
+  } catch {}
+}
 
 function getThemeSoundPreloadUrls() {
   const urls = [];
@@ -1234,6 +1252,18 @@ function setHitWinFocusable(focusable) {
   const next = !!focusable;
   if (typeof hitWin.isFocusable === "function" && hitWin.isFocusable() === next) return;
   hitWin.setFocusable(next);
+  // Electron's NativeWindowViews::SetFocusable couples activation to the
+  // taskbar on Windows: SetFocusable(true) internally calls
+  // SetSkipTaskbar(false) → ITaskbarList::AddTab, so restoring activation
+  // after a fullscreen exit (or a screenshot overlay dismissing) flashes a
+  // taskbar button for the hit window (#586). Delete the tab again in the
+  // same turn, before the taskbar repaints.
+  // true-direction ONLY: SetFocusable(false) already deletes the tab
+  // internally, and re-deleting on that path broke cursor-drag while a
+  // fullscreen app was foreground (real-machine repro during #586 review;
+  // exact Windows-side mechanism unconfirmed). Do not "simplify" this into
+  // an unconditional call.
+  if (next) keepOutOfTaskbar(hitWin);
 }
 
 // ── Mini Mode — delegated to src/mini.js ──
@@ -1324,6 +1354,12 @@ const _permCtx = {
   clearShortcutFailure: (actionId) => shortcutRuntime.clearFailure(actionId),
   repositionUpdateBubble: () => repositionUpdateBubble(),
   getTelegramApprovalClient: () => getTelegramApprovalClient(),
+  getRemoteApprovalClients: () => {
+    const client = getFeishuApprovalClient();
+    return client && typeof client.isConnected === "function" && client.isConnected()
+      ? [{ name: "feishu", client }]
+      : [];
+  },
   onPermissionsChanged: () => {
     if (hardwareBuddyAdapter) hardwareBuddyAdapter.notifyPermissionsChanged();
   },
@@ -1842,7 +1878,6 @@ agentRuntime = createAgentRuntimeMain({
   isAgentEnabled: (agentId) => _isAgentEnabled(_settingsController.getSnapshot(), agentId),
   updateSession: (sessionId, state, event, opts) => updateSession(sessionId, state, event, opts),
   captureGhosttyTerminalId,
-  showCodexNotifyBubble: (payload) => showCodexNotifyBubble(payload),
   clearCodexNotifyBubbles: (...args) => clearCodexNotifyBubbles(...args),
 });
 
@@ -1868,6 +1903,7 @@ const _serverCtx = {
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),
   setState,
   updateSession: agentRuntime.updateSessionFromServer,
+  updateSessionMetadata: (sessionId, opts) => _state.updateSessionMetadata(sessionId, opts),
   resolvePermissionEntry,
   sendPermissionResponse,
   addPendingPermission,
@@ -1957,6 +1993,18 @@ function getTelegramCompanionClient() {
   return null;
 }
 
+function getFeishuApprovalClient() {
+  return feishuApprovalClient && typeof feishuApprovalClient.isConnected === "function" && feishuApprovalClient.isConnected()
+    ? feishuApprovalClient
+    : null;
+}
+
+function getConfiguredFeishuApprovalClient() {
+  return feishuApprovalClient && typeof feishuApprovalClient.isEnabled === "function" && feishuApprovalClient.isEnabled()
+    ? feishuApprovalClient
+    : null;
+}
+
 function telegramApprovalLog(level, message, meta = {}) {
   const parts = [`telegram approval ${level}: ${message}`];
   if (meta && meta.text) parts.push(String(meta.text).trim());
@@ -1970,8 +2018,34 @@ function telegramApprovalLog(level, message, meta = {}) {
   permLog(parts.filter(Boolean).join(" | "));
 }
 
+function feishuApprovalLog(level, message, meta = {}) {
+  const parts = [`feishu approval ${level}: ${message}`];
+  if (meta && meta.text) parts.push(String(meta.text).trim());
+  if (meta && meta.error) parts.push(String(meta.error).trim());
+  for (const key of ["requestId", "messageId", "decision", "matched"]) {
+    const value = meta && meta[key];
+    if (value !== undefined && value !== null && value !== "") {
+      parts.push(`${key}=${String(value).trim()}`);
+    }
+  }
+  const config = getFeishuApprovalPrefs();
+  const secrets = getFeishuApprovalSecrets();
+  const redactionSecrets = feishuApprovalSettings.redactionSecretsForFeishuApproval(config, secrets);
+  for (const secret of redactionSecrets) {
+    if (!secret) continue;
+    for (let i = 0; i < parts.length; i += 1) {
+      parts[i] = String(parts[i]).split(String(secret)).join("<redacted>");
+    }
+  }
+  permLog(parts.filter(Boolean).join(" | "));
+}
+
 function getTelegramApprovalPrefs() {
   return telegramApprovalSettings.normalizeTelegramApproval(_settingsController.get("tgApproval"));
+}
+
+function getFeishuApprovalPrefs() {
+  return feishuApprovalSettings.normalizeFeishuApproval(_settingsController.get("feishuApproval"));
 }
 
 function getTelegramMigrationPrefs() {
@@ -2048,6 +2122,206 @@ function getTelegramApprovalPaths() {
     configPath: telegramApprovalSettings.defaultBridgeConfigPath(userDataDir),
     tokenEnvFilePath: telegramApprovalSettings.defaultTokenEnvFilePath(userDataDir),
   };
+}
+
+function getFeishuApprovalPaths() {
+  const userDataDir = app.getPath("userData");
+  return {
+    userDataDir,
+    secretsEnvFilePath: feishuApprovalSettings.defaultSecretsEnvFilePath(userDataDir),
+  };
+}
+
+function getFeishuApprovalSecrets() {
+  const paths = getFeishuApprovalPaths();
+  return feishuApprovalSettings.readSecretsEnvFile({
+    fs,
+    filePath: paths.secretsEnvFilePath,
+  });
+}
+
+function getFeishuApprovalSecretInfo() {
+  const paths = getFeishuApprovalPaths();
+  return feishuApprovalSettings.readMaskedSecrets({
+    fs,
+    filePath: paths.secretsEnvFilePath,
+  });
+}
+
+function buildFeishuApprovalSignature(config, paths, secrets) {
+  return JSON.stringify({
+    enabled: config.enabled === true,
+    idType: config.idType,
+    approverId: config.approverId,
+    secretsEnvFilePath: paths.secretsEnvFilePath,
+    appId: secrets.appId,
+    appSecret: secrets.appSecret ? "set" : "",
+    verificationToken: secrets.verificationToken ? "set" : "",
+    encryptKey: secrets.encryptKey ? "set" : "",
+    connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    secretsRevision: feishuApprovalSecretsRevision,
+  });
+}
+
+function getFeishuApprovalStatus() {
+  const config = getFeishuApprovalPrefs();
+  const secrets = getFeishuApprovalSecrets();
+  const ready = feishuApprovalSettings.readiness(config, secrets);
+  const clientStatus = feishuApprovalClient && typeof feishuApprovalClient.getStatus === "function"
+    ? feishuApprovalClient.getStatus()
+    : { status: "stopped" };
+  return {
+    ...clientStatus,
+    enabled: config.enabled === true,
+    configured: ready.ready === true,
+    reason: ready.reason || "",
+    message: clientStatus.message || ready.message || "",
+    connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    secretsStored: !!(secrets.appId || secrets.appSecret || secrets.verificationToken || secrets.encryptKey),
+  };
+}
+
+function broadcastFeishuApprovalStatus() {
+  broadcastSettingsWindow("remoteApproval:status-changed", {
+    channel: "feishu",
+    status: getFeishuApprovalStatus(),
+  });
+}
+
+function writeFeishuApprovalSecrets(secrets) {
+  const paths = getFeishuApprovalPaths();
+  const result = feishuApprovalSettings.writeSecretsEnvFile({
+    fs,
+    path,
+    filePath: paths.secretsEnvFilePath,
+    secrets,
+    platform: process.platform,
+  });
+  if (result && result.status === "ok") {
+    feishuApprovalSecretsRevision += 1;
+    queueFeishuApprovalSync("secrets");
+  }
+  return result;
+}
+
+async function startFeishuApprovalClient() {
+  const config = getFeishuApprovalPrefs();
+  const paths = getFeishuApprovalPaths();
+  const secrets = getFeishuApprovalSecrets();
+  const ready = feishuApprovalSettings.readiness(config, secrets);
+  if (!ready.ready) {
+    if (feishuApprovalClient) stopFeishuApprovalClient();
+    if (ready.reason !== "disabled") {
+      feishuApprovalLog("info", ready.reason || "not configured", {
+        error: ready.message || "",
+      });
+    }
+    return false;
+  }
+  const signature = buildFeishuApprovalSignature(config, paths, secrets);
+  if (feishuApprovalClient && feishuApprovalConfigSignature === signature) {
+    try {
+      await feishuApprovalClient.start();
+      return true;
+    } catch (err) {
+      feishuApprovalLog("warn", "start failed", { error: err && err.message ? err.message : String(err) });
+      return false;
+    }
+  }
+  stopFeishuApprovalClient();
+  feishuApprovalClient = new FeishuApprovalClient({
+    appId: secrets.appId,
+    appSecret: secrets.appSecret,
+    verificationToken: secrets.verificationToken,
+    encryptKey: secrets.encryptKey,
+    approverId: config.approverId,
+    idType: config.idType,
+    connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    log: feishuApprovalLog,
+    onStatusChange: () => broadcastFeishuApprovalStatus(),
+  });
+  feishuApprovalConfigSignature = signature;
+  try {
+    await feishuApprovalClient.start();
+    feishuApprovalLog("info", "starting");
+    return true;
+  } catch (err) {
+    feishuApprovalLog("warn", "start failed", { error: err && err.message ? err.message : String(err) });
+    return false;
+  }
+}
+
+function stopFeishuApprovalClient() {
+  const client = feishuApprovalClient;
+  feishuApprovalClient = null;
+  feishuApprovalConfigSignature = "";
+  if (client && typeof client.close === "function") {
+    try { client.close(); } catch (err) {
+      feishuApprovalLog("warn", "stop failed", { error: err && err.message ? err.message : String(err) });
+    }
+  }
+}
+
+async function syncFeishuApproval(reason = "settings") {
+  const config = getFeishuApprovalPrefs();
+  const secrets = getFeishuApprovalSecrets();
+  const ready = feishuApprovalSettings.readiness(config, secrets);
+  if (!ready.ready) {
+    stopFeishuApprovalClient();
+    return false;
+  }
+  const started = await startFeishuApprovalClient();
+  if (started) feishuApprovalLog("debug", `sync ${reason}`);
+  return started;
+}
+
+function queueFeishuApprovalSync(reason) {
+  feishuApprovalSyncPromise = feishuApprovalSyncPromise
+    .catch(() => {})
+    .then(() => syncFeishuApproval(reason));
+  return feishuApprovalSyncPromise;
+}
+
+function feishuApprovalUnavailableMessage(status) {
+  if (status && status.message) return status.message;
+  if (status && status.reason === "disabled") return "Feishu approval is disabled";
+  if (status && status.reason === "missing-secret") return "Feishu App ID and App Secret are not configured";
+  if (status && status.reason === "invalid-config") return "Feishu approval config is incomplete";
+  return "Feishu approval client is not running";
+}
+
+async function sendFeishuApprovalTest() {
+  const beforeStatus = getFeishuApprovalStatus();
+  if (beforeStatus.configured !== true) {
+    return { status: "error", message: feishuApprovalUnavailableMessage(beforeStatus) };
+  }
+  await queueFeishuApprovalSync("test");
+  const client = getConfiguredFeishuApprovalClient();
+  if (!client || typeof client.requestApproval !== "function") {
+    return { status: "error", message: feishuApprovalUnavailableMessage(getFeishuApprovalStatus()) };
+  }
+  if (typeof client.waitUntilConnected === "function") {
+    const config = getFeishuApprovalPrefs();
+    const timeoutMs = Math.max(1, Number(config.connectionTimeoutSeconds) || 15) * 1000;
+    const connected = await client.waitUntilConnected(timeoutMs);
+    if (!connected) {
+      return { status: "error", message: feishuApprovalUnavailableMessage(getFeishuApprovalStatus()) };
+    }
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60 * 1000);
+  try {
+    const decision = await client.requestApproval({
+      title: "Clawd Feishu approval test",
+      detail: "This is a settings test message. It is not attached to any agent permission request.",
+    }, { signal: controller.signal });
+    if (decision === "allow" || decision === "deny") {
+      return { status: "ok", decision };
+    }
+    return { status: "error", message: "Feishu test did not receive a button response" };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function getTelegramApprovalTokenStatus() {
@@ -3133,6 +3407,9 @@ _settingsController.subscribeKey("tgApproval", () => {
   if (suppressTelegramApprovalSidecarSync > 0) return;
   queueTelegramApprovalSidecarSync("settings");
 });
+_settingsController.subscribeKey("feishuApproval", () => {
+  queueFeishuApprovalSync("settings");
+});
 _settingsController.subscribeKey("mobilePreviewEnabled", async (enabled) => {
   if (enabled) {
     if (!_lanWss) {
@@ -3519,7 +3796,19 @@ function createWindow() {
 
   initFocusHelper();
   startMainTick();
-  startHttpServer();
+  // Silently connect any remote SSH profile flagged "connect on launch" once
+  // the hook server is ACTUALLY listening and its real port is known.
+  // runtime.connect() reads getHookServerPort() synchronously to build the SSH
+  // reverse tunnel, and listen() is async — sweeping before the 'listening'
+  // event would read a stale fallback port and tunnel to the wrong local port
+  // if the bind drifted (port in use, multi-instance). startHttpServer()
+  // resolves null when no port could be bound, in which case we skip the sweep.
+  // Best-effort: failures fall back to the runtime's own reconnect/backoff and
+  // never block startup.
+  startHttpServer().then((port) => {
+    if (port == null) return;
+    try { _remoteSshIpc.connectOnLaunchProfiles(); } catch {}
+  }).catch(() => {});
   if (_settingsController.get("mobilePreviewEnabled") === true) _lanWss.start();
   startStaleCleanup();
   // Wait for renderer to be ready before sending initial state
@@ -3658,7 +3947,9 @@ const { enterMiniMode, exitMiniMode, enterMiniViaMenu, miniPeekIn, miniPeekOut,
 const _roamCtx = {
   get win() { return win; },
   getPetWindowBounds,
-  applyPetWindowPosition,
+  applyPetWindowBounds,
+  // #569: lets roam anchor to the keep-size frozen size when that toggle is on
+  getEffectiveCurrentPixelSize,
   syncHitWin: () => syncHitWin(),
   repositionSessionHud: () => repositionSessionHud(),
   repositionAnchoredSurfaces: () => repositionAnchoredFloatingSurfaces(),
@@ -3672,6 +3963,7 @@ const _roamCtx = {
   get miniTransitioning() { return _mini.getMiniTransitioning(); },
   applyState: (state, svgOverride, opts) => _state.applyState(state, svgOverride, opts),
   setState: (state, svgOverride, opts) => _state.setState(state, svgOverride, opts),
+  setRoamHeading: (headingLeft) => sendToRenderer("roam-heading", !!headingLeft),
 };
 const _roam = require("./roam")(_roamCtx);
 
@@ -3785,6 +4077,52 @@ if (!gotTheLock) {
     }
   }
 
+  // ── Codex official-hook health nudge ──
+  //
+  // Codex approval awareness now depends entirely on the official
+  // PermissionRequest hook (the JSONL approval heuristic was removed). If that
+  // hook silently failed to register — or [features].hooks=false, or it needs
+  // Codex /hooks review — the user gets NO approval prompts and no fallback.
+  // Nudge once, edge-triggered: notify only when the breakage KIND changes
+  // (deduped via the persisted signature) and reset when healthy, so a broken
+  // hook warns at most once per distinct breakage, never every launch. The
+  // Windows tray balloon is the active nudge; the Agents-tab badge is the
+  // always-on, cross-platform surface.
+  function fireCodexHookNudge(verdict) {
+    try {
+      const tray = _menu && typeof _menu.getTray === "function" ? _menu.getTray() : null;
+      if (tray && process.platform === "win32" && typeof tray.displayBalloon === "function") {
+        tray.displayBalloon({
+          iconType: "warning",
+          title: t("codexHookHealthNudgeTitle"),
+          content: t("codexHookHealthNudgeBody"),
+        });
+      }
+    } catch (err) {
+      console.warn("Clawd: Codex hook balloon failed:", err && err.message);
+    }
+    console.warn(`Clawd: Codex official hook needs attention (${verdict.signature}): ${verdict.detailText || ""}`);
+  }
+
+  function maybeNudgeCodexHookHealth() {
+    try {
+      const { getCodexHookHealth, decideCodexHookNotification } = require("./codex-hook-health");
+      const snapshot = _settingsController.getSnapshot();
+      const verdict = getCodexHookHealth({ prefs: snapshot });
+      const prevSignature = _settingsController.get("codexHookHealthLastNotified") || "";
+      const decision = decideCodexHookNotification(verdict, prevSignature, {
+        codexEnabled: _isAgentEnabled(snapshot, "codex"),
+        notifyEnabled: _settingsController.get("codexHookHealthNotifyEnabled") !== false,
+      });
+      if (decision.nextSignature !== prevSignature) {
+        _settingsController.applyUpdate("codexHookHealthLastNotified", decision.nextSignature);
+      }
+      if (decision.shouldNotify) fireCodexHookNudge(verdict);
+    } catch (err) {
+      console.warn("Clawd: Codex hook health nudge failed:", err && err.message);
+    }
+  }
+
   app.whenReady().then(() => {
     // macOS: override the dock icon with a version padded to the macOS icon
     // grid (~80.5% of the canvas, ~100px transparent margin per side) so the
@@ -3821,6 +4159,7 @@ if (!gotTheLock) {
     initTelegramMigrationController().catch((err) => {
       console.warn("Clawd: migration controller init failed:", err && err.message);
     });
+    queueFeishuApprovalSync("startup");
     createWindow();
     systemWakeRecovery = createSystemWakeRecovery({
       powerMonitor,
@@ -3901,6 +4240,11 @@ if (!gotTheLock) {
     // and startUpdateScheduler() short-circuits on !app.isPackaged.
     try { reconcilePendingOnStartup(); } catch (err) { updateLog(`reconcile failed: ${err && err.message}`); }
     try { startUpdateScheduler(); } catch (err) { updateLog(`scheduler start failed: ${err && err.message}`); }
+
+    // Deferred so any startup Codex hook sync has settled before we read the
+    // on-disk hook state; unref'd so it never blocks a fast quit.
+    const codexHookNudgeTimer = setTimeout(maybeNudgeCodexHookHealth, 4000);
+    if (codexHookNudgeTimer && typeof codexHookNudgeTimer.unref === "function") codexHookNudgeTimer.unref();
   });
 
   app.on("before-quit", () => {
@@ -3912,6 +4256,7 @@ if (!gotTheLock) {
     globalShortcut.unregisterAll();
     void settingsSizePreviewSession.cleanup();
     stopTelegramApprovalSidecar();
+    stopFeishuApprovalClient();
     if (typeof unsubscribeHardwareBuddySettings === "function") {
       unsubscribeHardwareBuddySettings();
       unsubscribeHardwareBuddySettings = null;

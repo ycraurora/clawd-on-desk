@@ -1076,6 +1076,13 @@ html, body {
   background: rgba(0, 0, 0, 0.05);
   color: var(--text-secondary);
 }
+/* Installed but the hook is broken/disabled/needs-review — amber warning.
+   Distinct from green (healthy) and muted (not installed). */
+.agent-badge.integration.hook-warning {
+  background: rgba(180, 120, 20, 0.14);
+  color: #9a6700;
+  cursor: help;
+}
 @media (prefers-color-scheme: dark) {
   .agent-badge.integration {
     color: #8ce99a;
@@ -1084,6 +1091,10 @@ html, body {
   .agent-badge.integration.not-installed {
     background: rgba(255, 255, 255, 0.08);
     color: var(--text-secondary);
+  }
+  .agent-badge.integration.hook-warning {
+    background: rgba(246, 195, 67, 0.16);
+    color: #f6c343;
   }
 }
 .agent-integration-action {
@@ -3493,6 +3504,32 @@ html, body {
 }
 .tg-approval-output-select {
   min-width: 180px;
+}
+
+.feishu-approval-secrets-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+}
+.feishu-approval-secrets-grid .soft-btn {
+  justify-self: end;
+}
+.feishu-approval-id-type {
+  flex: 0 1 auto;
+  min-width: 260px;
+}
+.feishu-approval-id-type button {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+@media (max-width: 640px) {
+  .feishu-approval-secrets-grid {
+    grid-template-columns: 1fr;
+  }
+  .feishu-approval-id-type {
+    width: 100%;
+    min-width: 0;
+  }
 }
 
 .tg-approval-prereq-row .row-desc {

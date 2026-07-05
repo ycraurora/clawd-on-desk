@@ -921,6 +921,10 @@ function handlePermissionPost(req, res, options) {
             }
             permEntry.bubble = null;
             sendHermesPermissionNoDecision(res);
+            return;
+          }
+          if (Array.isArray(elicitationInput.questions) && elicitationInput.questions.length > 0) {
+            startRemoteApproval(ctx, permEntry);
           }
           return;
         }
@@ -1105,6 +1109,10 @@ function handlePermissionPost(req, res, options) {
           }
           permEntry.bubble = null;
           ctx.sendPermissionResponse(res, "deny", "Elicitation bubble unavailable; answer in terminal", "Elicitation");
+          return;
+        }
+        if (Array.isArray(elicitationInput.questions) && elicitationInput.questions.length > 0) {
+          startRemoteApproval(ctx, permEntry);
         }
         return;
       }
@@ -1137,7 +1145,7 @@ function handlePermissionPost(req, res, options) {
       addPendingPermission(ctx, permEntry);
 
       // Play notification animation on the pet body so the bubble doesn't
-      // appear "silently". Mirrors the Codex path (main.js showCodexNotifyBubble)
+      // appear "silently". Mirrors the other permission-notification branches
       // and the Elicitation branch above. state.js:581 has a special
       // PermissionRequest branch that setStates notification without
       // mutating session state — so working/thinking is preserved for resolve.
