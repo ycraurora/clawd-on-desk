@@ -168,6 +168,7 @@ describe("server-route-state POST", () => {
         agentPid: 99,
         agentId: "codex",
         host: "remote-host",
+        wslDistro: null,
         headless: true,
         platform: "webui",
         model: "gpt-5.4",

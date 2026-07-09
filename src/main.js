@@ -356,6 +356,14 @@ const _settingsController = createSettingsController({
       agentRuntime ? agentRuntime.repairIntegrationForAgent(id, options) : false,
     stopIntegrationForAgent: (id) => agentRuntime ? agentRuntime.stopIntegrationForAgent(id) : false,
     uninstallIntegrationForAgent: (id) => agentRuntime ? agentRuntime.uninstallIntegrationForAgent(id) : false,
+    deployHooksToWsl: async (distro, agentId) => {
+      const { deployToWsl } = require("./wsl-deploy");
+      return deployToWsl(distro, { agentId, isPackaged: app.isPackaged });
+    },
+    removeHooksFromWsl: async (distro, agentId) => {
+      const { removeFromWsl } = require("./wsl-deploy");
+      return removeFromWsl(distro, { agentId });
+    },
     cleanupIntegrations: (options = {}) => {
       const { cleanupIntegrations } = require("../hooks/cleanup-integrations.js");
       return cleanupIntegrations({ ...options, backup: true, silent: true });
@@ -1913,6 +1921,7 @@ const _serverCtx = {
   clearCodexNotifyBubbles,
   maybeStartRemoteApproval,
   replyOpencodePermission,
+  syncPermissionShortcuts,
   permLog,
 };
 const _server = require("./server")(_serverCtx);
@@ -2652,6 +2661,7 @@ async function initTelegramMigrationController() {
         && getTelegramApprovalPrefs().r3DirectSendEnabled === true);
     },
     osPlatform: process.platform,
+    getLang: () => lang,
     log: telegramApprovalLog,
   });
   const nativeRunner = createTelegramNativeRunner({
@@ -2665,6 +2675,7 @@ async function initTelegramMigrationController() {
       log: telegramApprovalLog,
     }),
     getDispatch: () => _telegramMigrationController && _telegramMigrationController.dispatch,
+    getLang: () => lang,
     getChatId: () => {
       const cfg = getTelegramApprovalPrefs();
       const key = cfg && cfg.targetSessionKey;
@@ -2691,6 +2702,7 @@ async function initTelegramMigrationController() {
         && getTelegramApprovalPrefs().r3DirectSendEnabled === true);
     },
     onTextMessage: (payload) => telegramDirectSend && telegramDirectSend.handleTextMessage(payload),
+    getLang: () => _settingsController.get("lang") || lang || "en",
     log: telegramApprovalLog,
   });
   telegramNativeRunner = nativeRunner;
@@ -2784,13 +2796,13 @@ function queueTelegramApprovalSidecarSync(reason) {
 
 function telegramApprovalUnavailableMessage(status) {
   if (status && status.message) return status.message;
-  if (status && status.reason === "disabled") return "Telegram approval is disabled";
-  if (status && status.reason === "missing-token") return "Telegram bot token is not configured";
-  if (status && status.reason === "invalid-config") return "Telegram approval config is incomplete";
-  if (status && status.reason === "native-inactive") return "Native Telegram approval is not active";
-  if (status && status.reason === "native-testing") return "Native Telegram approval test is already in progress";
-  if (status && status.transport === "native") return "Native Telegram approval is not active";
-  return "Telegram approval sidecar is not running";
+  if (status && status.reason === "disabled") return translate("telegramApprovalDisabledMessage");
+  if (status && status.reason === "missing-token") return translate("telegramApprovalMissingTokenMessage");
+  if (status && status.reason === "invalid-config") return translate("telegramApprovalIncompleteConfigMessage");
+  if (status && status.reason === "native-inactive") return translate("telegramApprovalNativeInactiveMessage");
+  if (status && status.reason === "native-testing") return translate("telegramApprovalNativeTestingMessage");
+  if (status && status.transport === "native") return translate("telegramApprovalNativeInactiveMessage");
+  return translate("telegramApprovalSidecarNotRunningMessage");
 }
 
 async function sendTelegramApprovalTest() {
@@ -2809,8 +2821,8 @@ async function sendTelegramApprovalTest() {
   const timer = setTimeout(() => controller.abort(), 60 * 1000);
   try {
     const decision = await client.requestApproval({
-      title: "Clawd Telegram approval test",
-      detail: "This is a settings test message. It is not attached to any agent permission request.",
+      title: translate("telegramSettingsTestTitle"),
+      detail: translate("telegramSettingsTestDetail"),
     }, { signal: controller.signal });
     if (decision === "allow" || decision === "deny") {
       return { status: "ok", decision };
@@ -2818,7 +2830,7 @@ async function sendTelegramApprovalTest() {
     if (decision && (decision.action === "allow" || decision.action === "deny")) {
       return { status: "ok", decision: decision.action };
     }
-    return { status: "error", message: "Telegram test did not receive a button response" };
+    return { status: "error", message: translate("telegramApprovalNoButtonResponseMessage") };
   } finally {
     clearTimeout(timer);
   }
@@ -4161,6 +4173,10 @@ if (!gotTheLock) {
     });
     queueFeishuApprovalSync("startup");
     createWindow();
+    // WSL agent detection is NOT started here: scanning runs a command inside
+    // every installed distro, which boots each stopped VM — too aggressive for
+    // app launch. The first Settings→Agents visit triggers the scan instead
+    // (see fetchAgentInstallationHints in settings-ui-core.js).
     systemWakeRecovery = createSystemWakeRecovery({
       powerMonitor,
       ipcMain,
