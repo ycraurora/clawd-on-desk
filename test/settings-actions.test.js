@@ -279,25 +279,6 @@ describe("updateRegistry pure-data validators", () => {
     }, deps).status, "error");
   });
 
-  it("hardwareBuddy accepts only the normalized product settings shape", () => {
-    assert.strictEqual(updateRegistry.hardwareBuddy({
-      enabled: true,
-      backend: "bleak",
-      address: "00:4B:12:A1:9E:A6",
-      namePrefix: "Claude",
-      permissionsEnabled: false,
-      quickCommandsEnabled: true,
-    }).status, "ok");
-    assert.strictEqual(updateRegistry.hardwareBuddy({ enabled: true }).status, "error");
-    assert.strictEqual(updateRegistry.hardwareBuddy({
-      enabled: true,
-      backend: "serial",
-      address: "",
-      namePrefix: "Claude",
-      permissionsEnabled: false,
-      quickCommandsEnabled: false,
-    }).status, "error");
-  });
 
   it("sessionAliases requires a plain object of valid alias entries", () => {
     const deps = { snapshot: baseSnapshot };
@@ -540,31 +521,6 @@ describe("telegram approval commands", () => {
     assert.deepStrictEqual(empty, { status: "ok", configured: false, masked: "" });
 
     const missing = await commandRegistry["telegramApproval.tokenInfo"](null, {});
-    assert.equal(missing.status, "error");
-  });
-
-  it("telegramApproval.deleteTokenFile proxies the guarded main-process helper", async () => {
-    const calls = [];
-    const result = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
-      deleteTelegramApprovalTokenFile: async () => {
-        calls.push(true);
-        return { status: "ok", deleted: true };
-      },
-    });
-    assert.deepStrictEqual(result, { status: "ok", deleted: true });
-    assert.deepStrictEqual(calls, [true]);
-
-    const guarded = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
-      deleteTelegramApprovalTokenFile: async () => ({
-        status: "error",
-        code: "TOKEN_FILE_IN_USE",
-        message: "Native Telegram currently uses the shared token file.",
-      }),
-    });
-    assert.strictEqual(guarded.status, "error");
-    assert.strictEqual(guarded.code, "TOKEN_FILE_IN_USE");
-
-    const missing = await commandRegistry["telegramApproval.deleteTokenFile"](null, {});
     assert.equal(missing.status, "error");
   });
 

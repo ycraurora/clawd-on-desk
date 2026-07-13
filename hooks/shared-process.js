@@ -179,7 +179,11 @@ function getWindowsProcessSnapshot(execFileSync) {
     const out = execFileSync(
       "powershell.exe",
       [
-        "-NoProfile", "-NonInteractive", "-Command",
+        // -WindowStyle Hidden is belt-and-suspenders alongside windowsHide:
+        // when Windows Terminal is the OS default terminal app, its console
+        // delegation does not always honor CREATE_NO_WINDOW (#627), and the
+        // in-process flag shortens any window that still leaks through.
+        "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
         WINDOWS_PROCESS_SNAPSHOT_SCRIPT,
       ],
       { encoding: "utf8", timeout: 3000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
@@ -420,7 +424,10 @@ function readStdinJsonDetailed(options = {}) {
       let payload = {};
       let parseError = null;
       try {
-        const text = raw.toString();
+        let text = raw.toString();
+        // A PowerShell/.NET intermediary can prefix the payload with a UTF-8
+        // BOM (#638); trim() below would hide it but JSON.parse rejects it.
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
         if (text.trim()) payload = JSON.parse(text);
       } catch (err) {
         parseError = String((err && err.message) || "parse error").slice(0, 120);
